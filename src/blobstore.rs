@@ -17,6 +17,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+/// The maximum size of a single blob a `get` will read into memory. A read is a
+/// bounded allocation: an object larger than this is refused rather than
+/// buffered whole (finding V1). It matches the write path's body limit, so
+/// nothing legitimately stored becomes unreadable, while an out-of-band oversized
+/// file (or a raised body limit) cannot drive an unbounded allocation.
+pub const MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Why a blob-backend operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
@@ -27,6 +34,19 @@ pub enum BlobError {
         did: String,
         /// The content address requested.
         cid: String,
+    },
+    /// The stored object exceeds [`MAX_OBJECT_BYTES`]; refused rather than read
+    /// into memory (a resource-safety guard, not a content check).
+    #[error("blob {did}/{cid} is {size} bytes, over the {max}-byte read limit")]
+    TooLarge {
+        /// The DID whose blob was requested.
+        did: String,
+        /// The content address requested.
+        cid: String,
+        /// The object's size on the backend.
+        size: u64,
+        /// The read ceiling.
+        max: u64,
     },
     /// An underlying I/O operation failed.
     #[error("blob io error for {did}/{cid}: {source}")]
@@ -102,13 +122,23 @@ impl BlobStore for MemoryBlobStore {
     }
 
     fn get(&self, did: &str, cid: &str) -> Result<Vec<u8>, BlobError> {
-        self.lock()
+        let guard = self.lock();
+        let bytes = guard
             .get(&(did.to_owned(), cid.to_owned()))
-            .cloned()
             .ok_or_else(|| BlobError::Missing {
                 did: did.to_owned(),
                 cid: cid.to_owned(),
-            })
+            })?;
+        let size = bytes.len() as u64;
+        if size > MAX_OBJECT_BYTES {
+            return Err(BlobError::TooLarge {
+                did: did.to_owned(),
+                cid: cid.to_owned(),
+                size,
+                max: MAX_OBJECT_BYTES,
+            });
+        }
+        Ok(bytes.clone())
     }
 
     fn has(&self, did: &str, cid: &str) -> bool {
@@ -177,7 +207,35 @@ impl BlobStore for FsBlobStore {
     }
 
     fn get(&self, did: &str, cid: &str) -> Result<Vec<u8>, BlobError> {
-        match std::fs::read(self.permanent_path(did, cid)) {
+        let path = self.permanent_path(did, cid);
+        // Stat before read: this bounds the allocation and, crucially, never
+        // blocks — `read` on a FIFO/character device would park the thread
+        // forever, so a non-regular node is refused here as "not a stored blob".
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BlobError::Missing {
+                    did: did.to_owned(),
+                    cid: cid.to_owned(),
+                })
+            }
+            Err(e) => return Err(Self::io_err(did, cid, e)),
+        };
+        if !meta.is_file() {
+            return Err(BlobError::Missing {
+                did: did.to_owned(),
+                cid: cid.to_owned(),
+            });
+        }
+        if meta.len() > MAX_OBJECT_BYTES {
+            return Err(BlobError::TooLarge {
+                did: did.to_owned(),
+                cid: cid.to_owned(),
+                size: meta.len(),
+                max: MAX_OBJECT_BYTES,
+            });
+        }
+        match std::fs::read(&path) {
             Ok(bytes) => Ok(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobError::Missing {
                 did: did.to_owned(),
@@ -259,6 +317,22 @@ mod tests {
         );
     }
 
+    /// A `get` refuses an object larger than [`MAX_OBJECT_BYTES`] rather than
+    /// buffering it into memory (finding V1).
+    fn refuses_oversized(store: &dyn BlobStore) {
+        use super::MAX_OBJECT_BYTES;
+        let over = usize::try_from(MAX_OBJECT_BYTES).expect("cap fits usize") + 1;
+        let oversized = vec![0u8; over];
+        store.put("id:whale", "cid-big", &oversized).expect("put");
+        let err = store
+            .get("id:whale", "cid-big")
+            .expect_err("oversized read must be refused");
+        assert!(
+            matches!(err, BlobError::TooLarge { .. }),
+            "over the read cap -> TooLarge, got {err:?}",
+        );
+    }
+
     #[test]
     fn memory_backend_behaviors() {
         let store = MemoryBlobStore::new();
@@ -266,6 +340,42 @@ mod tests {
         dedups(&store);
         missing_is_reported(&store);
         backend_does_not_content_check(&store);
+        refuses_oversized(&store);
+    }
+
+    #[test]
+    fn fs_backend_refuses_oversized_reads() {
+        let root = temp_root("oversized");
+        let store = FsBlobStore::new(root.clone());
+        refuses_oversized(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_backend_refuses_a_non_regular_node_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        extern "C" {
+            fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
+        }
+        // A FIFO staged where a blob file would be must be refused as Missing —
+        // `read` on it would block forever, so the stat-first guard must catch it.
+        let root = temp_root("fifo");
+        let store = FsBlobStore::new(root.clone());
+        let path = root.join("blocks").join("id:x").join("cid-fifo");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        // SAFETY: a valid NUL-terminated path and a mode within mode_t's range.
+        let rc = unsafe { mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+        let err = store
+            .get("id:x", "cid-fifo")
+            .expect_err("a FIFO is not a stored blob");
+        assert!(
+            matches!(err, BlobError::Missing { .. }),
+            "a non-regular node -> Missing, got {err:?}",
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -292,21 +402,23 @@ mod tests {
     }
 
     #[test]
-    fn fs_backend_read_error_is_io_not_missing() {
-        // A non-NotFound read failure must surface as Io, never masquerade as
-        // Missing. Put a *directory* where the blob file would be, so read()
-        // fails with a non-NotFound error. (Pins the NotFound match guard: a
-        // mutant that treats every read error as Missing must fail here.)
-        let root = temp_root("ioerr");
+    fn fs_backend_treats_a_non_regular_node_as_absent() {
+        // A directory (or any non-regular node) where a blob file would be is
+        // not a stored blob: the stat-first guard refuses it as Missing rather
+        // than attempting a read that could block or error. (This is the V2
+        // non-regular guard; it also means `read` is only ever called on a
+        // confirmed regular file, so the Io path is reserved for genuine
+        // regular-file read failures.)
+        let root = temp_root("nonregular");
         let store = FsBlobStore::new(root.clone());
         let blob_path = root.join("blocks").join("id:e").join("cid-dir");
         std::fs::create_dir_all(&blob_path).expect("mkdir at the blob path");
         let err = store
             .get("id:e", "cid-dir")
-            .expect_err("reading a directory fails");
+            .expect_err("a directory is not a stored blob");
         assert!(
-            matches!(err, BlobError::Io { .. }),
-            "a non-NotFound read error is Io, not Missing; got {err:?}",
+            matches!(err, BlobError::Missing { .. }),
+            "a non-regular node is Missing, not a read attempt; got {err:?}",
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -19,9 +19,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 axum = "0.8.9"
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["timeout"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", default-features = false }
+
+[profile.release]
+# Metering arithmetic must never silently wrap: a wrapped byte count corrupts a
+# bill. Overflow is unreachable in practice (byte totals are u64-bounded), so
+# this only turns a latent bug into a loud panic (one reset connection, not a
+# process kill), never a hot-path cost that matters here.
+overflow-checks = true

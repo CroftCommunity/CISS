@@ -21,6 +21,10 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -44,6 +48,14 @@ use crate::receipts::{
 
 /// Header a client uses to present its public key when writing a signed manifest.
 const PUBKEY_HEADER: &str = "x-croft-pubkey";
+
+/// How long a single data-plane request may run before it is dropped (V4).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// The maximum number of data-plane requests served concurrently. Bounds
+/// aggregate memory (each in-flight request buffers at most one capped object)
+/// and blocking-pool pressure. `/healthz` is exempt.
+const MAX_INFLIGHT_REQUESTS: usize = 64;
 
 /// Convert a `usize` byte count to `u64`; the length of any real transfer fits.
 fn as_u64(n: usize) -> u64 {
@@ -160,7 +172,12 @@ impl App {
     /// `App` may be dropped afterward (the router holds its own `Arc`s) or kept
     /// alive to run [`App::checkpoint`] on shutdown.
     pub fn router(&self) -> Router {
-        Router::new()
+        // The metered data plane, guarded by a request timeout (a stuck request
+        // is dropped, not held — finding V4) and a global in-flight cap (bounds
+        // aggregate memory across concurrent requests — findings V1/V5). Both
+        // sit *below* `/healthz` so a saturated data plane never delays the
+        // liveness probe (croft-stack contract §2).
+        let data = Router::new()
             .route(
                 "/{did}/objects/{addr}",
                 put(put_object_handler).get(get_object_handler),
@@ -170,12 +187,20 @@ impl App {
                 put(put_manifest_handler).get(get_manifest_handler),
             )
             .route("/{did}/meter", get(get_meter_handler))
-            // Liveness/readiness probe (croft-stack contract §2): fast,
-            // side-effect-free, `200 ok` once the router is serving.
-            .route("/healthz", get(healthz_handler))
             // The atproto PDS blob surface (Phase 8) — a thin layer over the
             // same metered byte-path, mounted at its XRPC paths.
             .merge(crate::pds_api::routes())
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            ))
+            .layer(GlobalConcurrencyLimitLayer::new(MAX_INFLIGHT_REQUESTS));
+
+        Router::new()
+            // Liveness/readiness probe: fast, side-effect-free, unlimited — never
+            // behind the data plane's timeout or concurrency gate.
+            .route("/healthz", get(healthz_handler))
+            .merge(data)
             .fallback(unimplemented_s3)
             .with_state(self.state.clone())
     }
@@ -333,6 +358,22 @@ pub(crate) fn dispatch(state: &AppState, op: Op) -> Result<OpOutcome, ServerErro
     }
 }
 
+/// Dispatch an op off the async runtime. Every op does synchronous filesystem
+/// and SQLite work under a mutex; running that directly in an `async fn` would
+/// park a tokio worker (a slow disk, a deep ledger, or contention could then
+/// stall the whole server, including `/healthz` — finding V2). `spawn_blocking`
+/// moves it onto the blocking pool so the async workers stay free. The handlers
+/// call this, not [`dispatch`] directly.
+pub(crate) async fn dispatch_blocking(
+    state: &AppState,
+    op: Op,
+) -> Result<OpOutcome, ServerError> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || dispatch(&state, op))
+        .await
+        .map_err(|_| ServerError::TaskJoin)?
+}
+
 /// The running total of bytes metered for a DID so far (both directions) — the
 /// source of truth is the ledger, so we sum it rather than cache a counter.
 /// `SEAM:` cache this per DID for O(1) rather than O(n) per transfer.
@@ -414,6 +455,7 @@ fn op_put_object(
 fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, ServerError> {
     let data = state.blobs.get(did, cid).map_err(|e| match e {
         BlobError::Missing { .. } => ServerError::NotFound,
+        BlobError::TooLarge { size, max, .. } => ServerError::ObjectTooLarge { size, max },
         io @ BlobError::Io { .. } => ServerError::Blob(io),
     })?;
 
@@ -581,7 +623,7 @@ async fn put_object_handler(
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     tracing::info!(method = "PUT", did = %did, key = ?key, bytes = body.len(), "object boundary");
-    dispatch(
+    dispatch_blocking(
         &state,
         Op::PutObject {
             did: did.into_string(),
@@ -589,6 +631,7 @@ async fn put_object_handler(
             bytes: body.to_vec(),
         },
     )
+    .await
 }
 
 async fn get_object_handler(
@@ -598,13 +641,14 @@ async fn get_object_handler(
     let did = Did::parse(&did)?;
     let addr = ContentAddr::parse(&addr)?;
     tracing::info!(method = "GET", did = %did, cid = %addr, "object boundary");
-    dispatch(
+    dispatch_blocking(
         &state,
         Op::GetObject {
             did: did.into_string(),
             cid: addr.into_string(),
         },
     )
+    .await
 }
 
 async fn put_manifest_handler(
@@ -619,7 +663,7 @@ async fn put_manifest_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    dispatch(
+    dispatch_blocking(
         &state,
         Op::PutManifest {
             did: did.into_string(),
@@ -627,6 +671,7 @@ async fn put_manifest_handler(
             body: body.to_vec(),
         },
     )
+    .await
 }
 
 async fn get_manifest_handler(
@@ -634,7 +679,7 @@ async fn get_manifest_handler(
     Path(did): Path<String>,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    dispatch(&state, Op::GetManifest { did: did.into_string() })
+    dispatch_blocking(&state, Op::GetManifest { did: did.into_string() }).await
 }
 
 async fn get_meter_handler(
@@ -642,7 +687,7 @@ async fn get_meter_handler(
     Path(did): Path<String>,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    dispatch(&state, Op::GetMeter { did: did.into_string() })
+    dispatch_blocking(&state, Op::GetMeter { did: did.into_string() }).await
 }
 
 /// Liveness/readiness: `200 ok`. Side-effect-free — it neither reads the store
@@ -776,6 +821,17 @@ pub enum ServerError {
     /// A request identifier (`did`/content address) failed boundary validation.
     #[error("invalid identifier: {0}")]
     BadIdentifier(#[from] crate::identifiers::IdentifierError),
+    /// The requested object is larger than the read limit (resource safety).
+    #[error("object is {size} bytes, over the {max}-byte limit")]
+    ObjectTooLarge {
+        /// The object's size.
+        size: u64,
+        /// The read ceiling.
+        max: u64,
+    },
+    /// A blocking dispatch task failed to join (e.g. panicked) — never expected.
+    #[error("internal task failure")]
+    TaskJoin,
 }
 
 impl IntoResponse for ServerError {
@@ -789,13 +845,15 @@ impl IntoResponse for ServerError {
             ServerError::DidKeyMismatch => StatusCode::FORBIDDEN,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
+            ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::Tampered { .. } | ServerError::ByteCountMismatch { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             ServerError::Persist(_)
             | ServerError::Blob(_)
             | ServerError::Json(_)
-            | ServerError::BadConfig => StatusCode::INTERNAL_SERVER_ERROR,
+            | ServerError::BadConfig
+            | ServerError::TaskJoin => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = self.to_string();
         if status.is_server_error() {

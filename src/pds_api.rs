@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use crate::cidv1;
 use crate::identifiers::Did;
-use crate::server::{dispatch, AppState, Op, OpOutcome, ServerError};
+use crate::server::{dispatch_blocking, AppState, Op, OpOutcome, ServerError};
 
 /// The mime returned when a request declares none, and echoed by `getBlob`.
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -77,14 +77,15 @@ async fn upload_blob(
         .to_owned();
     tracing::info!(endpoint = "uploadBlob", %did, bytes = body.len(), mime = ?mime, "atproto blob boundary");
 
-    let outcome = dispatch(
+    let outcome = dispatch_blocking(
         &state,
         Op::PutObject {
             did: did.into_string(),
             key: "uploadBlob".to_owned(),
             bytes: body.to_vec(),
         },
-    )?;
+    )
+    .await?;
     let OpOutcome::Stored { cid, bytes, .. } = outcome else {
         // A PutObject dispatch always yields Stored; any other variant is an
         // internal invariant break — surfaced loudly, never mis-shaped.
@@ -120,13 +121,14 @@ async fn get_blob(
     let hex = cidv1::to_sha256_hex(&params.cid)?;
     tracing::info!(endpoint = "getBlob", did = %did, blob_cid = %params.cid, "atproto blob boundary");
 
-    let outcome = dispatch(
+    let outcome = dispatch_blocking(
         &state,
         Op::GetObject {
             did: did.into_string(),
             cid: hex,
         },
-    )?;
+    )
+    .await?;
     let OpOutcome::Bytes { data, .. } = outcome else {
         return Err(ServerError::BadConfig);
     };
@@ -150,7 +152,7 @@ async fn list_blobs(
     let did = Did::parse(&params.did)?;
     tracing::info!(endpoint = "listBlobs", did = %did, "atproto blob boundary");
 
-    let outcome = dispatch(&state, Op::ListBlobs { did: did.into_string() })?;
+    let outcome = dispatch_blocking(&state, Op::ListBlobs { did: did.into_string() }).await?;
     let OpOutcome::BlobList { cids } = outcome else {
         return Err(ServerError::BadConfig);
     };
