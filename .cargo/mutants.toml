@@ -1,0 +1,29 @@
+# cargo-mutants configuration.
+#
+# Trivial field accessors are excluded from mutation testing: mutating a getter
+# that just returns a stored field to a constant is not a meaningful behavioral
+# test (the getters are exercised indirectly by the logic tests), and chasing
+# them to zero would add assertions with no behavioral value. Excluding them
+# makes the mutation score reflect logic, not plumbing. See ROADMAP_TODO E86.
+#
+# NOTE: only pure field-return accessors are listed. Predicates and logic
+# (verify_*, merkle_root, retrieve_verified, ContentStore::has, etc.) are NOT
+# excluded — they must be killed by tests.
+exclude_re = [
+    # Equivalent mutant: rent_cents is `byte_days * RENT_NUMERATOR / RENT_DENOMINATOR`
+    # with RENT_NUMERATOR == 1, so `* 1` and `/ 1` produce identical output for every
+    # input — no test can distinguish them. Not a coverage gap. See ROADMAP_TODO E86.
+    "with / in rent_cents",
+    # Equivalent mutant: Op::is_heavy returns `false` for every v0 op by design
+    # (the E83 per-DID-scope seam — no v0 op is cgroup-scoped), so `-> false` is
+    # identical to the original. The `-> true` mutant IS caught (a test asserts
+    # every v0 op is not heavy). See ROADMAP_TODO E83/E86.
+    "replace Op::is_heavy -> bool with false",
+    "replace Keypair::label ->",
+    "replace Identity::verifying_key ->",
+    "replace Ledger::owner_id ->",
+    "replace ManifestLeaf::cid ->",
+    "replace Manifest::signer_id ->",
+    "replace Manifest::leaves ->",
+    "replace Receipt::content_hash ->",
+]

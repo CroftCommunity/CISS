@@ -1,0 +1,3 @@
+# Domain/product terms used as prose in doc comments — not code identifiers, so
+# clippy::doc_markdown should not demand backticks. ".." keeps clippy's defaults.
+doc-valid-idents = ["..", "SQLite", "DID", "PDS", "SeaweedFS", "CIDv1", "RBSR", "MST"]
