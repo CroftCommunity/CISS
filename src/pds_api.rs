@@ -31,6 +31,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::cidv1;
+use crate::identifiers::Did;
 use crate::server::{dispatch, AppState, Op, OpOutcome, ServerError};
 
 /// The mime returned when a request declares none, and echoed by `getBlob`.
@@ -67,19 +68,19 @@ async fn upload_blob(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    let did = authed_did(&headers)?;
+    let did = Did::parse(&authed_did(&headers)?)?;
     let mime = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_MIME)
         .to_owned();
-    tracing::info!(endpoint = "uploadBlob", %did, bytes = body.len(), %mime, "atproto blob boundary");
+    tracing::info!(endpoint = "uploadBlob", %did, bytes = body.len(), mime = ?mime, "atproto blob boundary");
 
     let outcome = dispatch(
         &state,
         Op::PutObject {
-            did,
+            did: did.into_string(),
             key: "uploadBlob".to_owned(),
             bytes: body.to_vec(),
         },
@@ -115,13 +116,14 @@ async fn get_blob(
     State(state): State<AppState>,
     Query(params): Query<GetBlobParams>,
 ) -> Result<Response, ServerError> {
+    let did = Did::parse(&params.did)?;
     let hex = cidv1::to_sha256_hex(&params.cid)?;
-    tracing::info!(endpoint = "getBlob", did = %params.did, blob_cid = %params.cid, "atproto blob boundary");
+    tracing::info!(endpoint = "getBlob", did = %did, blob_cid = %params.cid, "atproto blob boundary");
 
     let outcome = dispatch(
         &state,
         Op::GetObject {
-            did: params.did,
+            did: did.into_string(),
             cid: hex,
         },
     )?;
@@ -145,9 +147,10 @@ async fn list_blobs(
     State(state): State<AppState>,
     Query(params): Query<ListBlobsParams>,
 ) -> Result<Response, ServerError> {
-    tracing::info!(endpoint = "listBlobs", did = %params.did, "atproto blob boundary");
+    let did = Did::parse(&params.did)?;
+    tracing::info!(endpoint = "listBlobs", did = %did, "atproto blob boundary");
 
-    let outcome = dispatch(&state, Op::ListBlobs { did: params.did })?;
+    let outcome = dispatch(&state, Op::ListBlobs { did: did.into_string() })?;
     let OpOutcome::BlobList { cids } = outcome else {
         return Err(ServerError::BadConfig);
     };

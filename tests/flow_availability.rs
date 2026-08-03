@@ -32,7 +32,6 @@ fn as_path_segment(abs: &std::path::Path) -> String {
 /// percent-encoded absolute path escapes the data dir. A write must be refused
 /// before it touches the filesystem.
 #[tokio::test]
-#[ignore = "RED spec (A3) — un-ignore in Phase 1/2: identifiers are validated before FS use"]
 async fn a_write_with_a_traversal_path_is_refused() {
     let world = World::spawn_fs().await;
     let data_dir = world.data_dir().expect("fs world").to_owned();

@@ -32,6 +32,7 @@ use zeroize::Zeroize;
 
 use crate::blobstore::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
 use crate::crypto::{derive_keypair, public_key_from_hex, sha256_hex, Keypair};
+use crate::identifiers::{ContentAddr, Did};
 use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
@@ -358,7 +359,7 @@ fn op_put_object(
     // the key is narration only. `SEAM:` a mutable key->CID name index (S3
     // arbitrary-key GET) is deferred — v0 GETs by CID, matching atproto
     // getBlob(cid).
-    tracing::debug!(%did, object_key = %key, %cid, "object key -> content address");
+    tracing::debug!(%did, object_key = ?key, %cid, "object key -> content address");
 
     // Layer 1: dumb backend write. It reports the bytes it wrote.
     let written = state.blobs.put(did, &cid, bytes)?;
@@ -578,11 +579,12 @@ async fn put_object_handler(
     Path((did, key)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
-    tracing::info!(method = "PUT", %did, key = %key, bytes = body.len(), "object boundary");
+    let did = Did::parse(&did)?;
+    tracing::info!(method = "PUT", did = %did, key = ?key, bytes = body.len(), "object boundary");
     dispatch(
         &state,
         Op::PutObject {
-            did,
+            did: did.into_string(),
             key,
             bytes: body.to_vec(),
         },
@@ -593,8 +595,16 @@ async fn get_object_handler(
     State(state): State<AppState>,
     Path((did, addr)): Path<(String, String)>,
 ) -> Result<OpOutcome, ServerError> {
-    tracing::info!(method = "GET", %did, cid = %addr, "object boundary");
-    dispatch(&state, Op::GetObject { did, cid: addr })
+    let did = Did::parse(&did)?;
+    let addr = ContentAddr::parse(&addr)?;
+    tracing::info!(method = "GET", did = %did, cid = %addr, "object boundary");
+    dispatch(
+        &state,
+        Op::GetObject {
+            did: did.into_string(),
+            cid: addr.into_string(),
+        },
+    )
 }
 
 async fn put_manifest_handler(
@@ -603,6 +613,7 @@ async fn put_manifest_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
     let pubkey_hex = headers
         .get(PUBKEY_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -611,7 +622,7 @@ async fn put_manifest_handler(
     dispatch(
         &state,
         Op::PutManifest {
-            did,
+            did: did.into_string(),
             pubkey_hex,
             body: body.to_vec(),
         },
@@ -622,14 +633,16 @@ async fn get_manifest_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<OpOutcome, ServerError> {
-    dispatch(&state, Op::GetManifest { did })
+    let did = Did::parse(&did)?;
+    dispatch(&state, Op::GetManifest { did: did.into_string() })
 }
 
 async fn get_meter_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<OpOutcome, ServerError> {
-    dispatch(&state, Op::GetMeter { did })
+    let did = Did::parse(&did)?;
+    dispatch(&state, Op::GetMeter { did: did.into_string() })
 }
 
 /// Liveness/readiness: `200 ok`. Side-effect-free — it neither reads the store
@@ -760,15 +773,19 @@ pub enum ServerError {
     /// The server was misconfigured (e.g. a non-UTF-8 database path).
     #[error("bad configuration")]
     BadConfig,
+    /// A request identifier (`did`/content address) failed boundary validation.
+    #[error("invalid identifier: {0}")]
+    BadIdentifier(#[from] crate::identifiers::IdentifierError),
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = match self {
             ServerError::NotFound => StatusCode::NOT_FOUND,
-            ServerError::BadManifest(_) | ServerError::BadPubkey | ServerError::BadCid(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            ServerError::BadManifest(_)
+            | ServerError::BadPubkey
+            | ServerError::BadCid(_)
+            | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
             ServerError::DidKeyMismatch => StatusCode::FORBIDDEN,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
