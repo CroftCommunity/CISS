@@ -61,7 +61,11 @@ impl Store {
         // `wal_checkpoint(TRUNCATE)` graceful-shutdown seam to do real work.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS manifest (
+            "CREATE TABLE IF NOT EXISTS meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS manifest (
                  did  TEXT PRIMARY KEY,
                  json TEXT NOT NULL
              );
@@ -79,6 +83,37 @@ impl Store {
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);",
         )?;
         Ok(Self { conn })
+    }
+
+    /// Upsert a server-held metadata value (a small key/value singleton table).
+    ///
+    /// Used for durable server state that is not per-DID — e.g. the provider's
+    /// key seed, which lives here so Litestream backs it up and the signing
+    /// identity survives a backup/restore.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn put_meta(&self, key: &str, value: &str) -> Result<(), PersistError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Load a server-held metadata value, if set.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, PersistError> {
+        let value: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(value)
     }
 
     /// Upsert the DID's current signed manifest (single-author repo record).
@@ -212,5 +247,25 @@ mod tests {
         assert!(store.load_manifest("id:absent").expect("load").is_none());
         assert!(store.load_receipts("id:absent").expect("load").is_empty());
         assert!(store.load_statements("id:absent").expect("load").is_empty());
+    }
+
+    #[test]
+    fn meta_round_trips_and_upserts() {
+        let store = Store::open_in_memory().expect("open");
+        assert!(
+            store.get_meta("provider_seed").expect("get").is_none(),
+            "an unset key is absent, not an error",
+        );
+        store.put_meta("provider_seed", "abc123").expect("put");
+        assert_eq!(
+            store.get_meta("provider_seed").expect("get").as_deref(),
+            Some("abc123"),
+        );
+        store.put_meta("provider_seed", "def456").expect("upsert");
+        assert_eq!(
+            store.get_meta("provider_seed").expect("get").as_deref(),
+            Some("def456"),
+            "put on an existing key upserts",
+        );
     }
 }

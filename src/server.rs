@@ -28,6 +28,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
+use zeroize::Zeroize;
 
 use crate::blobstore::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
 use crate::crypto::{derive_keypair, public_key_from_hex, sha256_hex, Keypair};
@@ -109,23 +110,43 @@ impl App {
     ///
     /// Returns [`ServerError`] if the metering store cannot be opened.
     pub fn new(seed: &str, blobs: Blobs, db: Db) -> Result<Self, ServerError> {
-        let provider = Arc::new(Provider::from_seed(seed));
+        let store = open_store(db)?;
+        Ok(Self::assemble(Provider::from_seed(seed), blobs, store))
+    }
+
+    /// Build a server whose provider identity is **persisted** in the metering
+    /// store: on first start a fresh random seed is generated and saved; on every
+    /// later start the saved seed is reused. Because the seed lives in the
+    /// canonical SQLite (Litestream-backed), the signing identity survives a
+    /// backup/restore, so historical receipts stay verifiable. This is the
+    /// deployment constructor — no external seed/secret wiring is required.
+    ///
+    /// `SEAM:` a real deployment loads the provider key from a KMS, not a seed
+    /// persisted at rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the store cannot be opened or the seed cannot
+    /// be read/generated/persisted.
+    pub fn with_persistent_provider(blobs: Blobs, db: Db) -> Result<Self, ServerError> {
+        let store = open_store(db)?;
+        let seed = resolve_or_create_provider_seed(&store)?;
+        Ok(Self::assemble(Provider::from_seed(&seed), blobs, store))
+    }
+
+    fn assemble(provider: Provider, blobs: Blobs, store: Store) -> Self {
         let blobs: Arc<dyn BlobStore> = match blobs {
             Blobs::Memory => Arc::new(MemoryBlobStore::new()),
             Blobs::Fs(root) => Arc::new(FsBlobStore::new(root)),
         };
-        let store = match db {
-            Db::Memory => Store::open_in_memory()?,
-            Db::File(path) => Store::open(path.to_str().ok_or(ServerError::BadConfig)?)?,
-        };
-        Ok(Self {
+        Self {
             state: AppState {
-                provider,
+                provider: Arc::new(provider),
                 blobs,
                 store: Arc::new(Mutex::new(store)),
                 day: 0,
             },
-        })
+        }
     }
 
     /// The provider's derived id (the boundary's signing identity).
@@ -148,6 +169,9 @@ impl App {
                 put(put_manifest_handler).get(get_manifest_handler),
             )
             .route("/{did}/meter", get(get_meter_handler))
+            // Liveness/readiness probe (croft-stack contract §2): fast,
+            // side-effect-free, `200 ok` once the router is serving.
+            .route("/healthz", get(healthz_handler))
             // The atproto PDS blob surface (Phase 8) — a thin layer over the
             // same metered byte-path, mounted at its XRPC paths.
             .merge(crate::pds_api::routes())
@@ -167,6 +191,32 @@ impl App {
         lock_store(&self.state.store).checkpoint_truncate()?;
         Ok(())
     }
+}
+
+/// The `meta` key under which the provider's key seed is persisted.
+const PROVIDER_SEED_KEY: &str = "provider_seed";
+
+/// Open the metering store from a [`Db`] config.
+fn open_store(db: Db) -> Result<Store, ServerError> {
+    match db {
+        Db::Memory => Ok(Store::open_in_memory()?),
+        Db::File(path) => Ok(Store::open(path.to_str().ok_or(ServerError::BadConfig)?)?),
+    }
+}
+
+/// Return the persisted provider seed, generating and persisting a fresh random
+/// one on first start. The seed lives in the canonical SQLite so it is backed up
+/// with the ledger it signs.
+fn resolve_or_create_provider_seed(store: &Store) -> Result<String, ServerError> {
+    if let Some(seed) = store.get_meta(PROVIDER_SEED_KEY)? {
+        return Ok(seed);
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|_| ServerError::BadConfig)?;
+    let seed = hex::encode(bytes);
+    bytes.zeroize();
+    store.put_meta(PROVIDER_SEED_KEY, &seed)?;
+    Ok(seed)
 }
 
 /// Recover the store guard even if a prior writer panicked: the metering
@@ -580,6 +630,12 @@ async fn get_meter_handler(
     Path(did): Path<String>,
 ) -> Result<OpOutcome, ServerError> {
     dispatch(&state, Op::GetMeter { did })
+}
+
+/// Liveness/readiness: `200 ok`. Side-effect-free — it neither reads the store
+/// nor the backend, so it stays fast under load (croft-stack contract §2).
+async fn healthz_handler() -> Response {
+    (StatusCode::OK, "ok").into_response()
 }
 
 /// The unimplemented S3 verb surface.

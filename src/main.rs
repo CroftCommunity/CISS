@@ -1,44 +1,57 @@
 //! The runnable CISS (Croft Item Storage Server) binary.
 //!
-//! The library ([`ciss`]) holds the metered-boundary logic; this binary
-//! is the deployable entry point — it cannot be `curl`'d or run from the lib
-//! alone. It wires configuration from the environment, binds (or inherits) a
-//! listening socket, serves the router with a SIGTERM graceful-shutdown path,
-//! and checkpoints the metering WAL on exit.
+//! The library ([`ciss`]) holds the metered-boundary logic; this binary is the
+//! deployable entry point — it cannot be `curl`'d or run from the lib alone. It
+//! honours the croft-stack tenant contract (`CONTRACT.md`): it takes
+//! `--data-dir <path>` and `--listen <host:port>`, keeps **all** state under the
+//! data dir, serves `GET /healthz` → `ok`, runs unprivileged, and binds a port
+//! ≥ 1024 (Caddy terminates TLS). It self-manages its layout under the data dir:
 //!
-//! Configuration (all optional, dev defaults shown):
-//! - `CISS_SEED` — provider key seed (`ciss-dev`). `SEAM:` a real deployment
-//!   loads the provider key from a secret store / KMS, not an env seed.
-//! - `CISS_BLOB_ROOT` — filesystem blob backend root (`./data/blocks`).
-//! - `CISS_DB` — per-DID metering SQLite path (`./data/meter.sqlite`).
-//! - `CISS_ADDR` — bind address when not socket-activated (`127.0.0.1:8080`).
+//! - `<data-dir>/meter.sqlite` — the per-DID metering ledger (**canonical**;
+//!   Litestream-backed). Also holds the persisted provider key seed, so the
+//!   signing identity survives a backup/restore.
+//! - `<data-dir>/blocks/` — content-addressed blob bytes (**blobs**;
+//!   rclone-mirrored, `--immutable`).
+//!
+//! Both paths are created on start (contract: create every declared path), and
+//! the binary installs a SIGTERM graceful-shutdown path that checkpoints the
+//! metering WAL on exit (E87). A systemd socket-activation fd is inherited when
+//! offered (E87 seam).
 
 use std::path::PathBuf;
 
 use ciss::server::{inherit_fd_requested, App, Blobs, Db};
 
+/// Resolved runtime configuration from the command line.
+struct Config {
+    data_dir: PathBuf,
+    listen: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
-    let seed = env_or("CISS_SEED", "ciss-dev");
-    let blob_root = PathBuf::from(env_or("CISS_BLOB_ROOT", "./data/blocks"));
-    let db_path = PathBuf::from(env_or("CISS_DB", "./data/meter.sqlite"));
-    let addr = env_or("CISS_ADDR", "127.0.0.1:8080");
+    let config = parse_args(std::env::args().skip(1))?;
+    let db_path = config.data_dir.join("meter.sqlite");
 
-    // Provision the data directories the binary owns (fail loud if we cannot):
-    // the SQLite path's parent must exist before the store opens, and the blob
-    // root before the first write.
-    std::fs::create_dir_all(&blob_root)?;
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Provision the layout the binary owns (fail loud if we cannot). The blob
+    // backend is rooted at the data dir: FsBlobStore lays content out under
+    // `<data-dir>/blocks/{did}/{cid}` with a sibling `<data-dir>/tmp/` staging
+    // dir — so the rclone-mirrored `blocks/` holds only permanent content and
+    // the transient staging path stays outside the mirror. Creating `blocks/`
+    // (which also creates the data dir) satisfies the contract's "create every
+    // declared path on start"; the store creates `meter.sqlite` on open.
+    std::fs::create_dir_all(config.data_dir.join("blocks"))?;
 
-    let app = App::new(&seed, Blobs::Fs(blob_root), Db::File(db_path))?;
+    // The provider identity is persisted in the metering store (generated on
+    // first start), so no seed/secret needs wiring into the unit.
+    let app = App::with_persistent_provider(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?;
 
-    let listener = listen(&addr).await?;
+    let listener = listen(&config.listen).await?;
     tracing::info!(
         provider = %app.provider_id(),
+        data_dir = %config.data_dir.display(),
         local = ?listener.local_addr().ok(),
         "CISS starting"
     );
@@ -53,8 +66,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_owned())
+/// Parse `--data-dir <path>` and `--listen <host:port>` from the arguments.
+///
+/// Dev defaults keep `cargo run` usable; the croft-stack generator always passes
+/// both explicitly. Unknown arguments and value-less flags are loud errors.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Config, String> {
+    let mut data_dir = PathBuf::from("./data");
+    let mut listen = String::from("127.0.0.1:8080");
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => {
+                data_dir = PathBuf::from(args.next().ok_or("--data-dir requires a value")?);
+            }
+            "--listen" => listen = args.next().ok_or("--listen requires a value")?,
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(Config { data_dir, listen })
 }
 
 fn init_tracing() {
@@ -104,5 +133,45 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+    use std::path::PathBuf;
+
+    fn parse(args: &[&str]) -> Result<(PathBuf, String), String> {
+        let cfg = parse_args(args.iter().map(|s| (*s).to_owned()))?;
+        Ok((cfg.data_dir, cfg.listen))
+    }
+
+    #[test]
+    fn flags_set_data_dir_and_listen() {
+        let (dir, listen) = parse(&["--data-dir", "/var/lib/ciss", "--listen", "127.0.0.1:8301"])
+            .expect("valid flags");
+        assert_eq!(dir, PathBuf::from("/var/lib/ciss"));
+        assert_eq!(listen, "127.0.0.1:8301");
+    }
+
+    #[test]
+    fn defaults_apply_when_flags_are_absent() {
+        let (dir, listen) = parse(&[]).expect("no args uses dev defaults");
+        assert_eq!(dir, PathBuf::from("./data"));
+        assert_eq!(listen, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn a_value_less_flag_is_a_loud_error() {
+        assert!(parse(&["--data-dir"]).is_err(), "--data-dir needs a value");
+        assert!(parse(&["--listen"]).is_err(), "--listen needs a value");
+    }
+
+    #[test]
+    fn an_unknown_flag_is_a_loud_error() {
+        assert!(
+            parse(&["--wat", "x"]).is_err(),
+            "unknown flags are rejected, not ignored",
+        );
     }
 }

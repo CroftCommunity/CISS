@@ -53,7 +53,13 @@ correctly.
   identically to an S3 one. Real CIDv1 (`raw` + sha-256) blob references close
   the hex-SHA-256 CID `SEAM:`; a mock-bearer auth `SEAM:` stands in for the real
   atproto OAuth/DPoP session on `uploadBlob`.
-- **Pending:** croft-stack VPS deploy (Phase 9).
+- **croft-stack deploy contract (Phase 9): ready.** The binary honours the
+  croft-stack tenant contract — `--data-dir <path>` + `--listen <host:port>`,
+  all state under the data dir (`meter.sqlite` canonical, `blocks/` blobs),
+  `GET /healthz` → `ok`, unprivileged, port ≥ 1024. The provider key seed is
+  persisted in the canonical SQLite (generated on first start), so the signing
+  identity survives a Litestream backup/restore with no external secret wiring.
+  Deployed as a governed, hardened tenant via `CroftCommunity/croft-stack`.
 
 ## The v0 metered boundary
 
@@ -89,15 +95,17 @@ PDS surface (`getRepo`/`getRecord`/`subscribeRepos`/…) is out of v0.
 ## Run it
 
 ```sh
-cargo run
-# configuration (env, dev defaults shown):
-#   CISS_SEED=ciss-dev              provider key seed (SEAM: real key from a KMS)
-#   CISS_BLOB_ROOT=./data/blocks    filesystem blob backend root
-#   CISS_DB=./data/meter.sqlite     per-DID metering SQLite
-#   CISS_ADDR=127.0.0.1:8080        bind address (or systemd socket-activated)
+cargo run -- --data-dir ./data --listen 127.0.0.1:8080
+# Two flags, nothing else (croft-stack contract §1). Dev defaults match the
+# above, so a bare `cargo run` also works. The binary self-manages its layout:
+#   <data-dir>/meter.sqlite   per-DID metering ledger (canonical; Litestream)
+#                             — also holds the persisted provider key seed
+#   <data-dir>/blocks/        content-addressed blob bytes (rclone --immutable)
+# Both are created on start. A systemd socket-activation fd is inherited when
+# offered (LISTEN_FDS/LISTEN_PID); SIGTERM drains + checkpoints the WAL.
 ```
 
-A metered round-trip:
+`GET /healthz` returns `200 ok` once serving. A metered round-trip:
 
 ```sh
 CID=$(printf 'hello' | shasum -a 256 | cut -d' ' -f1)

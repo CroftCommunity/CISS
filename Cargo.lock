@@ -171,10 +171,11 @@ dependencies = [
 
 [[package]]
 name = "ciss"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "ed25519-dalek",
+ "getrandom",
  "hex",
  "ipld-core",
  "reqwest",
