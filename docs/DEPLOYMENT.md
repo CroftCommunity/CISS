@@ -10,11 +10,11 @@ CISS runs as a governed croft-stack **tenant** on the OVH VPS:
 
 ```
    Internet ──HTTPS :443──▶ Caddy (shared, TLS via Let's Encrypt)
-                              name-routes by Host header:
-                                ciss.croft.ing → 127.0.0.1:8301   (CISS)
-                                canary.croft.ing → 127.0.0.1:8100
-                                stellin-staging… → 127.0.0.1:8101
-                                account.croft.ing → broker
+                              name-routes by Host header (the live vhosts):
+                                ciss.croft.ing    → 127.0.0.1:8301  (CISS)
+                                canary.croft.ing  → 127.0.0.1:8100  (contract/smoke canary)
+                                account.croft.ing → 127.0.0.1:8001  (OAuth broker)
+                                relay.croft.ing   → cert-only (iroh-relay serves its own TLS on :8443)
                               │  reverse_proxy (with request-retry)
                               ▼
    systemd: ciss.service  ──▶  /opt/ciss/current/ciss --data-dir /var/lib/ciss
@@ -24,6 +24,14 @@ CISS runs as a governed croft-stack **tenant** on the OVH VPS:
 ```
 
 The only path from the internet to CISS is `443 → Caddy → 127.0.0.1:8301`.
+
+The above is the *deployed* set (the `active_tenants` — ciss, canary — plus the
+broker and relay, which their own roles install). The croft-stack repo also
+*declares* the AppView-family tenants `appview-stellin` and `appview-croft-groups`
+(firehose-ingest + XRPC-serving AppViews, a different tier from CISS's storage
+role), but they are stub + not activated, so they have no vhost and do not appear
+on the box. `caddy-admin list` on the host is the source of truth for what is
+actually fronted.
 
 ## 2. The croft-stack tenant contract
 
@@ -148,7 +156,7 @@ ls /etc/caddy/conf.d/
 # fqdn -> backend port, at a glance:
 grep -H reverse_proxy /etc/caddy/conf.d/*.caddy
 # the tenant backends and their state:
-systemctl list-units --type=service | grep -E 'ciss|canary|stellin|croft-groups|broker|caddy'
+systemctl list-units --type=service | grep -E 'ciss|canary|appview|broker|relay|caddy'
 # from the repo (source of truth): croft-stack/generated/ports.json + generated/caddy/
 ```
 
