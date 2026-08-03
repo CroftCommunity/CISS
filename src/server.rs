@@ -86,7 +86,7 @@ pub enum Db {
 /// each) behind a small pool; here every DID co-locates in one connection,
 /// keyed by the `did` column.
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     provider: Arc<Provider>,
     blobs: Arc<dyn BlobStore>,
     store: Arc<Mutex<Store>>,
@@ -148,6 +148,9 @@ impl App {
                 put(put_manifest_handler).get(get_manifest_handler),
             )
             .route("/{did}/meter", get(get_meter_handler))
+            // The atproto PDS blob surface (Phase 8) — a thin layer over the
+            // same metered byte-path, mounted at its XRPC paths.
+            .merge(crate::pds_api::routes())
             .fallback(unimplemented_s3)
             .with_state(self.state.clone())
     }
@@ -174,7 +177,7 @@ fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 }
 
 /// A request routed through the dispatch boundary.
-enum Op {
+pub(crate) enum Op {
     PutObject {
         did: String,
         key: String,
@@ -195,6 +198,12 @@ enum Op {
     GetMeter {
         did: String,
     },
+    /// The content addresses (hex SHA-256) a DID has uploaded — the source for
+    /// the atproto `listBlobs` surface. Derived from the DID's upload receipts,
+    /// so it needs no backend enumeration primitive.
+    ListBlobs {
+        did: String,
+    },
 }
 
 impl Op {
@@ -212,13 +221,14 @@ impl Op {
             | Op::GetObject { .. }
             | Op::PutManifest { .. }
             | Op::GetManifest { .. }
-            | Op::GetMeter { .. } => false,
+            | Op::GetMeter { .. }
+            | Op::ListBlobs { .. } => false,
         }
     }
 }
 
 /// The result of a dispatched op, ready to render as an HTTP response.
-enum OpOutcome {
+pub(crate) enum OpOutcome {
     Stored {
         cid: String,
         bytes: u64,
@@ -242,11 +252,16 @@ enum OpOutcome {
         running_total_bytes: u64,
         postage_cents: u64,
     },
+    /// The distinct content addresses (hex SHA-256) a DID has uploaded, in
+    /// first-upload order. The atproto layer maps each to a CIDv1 `$link`.
+    BlobList {
+        cids: Vec<String>,
+    },
 }
 
 /// The single dispatch boundary. Every handler routes through here so the E83
 /// per-DID scope wrapper has one attach point.
-fn dispatch(state: &AppState, op: Op) -> Result<OpOutcome, ServerError> {
+pub(crate) fn dispatch(state: &AppState, op: Op) -> Result<OpOutcome, ServerError> {
     // SEAM (E83): a heavy op would enter a per-DID cgroup scope here; v0 ops are
     // all cheap, so dispatch runs in-process. The classification is live so the
     // wrapper slots in without a handler rewrite.
@@ -263,6 +278,7 @@ fn dispatch(state: &AppState, op: Op) -> Result<OpOutcome, ServerError> {
         } => op_put_manifest(state, &did, &pubkey_hex, &body),
         Op::GetManifest { did } => op_get_manifest(state, &did),
         Op::GetMeter { did } => op_get_meter(state, &did),
+        Op::ListBlobs { did } => op_list_blobs(state, &did),
     }
 }
 
@@ -488,6 +504,23 @@ fn op_get_meter(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
     })
 }
 
+/// The distinct content addresses a DID has uploaded, in first-upload order.
+/// The ledger's upload receipts are the source of truth for "which blobs this
+/// DID stored" — no backend enumeration primitive is required.
+fn op_list_blobs(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
+    let receipts = lock_store(&state.store).load_receipts(did)?;
+    let mut cids: Vec<String> = Vec::new();
+    for receipt in &receipts {
+        if receipt.core().direction == Direction::Upload {
+            let cid = receipt.core().cid.clone();
+            if !cids.contains(&cid) {
+                cids.push(cid);
+            }
+        }
+    }
+    Ok(OpOutcome::BlobList { cids })
+}
+
 // ---- HTTP handlers: extract inputs, route through the dispatch boundary. ----
 
 async fn put_object_handler(
@@ -612,6 +645,9 @@ impl IntoResponse for OpOutcome {
                 "postage_cents": postage_cents,
             }))
             .into_response(),
+            OpOutcome::BlobList { cids } => {
+                Json(serde_json::json!({ "cids": cids })).into_response()
+            }
         }
     }
 }
@@ -648,6 +684,12 @@ pub enum ServerError {
     /// A bilateral receipt was requested at the raw S3 boundary (unsupported).
     #[error("bilateral co-signing is not supported at the raw S3 boundary (SEAM)")]
     BilateralUnsupported,
+    /// An atproto `uploadBlob` arrived without a valid session (mock auth SEAM).
+    #[error("unauthorized: uploadBlob requires a bearer session")]
+    Unauthorized,
+    /// A blob CID could not be parsed as a CIDv1 raw + sha-256 address.
+    #[error("bad blob CID: {0}")]
+    BadCid(#[from] crate::cidv1::CidError),
     /// The boundary byte count disagreed with the backend (metering integrity).
     #[error("metering integrity: HTTP boundary {boundary} bytes != backend {written} bytes")]
     ByteCountMismatch {
@@ -668,8 +710,11 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = match self {
             ServerError::NotFound => StatusCode::NOT_FOUND,
-            ServerError::BadManifest(_) | ServerError::BadPubkey => StatusCode::BAD_REQUEST,
+            ServerError::BadManifest(_) | ServerError::BadPubkey | ServerError::BadCid(_) => {
+                StatusCode::BAD_REQUEST
+            }
             ServerError::DidKeyMismatch => StatusCode::FORBIDDEN,
+            ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::Tampered { .. } | ServerError::ByteCountMismatch { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -782,6 +827,7 @@ mod tests {
             },
             Op::GetManifest { did: "id:x".into() },
             Op::GetMeter { did: "id:x".into() },
+            Op::ListBlobs { did: "id:x".into() },
         ];
         for op in ops {
             assert!(!op.is_heavy(), "v0 ops are cheap and never cgroup-scoped");

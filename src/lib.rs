@@ -26,6 +26,7 @@
 pub mod audit;
 pub mod blobstore;
 pub mod canonical;
+pub mod cidv1;
 pub mod clock;
 pub mod crypto;
 pub mod dial;
@@ -34,6 +35,7 @@ pub mod identity;
 pub mod item;
 pub mod ledger;
 pub mod manifest;
+pub mod pds_api;
 pub mod persist;
 pub mod pricing;
 pub mod receipts;

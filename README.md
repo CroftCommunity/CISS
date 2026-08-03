@@ -1,10 +1,11 @@
 # CISS — Croft Item Storage Server
 
 A PDS-like **cooperative metered-storage server** in Rust: a network-accessible,
-custom storage server that exposes an **S3-compatible object interface** (and,
-in progress, an **atproto PDS blob API**) where the network boundary *is* the
-metering boundary. Every byte that crosses the boundary is metered with a signed
-receipt (postage), and rent derives from the customer's own signed manifest.
+custom storage server that exposes an **S3-compatible object interface** and an
+**atproto PDS blob API** over one metered byte-path, where the network boundary
+*is* the metering boundary. Every byte that crosses the boundary is metered with
+a signed receipt (postage), and rent derives from the customer's own signed
+manifest.
 
 CISS is destined for VPS deployment via **croft-stack** and doubles as the
 substrate for the MLS history-convergence server (one store, two consumers).
@@ -47,8 +48,12 @@ correctly.
   the customer-signed manifest surface; a graceful-shutdown + socket-activation
   seam; forward-compat seams for per-DID compute observability (E83) and
   kernel-perf backends (E84).
-- **Pending:** the atproto PDS blob API (`uploadBlob`/`getBlob`/`listBlobs`)
-  over the same metered path, then croft-stack VPS deploy.
+- **atproto PDS blob API (Phase 8): shipped.** `uploadBlob`/`getBlob`/`listBlobs`
+  as a thin layer over the *same* metered byte-path — an atproto transfer meters
+  identically to an S3 one. Real CIDv1 (`raw` + sha-256) blob references close
+  the hex-SHA-256 CID `SEAM:`; a mock-bearer auth `SEAM:` stands in for the real
+  atproto OAuth/DPoP session on `uploadBlob`.
+- **Pending:** croft-stack VPS deploy (Phase 9).
 
 ## The v0 metered boundary
 
@@ -62,6 +67,24 @@ correctly.
 
 Everything else on the S3 verb surface (DELETE, LIST, HEAD, multipart) is a
 `SEAM:` behind the fallback — not yet in v0.
+
+## The atproto PDS blob surface
+
+The Bluesky-facing blob endpoints (canonical lexicon shapes), a thin layer over
+the same metered byte-path — so an atproto transfer produces the same signed
+receipts as the S3 plane. The network speaks CIDv1 (`ref.$link`); the backend is
+keyed by the same digest in hex, and `cidv1.rs` bridges the two losslessly.
+
+| Method | Path | Meaning |
+|---|---|---|
+| `POST` | `/xrpc/com.atproto.repo.uploadBlob` | **Auth required.** Store the raw-body blob in the authed repo; metered. Returns `{"blob":{"$type":"blob","ref":{"$link":"<CIDv1>"},"mimeType":"<ct>","size":<int>}}`. |
+| `GET` | `/xrpc/com.atproto.sync.getBlob?did=&cid=` | **Public.** Return the raw bytes addressed by the CIDv1; metered. |
+| `GET` | `/xrpc/com.atproto.sync.listBlobs?did=` | **Public.** The CIDv1 addresses the DID has uploaded: `{"cids":[...]}`. |
+
+`SEAM:`s: `uploadBlob` auth is a mock bearer check (the token stands in for the
+DID; real atproto OAuth/DPoP is a later spike); `getBlob`'s Content-Type echo and
+`listBlobs` pagination (`cursor`/`since`/`limit`) are deferred. The rest of the
+PDS surface (`getRepo`/`getRecord`/`subscribeRepos`/…) is out of v0.
 
 ## Run it
 
@@ -83,6 +106,17 @@ curl http://127.0.0.1:8080/id:me/objects/$CID      # -> hello
 curl http://127.0.0.1:8080/id:me/meter             # -> receipt tally
 ```
 
+The same round-trip over the atproto surface (a real CIDv1 comes back):
+
+```sh
+LINK=$(curl -s -X POST -H 'Authorization: Bearer did:plc:me' \
+  --data-binary 'hello' \
+  http://127.0.0.1:8080/xrpc/com.atproto.repo.uploadBlob \
+  | sed -E 's/.*"\$link":"([^"]+)".*/\1/')
+curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.getBlob?did=did:plc:me&cid=$LINK"   # -> hello
+curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.listBlobs?did=did:plc:me"           # -> {"cids":[...]}
+```
+
 ## Develop
 
 Standalone crate. From the repo root:
@@ -90,10 +124,12 @@ Standalone crate. From the repo root:
 ```sh
 cargo test                              # full suite (unit + wiring + abuse)
 cargo test --test wiring_s3_metered     # the Phase-7 anti-dead-code wiring gate
+cargo test --test wiring_pds_blob       # the Phase-8 atproto wiring gate
 cargo test --test e86_abuse             # the end-to-end abuse suite
 cargo clippy --all-targets -- -W clippy::pedantic -D warnings
 cargo fmt --check
 cargo mutants --file src/server.rs --file src/blobstore.rs   # mutation gate
+cargo mutants --file src/cidv1.rs --file src/pds_api.rs       # Phase-8 mutation gate
 ```
 
 ## Provenance
