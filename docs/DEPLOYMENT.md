@@ -38,7 +38,12 @@ actually fronted.
 CISS satisfies `croft-stack/CONTRACT.md` so it drops in with no kit changes:
 
 - `--data-dir <path>` + `--listen <host:port>`, nothing else required to start.
-- `GET /healthz` → `200 ok` once serving.
+- `GET /healthz` → `200 ok` once serving. It is exempt from the app's request
+  timeout + concurrency limits (it does no work and must not be starved), and its
+  *public* exposure is controlled at the Caddy edge, not the app — see
+  [`adr/0002-healthz-exposure-and-limit-exemption.md`](adr/0002-healthz-exposure-and-limit-exemption.md).
+  **TODO (croft-stack):** restrict `/healthz` on the `ciss.croft.ing` vhost to a
+  loopback + monitoring-host allowlist; currently it answers the public internet.
 - **All** state under the data dir; no root; port ≥ 1024 (TLS is Caddy's).
 - Self-managed layout matching the manifest's `data_profile`:
   `meter.sqlite` (canonical) + `blocks/` (blobs) + `tmp/` (staging, outside the mirror).
