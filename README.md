@@ -9,8 +9,9 @@ customer's own signed manifest — never from the storage backend.
 
 CISS is the productionization of the proven `item-storage-protocol` experiment.
 It runs live as a governed [croft-stack](https://github.com/CroftCommunity/croft-stack)
-tenant and doubles as the substrate for a content-blind history-convergence
-server (one store, two consumers).
+tenant, and is designed to also serve as the substrate for a *planned* content-blind
+history-convergence server (one store, two consumers — the second consumer is not
+built yet).
 
 - **Live:** `https://ciss.croft.ing`
 - **Design docs:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
@@ -62,7 +63,7 @@ CISS is two layers that compose but never conflate:
   so any S3-compatible store (FS today; Garage/SeaweedFS/R2 later) can stand in,
   and a compromised backend still cannot forge a bill or slip a bad blob past
   Layer 2.
-- **Layer 2 (`server.rs` + `pds_api.rs`)** is the boundary. It content-addresses
+- **Layer 2 (`server.rs` + `pds_api.rs` + `cidv1.rs`)** is the boundary. It content-addresses
   (SHA-256), re-verifies bytes on the way out (tamper-at-rest is caught here),
   meters each transfer with a provider-signed receipt in the customer's per-DID
   SQLite ledger, and derives rent from the customer's signed manifest.

@@ -104,10 +104,11 @@ ciss.croft.ing {
 }
 ```
 
-Verified live: **120/120 requests returned 200 across a full `systemctl restart
-ciss`.** Retry is safe for PUT/POST — Caddy only retries when the dial fails,
-before any bytes reach the upstream. True zero-downtime (kernel holds the socket)
-is the E87 socket-activation stretch.
+Verified live (point-in-time check, 2026-08-03; recorded in the croft-stack
+`reviews/2026-08-03-stack-review.md`): **120/120 requests returned 200 across a
+full `systemctl restart ciss`.** Retry is safe for PUT/POST — Caddy only retries
+when the dial fails, before any bytes reach the upstream. True zero-downtime
+(kernel holds the socket) is the E87 socket-activation stretch.
 
 ## 6. Data profile & backup
 
