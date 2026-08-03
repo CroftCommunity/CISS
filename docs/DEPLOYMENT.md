@@ -1,0 +1,201 @@
+# CISS deployment & operations
+
+How CISS is packaged, deployed as a [croft-stack](https://github.com/CroftCommunity/croft-stack)
+tenant, governed, and operated — including the incident runbook for the Caddy
+front. For the design/internals see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## 1. Where it runs
+
+CISS runs as a governed croft-stack **tenant** on the OVH VPS:
+
+```
+   Internet ──HTTPS :443──▶ Caddy (shared, TLS via Let's Encrypt)
+                              name-routes by Host header:
+                                ciss.croft.ing → 127.0.0.1:8301   (CISS)
+                                canary.croft.ing → 127.0.0.1:8100
+                                stellin-staging… → 127.0.0.1:8101
+                                account.croft.ing → broker
+                              │  reverse_proxy (with request-retry)
+                              ▼
+   systemd: ciss.service  ──▶  /opt/ciss/current/ciss --data-dir /var/lib/ciss
+   (User=ciss, hardened,        --listen 127.0.0.1:8301
+    cgroup-governed)           binds LOOPBACK ONLY — nftables opens only 22/80/443,
+                               so 8301 is unreachable from the internet.
+```
+
+The only path from the internet to CISS is `443 → Caddy → 127.0.0.1:8301`.
+
+## 2. The croft-stack tenant contract
+
+CISS satisfies `croft-stack/CONTRACT.md` so it drops in with no kit changes:
+
+- `--data-dir <path>` + `--listen <host:port>`, nothing else required to start.
+- `GET /healthz` → `200 ok` once serving.
+- **All** state under the data dir; no root; port ≥ 1024 (TLS is Caddy's).
+- Self-managed layout matching the manifest's `data_profile`:
+  `meter.sqlite` (canonical) + `blocks/` (blobs) + `tmp/` (staging, outside the mirror).
+
+The tenant manifest is `croft-stack/services/ciss.toml`:
+
+```toml
+name = "ciss"; fqdn = "ciss.croft.ing"; port = 8301
+artifact = "github:CroftCommunity/CISS/releases"; serve_api = false
+[limits] memory_high="256M" memory_max="384M" cpu_quota="60%" tasks_max=256 io_weight=200
+[data_profile] canonical=["meter.sqlite"] blobs=["blocks/"] blobs_immutable=["blocks/"]
+```
+
+## 3. Packaging & release
+
+CISS ships as a **pinned, checksummed GitHub release binary** (the same pattern
+croft-stack uses for the iroh relay):
+
+1. Build a release binary for the box (`cargo build --release`). The current
+   estate is Debian 13 (trixie, glibc 2.41, x86_64), so the v0.1.0 asset is a
+   stripped **glibc** build. *(A fully-static `x86_64-unknown-linux-musl` build is
+   the portability hardening follow-up; on a single trixie box the glibc build is
+   correct and simplest.)*
+2. Package + checksum: `tar czf ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz ciss` and
+   record its `sha256sum`.
+3. Publish: `gh release create vX.Y.Z -R CroftCommunity/CISS <tarball>`.
+4. Pin it in `croft-stack/ansible/group_vars/all.yml` under the `ciss`
+   `active_tenants` entry: `binary_version`, `binary_url`, `binary_sha256`.
+
+The croft-stack `tenants` role then `get_url`s the tarball (verifying the
+checksum) and unpacks `ciss` to `/opt/ciss/current/ciss` — the exact path the
+generated unit's `ExecStart` uses.
+
+## 4. The systemd unit (generated, governed, hardened)
+
+`render.py` emits `ciss.service` from the manifest. Every tenant unit is
+hardened + cgroup-governed by default:
+
+- `User=ciss`, `StateDirectory=ciss` (0700 `/var/lib/ciss`), `WorkingDirectory`
+  + `ReadWritePaths` = the data dir only.
+- `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `MemoryDenyWriteExecute`,
+  `SystemCallFilter=@system-service`, empty `CapabilityBoundingSet` — a Rust
+  binary (no JIT) takes the full sandbox; `systemd-analyze security ciss.service`
+  ≈ **1.5 (OK)**.
+- `MemoryAccounting`/`CPUAccounting`/`IOAccounting`/`TasksAccounting=yes` plus the
+  manifest's limits (`MemoryHigh=256M`, `MemoryMax=384M`, `CPUQuota=60%`,
+  `TasksMax=256`, `IOWeight=200`).
+- `Restart=always`, `RestartSec=2`.
+
+## 5. Caddy front + zero-downtime posture
+
+The generated vhost (`ciss.croft.ing.caddy`) reverse-proxies `443 →
+127.0.0.1:8301` with **request-retry** so a tenant restart doesn't 502:
+
+```caddy
+ciss.croft.ing {
+	reverse_proxy 127.0.0.1:8301 {
+		lb_try_duration 5s      # hold + re-dial the upstream across a restart
+		lb_try_interval 250ms   # (graceful drain covers in-flight; this covers new)
+	}
+	encode gzip
+	header -Server
+}
+```
+
+Verified live: **120/120 requests returned 200 across a full `systemctl restart
+ciss`.** Retry is safe for PUT/POST — Caddy only retries when the dial fails,
+before any bytes reach the upstream. True zero-downtime (kernel holds the socket)
+is the E87 socket-activation stretch.
+
+## 6. Data profile & backup
+
+| Path | Class | Backup mechanism | Status |
+|---|---|---|---|
+| `meter.sqlite` | canonical | Litestream → R2 (`sync-interval 1s`) | unit **generated, not yet activated** |
+| `blocks/` | blobs, immutable | rclone `sync --immutable` → R2 | unit **generated, not yet activated** |
+
+The Litestream/rclone units are rendered but **not enabled** — they need the R2
+credential environment wired into the estate. **R2 backup is set aside for now
+(2026-08-03).** Until then, `meter.sqlite` is not mirrored off-box; treat the
+deployment as test/dogfood, not durable-of-record. `blocks/` is content-addressed,
+so its mirror uses `--immutable` (no overwrite/delete churn) once activated.
+
+## 7. Telemetry
+
+The croft-stack telemetry poller reads **cgroup v2** files per unit
+(`/sys/fs/cgroup/system.slice/ciss.service/{memory.current,cpu.stat,pids.current,io.stat}`)
+— it does **not** scrape logs. CISS emits no app-level metrics; its governed unit
+is enough. App-level `tracing` goes to **journald** for debugging
+(`journalctl -u ciss`) and carries only the *public* provider id — no key material.
+
+## 8. Deploy / upgrade a version
+
+```sh
+# 1. build + publish a new release (see §3), pin it in group_vars/all.yml
+# 2. converge (from croft-stack/ansible):
+ansible-playbook site.yml                 # full, idempotent, no-lockout-safe
+#   or scope to the tenant + front + telemetry with a small play running only
+#   the caddy, tenants, telemetry roles.
+# 3. verify:
+curl -sS https://ciss.croft.ing/healthz   # -> 200 ok
+```
+
+The `tenants` role's unpack is guarded by `creates: /opt/ciss/current/ciss`, so a
+*new* version needs the current binary cleared (or the release path bumped) to
+re-extract; then `systemctl restart ciss` (Caddy retry masks it).
+
+## 9. Incident runbook — the Caddy front
+
+**Quick-list what Caddy is brokering for** (on the box):
+
+```sh
+# each *.caddy in conf.d is one fronted site:
+ls /etc/caddy/conf.d/
+# fqdn -> backend port, at a glance:
+grep -H reverse_proxy /etc/caddy/conf.d/*.caddy
+# the tenant backends and their state:
+systemctl list-units --type=service | grep -E 'ciss|canary|stellin|croft-groups|broker|caddy'
+# from the repo (source of truth): croft-stack/generated/ports.json + generated/caddy/
+```
+
+Caddy's admin API is on a root/caddy-only unix socket (not `localhost:2019`):
+`sudo curl --unix-socket /run/caddy/admin.sock http://localhost/config/` dumps the
+live config as JSON if you need to inspect what is actually loaded.
+
+**Disable / enable a fronted backend during an incident.** Two levers:
+
+*(a) Take a site off the internet (cut at Caddy; process keeps running).* Best for
+abuse/DNS/"make it stop serving now" — instant, clean, and does not touch data:
+
+```sh
+# disable — the Caddyfile imports conf.d/*.caddy, so renaming drops it from the glob
+sudo mv /etc/caddy/conf.d/ciss.croft.ing.caddy /etc/caddy/conf.d/ciss.croft.ing.caddy.disabled
+sudo systemctl reload caddy      # graceful; a bad config is rejected, old config kept
+
+# re-enable
+sudo mv /etc/caddy/conf.d/ciss.croft.ing.caddy.disabled /etc/caddy/conf.d/ciss.croft.ing.caddy
+sudo systemctl reload caddy
+```
+
+*(b) Stop the backend itself (process down).* Best for a runaway/compromised
+service; data at rest is untouched:
+
+```sh
+sudo systemctl stop ciss.service            # down now
+sudo systemctl start ciss.service           # back up
+sudo systemctl disable --now ciss.service   # down + stays down across reboot
+```
+
+**Which lever:** to take a site *offline*, prefer (a) — with `lb_try_duration 5s`
+in place, merely *stopping* the backend makes Caddy hold each request ~5s **then**
+502 (a hang, not a clean cutoff). Use (b) when the goal is to kill the process
+(compromise, memory runaway), and pair it with (a) if you also want the public
+name to stop answering immediately. `systemctl stop caddy` takes **every** site
+down — reserve it for an incident in Caddy itself.
+
+**Reconcile afterward.** These are imperative, box-local overrides. The
+declarative source of truth is `active_tenants` in `croft-stack/group_vars` — a
+future `ansible-playbook site.yml` will re-enable a tenant you only stopped
+imperatively. After the incident, either restore the imperative state or, for a
+lasting change, remove the tenant from `active_tenants` and re-converge.
+
+## 10. VPS baseline (for reference)
+
+Debian 13 (trixie), kernel 6.12, systemd 257, cgroup v2 unified, x86_64 +
+glibc 2.41, **ext4**. Consequences: E84 reflink is N/A (ext4 has no CoW; the
+FsBlobStore temp→rename baseline is the whole story); systemd 257 fully supports
+the E87 socket-activation seam when we choose to wire it.

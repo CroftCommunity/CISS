@@ -1,111 +1,88 @@
 # CISS — Croft Item Storage Server
 
-A PDS-like **cooperative metered-storage server** in Rust: a network-accessible,
-custom storage server that exposes an **S3-compatible object interface** and an
-**atproto PDS blob API** over one metered byte-path, where the network boundary
-*is* the metering boundary. Every byte that crosses the boundary is metered with
-a signed receipt (postage), and rent derives from the customer's own signed
-manifest.
+A PDS-like **cooperative metered-storage server** in Rust. CISS exposes an
+**S3-compatible object interface** and an **atproto PDS blob API**
+(`uploadBlob`/`getBlob`/`listBlobs`) over **one metered byte-path**, where the
+network boundary *is* the metering boundary: every byte that crosses it is
+metered with a provider-signed receipt (postage), and rent is derived from the
+customer's own signed manifest — never from the storage backend.
 
-CISS is destined for VPS deployment via **croft-stack** and doubles as the
-substrate for the MLS history-convergence server (one store, two consumers).
+CISS is the productionization of the proven `item-storage-protocol` experiment.
+It runs live as a governed [croft-stack](https://github.com/CroftCommunity/croft-stack)
+tenant and doubles as the substrate for a content-blind history-convergence
+server (one store, two consumers).
 
-## Design: meter the boundary, not the machine
+- **Live:** `https://ciss.croft.ing`
+- **Design docs:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+- **Full build plan / provenance** (reasoning, per-phase design, decisions): the
+  `discovery` repo, `alpha/plans/2026-07-31-1-plan-coop-metered-storage-service.md`.
+
+---
+
+## Why CISS exists (the use case)
+
+A cooperative that hosts storage for its members needs a way to charge honestly
+for what it actually costs to store and move bytes — **without** trusting the
+operator's word for the bill, and **without** the operator having to trust the
+member's word either. CISS makes the meter itself verifiable:
+
+- **The member** keeps a signed **manifest** of what they asked to store (CIDs +
+  sizes). Rent (bytes-at-rest × days) is a pure function of *their own* signed
+  document, so they can recompute the bill independently.
+- **The provider** signs a **receipt** for every transfer (bytes in/out). The
+  receipts form an append-only, hash-linked ledger; a monthly balance-forward
+  **statement** nets opening state + receipts + byte-days into a closing state
+  both parties can check.
+- **Neither side can quietly cheat:** content is addressed by its own hash
+  (tamper-at-rest is caught on read), receipts and statements are signed, and
+  the arithmetic is exact integer cents.
+
+Because it speaks the **atproto blob API**, CISS is also a PDS-shaped node on the
+Bluesky network — it can host blobs for a repo without owning the identity — and
+because it speaks a plain **S3 PUT/GET** interface, it is usable as ordinary
+metered object storage. The two surfaces share one metering plane.
+
+## The core idea: meter the boundary, not the machine
 
 CISS is two layers that compose but never conflate:
 
 ```
-   HTTP boundary  ── Layer 2: metering / crypto provenance ──┐
-   (S3 / atproto)     signed receipts (postage) + the         │  the ledger
-                      customer's signed manifest (rent)        │  (E0–E9)
-        │             + statements / audit / seal              │
-        ▼                                                       ▼
-   BlobStore trait ── Layer 1: dumb bytes-under-a-key backend ─┘
+   HTTP boundary  ── Layer 2: metering / crypto provenance ────────────┐
+   S3  ·  atproto    content-address (SHA-256) + re-verify on read;     │  the ledger
+   ·  manifest       provider-signed receipt per transfer (postage);    │  (E0–E9),
+   ·  meter          rent from the customer's signed manifest;          │  per-DID
+        │            statements · audit · seal · grace                   │  SQLite
+        ▼                                                                ▼
+   BlobStore trait ── Layer 1: dumb bytes-under-a-key backend ──────────┘
    (memory · FS · …)   never meters, never verifies, never trusted
 ```
 
-- **Layer 1 (`blobstore.rs`)** is a deliberately dumb, pluggable byte store
-  keyed by `(DID, CID)`. FS-first; Garage/SeaweedFS/R2 are later backends behind
-  the same `BlobStore` trait. It never meters and never content-checks.
-- **Layer 2 (`server.rs`)** is the boundary: it content-addresses (SHA-256),
-  re-verifies bytes on the way out (tamper-at-rest is caught here), meters each
-  transfer with a provider-signed receipt in the customer's per-DID SQLite
-  ledger, and derives rent from the customer's signed manifest.
+- **Layer 1 (`blobstore.rs`)** is a deliberately dumb, pluggable byte store keyed
+  by `(DID, CID)`. It never meters, never content-checks, holds no provenance —
+  so any S3-compatible store (FS today; Garage/SeaweedFS/R2 later) can stand in,
+  and a compromised backend still cannot forge a bill or slip a bad blob past
+  Layer 2.
+- **Layer 2 (`server.rs` + `pds_api.rs`)** is the boundary. It content-addresses
+  (SHA-256), re-verifies bytes on the way out (tamper-at-rest is caught here),
+  meters each transfer with a provider-signed receipt in the customer's per-DID
+  SQLite ledger, and derives rent from the customer's signed manifest.
 
-The provenance comes from the two parties' keys plus the customer's manifest —
-never from the backend. That is why a blind, untrusted backend still bills
-correctly.
+Provenance comes from the two parties' keys plus the customer's manifest — never
+from the backend. That is *why* a blind, untrusted backend still bills correctly.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full model.
 
-## Status
-
-- **E0–E9 metering ledger core: complete, mutation-gated.** Identity/crypto,
-  content-addressed items + a customer-signed Merkle manifest, two-mode transfer
-  receipts over an append-only signed ledger, balance-forward statements with
-  byte-day rent + rollup/purge + per-user SQLite, k-sample spot-check audit with
-  the assurance dial, and the seal/tombstone/grace tiers.
-- **S3-compatible metered boundary (Phase 7): shipped.** A real axum HTTP server
-  where PUT/GET are metered end-to-end; a pluggable `BlobStore` (memory + FS);
-  the customer-signed manifest surface; a graceful-shutdown + socket-activation
-  seam; forward-compat seams for per-DID compute observability (E83) and
-  kernel-perf backends (E84).
-- **atproto PDS blob API (Phase 8): shipped.** `uploadBlob`/`getBlob`/`listBlobs`
-  as a thin layer over the *same* metered byte-path — an atproto transfer meters
-  identically to an S3 one. Real CIDv1 (`raw` + sha-256) blob references close
-  the hex-SHA-256 CID `SEAM:`; a mock-bearer auth `SEAM:` stands in for the real
-  atproto OAuth/DPoP session on `uploadBlob`.
-- **croft-stack deploy contract (Phase 9): ready.** The binary honours the
-  croft-stack tenant contract — `--data-dir <path>` + `--listen <host:port>`,
-  all state under the data dir (`meter.sqlite` canonical, `blocks/` blobs),
-  `GET /healthz` → `ok`, unprivileged, port ≥ 1024. The provider key seed is
-  persisted in the canonical SQLite (generated on first start), so the signing
-  identity survives a Litestream backup/restore with no external secret wiring.
-  Deployed as a governed, hardened tenant via `CroftCommunity/croft-stack`.
-
-## The v0 metered boundary
-
-| Method | Path | Meaning |
-|---|---|---|
-| `PUT` | `/{did}/objects/{key}` | Store bytes; content-addressed by SHA-256; metered (a provider-signed upload receipt). Returns `{cid, bytes, receipt_mode}` + `ETag`. |
-| `GET` | `/{did}/objects/{cid}` | Return the exact bytes (re-verified); metered (a download receipt). |
-| `PUT` | `/{did}/manifest` | Store the customer's signed manifest (header `x-croft-pubkey`; the DID must be the key's fingerprint). Rent base. |
-| `GET` | `/{did}/manifest` | The stored signed manifest. |
-| `GET` | `/{did}/meter` | Metering summary: `{receipt_count, upload_bytes, download_bytes, running_total_bytes, postage_cents}`. |
-
-Everything else on the S3 verb surface (DELETE, LIST, HEAD, multipart) is a
-`SEAM:` behind the fallback — not yet in v0.
-
-## The atproto PDS blob surface
-
-The Bluesky-facing blob endpoints (canonical lexicon shapes), a thin layer over
-the same metered byte-path — so an atproto transfer produces the same signed
-receipts as the S3 plane. The network speaks CIDv1 (`ref.$link`); the backend is
-keyed by the same digest in hex, and `cidv1.rs` bridges the two losslessly.
-
-| Method | Path | Meaning |
-|---|---|---|
-| `POST` | `/xrpc/com.atproto.repo.uploadBlob` | **Auth required.** Store the raw-body blob in the authed repo; metered. Returns `{"blob":{"$type":"blob","ref":{"$link":"<CIDv1>"},"mimeType":"<ct>","size":<int>}}`. |
-| `GET` | `/xrpc/com.atproto.sync.getBlob?did=&cid=` | **Public.** Return the raw bytes addressed by the CIDv1; metered. |
-| `GET` | `/xrpc/com.atproto.sync.listBlobs?did=` | **Public.** The CIDv1 addresses the DID has uploaded: `{"cids":[...]}`. |
-
-`SEAM:`s: `uploadBlob` auth is a mock bearer check (the token stands in for the
-DID; real atproto OAuth/DPoP is a later spike); `getBlob`'s Content-Type echo and
-`listBlobs` pagination (`cursor`/`since`/`limit`) are deferred. The rest of the
-PDS surface (`getRepo`/`getRecord`/`subscribeRepos`/…) is out of v0.
-
-## Run it
+## Quickstart
 
 ```sh
 cargo run -- --data-dir ./data --listen 127.0.0.1:8080
-# Two flags, nothing else (croft-stack contract §1). Dev defaults match the
-# above, so a bare `cargo run` also works. The binary self-manages its layout:
-#   <data-dir>/meter.sqlite   per-DID metering ledger (canonical; Litestream)
-#                             — also holds the persisted provider key seed
-#   <data-dir>/blocks/        content-addressed blob bytes (rclone --immutable)
-# Both are created on start. A systemd socket-activation fd is inherited when
-# offered (LISTEN_FDS/LISTEN_PID); SIGTERM drains + checkpoints the WAL.
+# Two flags, nothing else (croft-stack contract). Dev defaults match the above,
+# so a bare `cargo run` also works. The binary self-manages its layout:
+#   <data-dir>/meter.sqlite   per-DID metering ledger (+ persisted provider seed)
+#   <data-dir>/blocks/        content-addressed blob bytes ({did}/{cid})
+#   <data-dir>/tmp/           write staging (temp→rename), outside blocks/
 ```
 
-`GET /healthz` returns `200 ok` once serving. A metered round-trip:
+A metered round-trip over the S3 surface:
 
 ```sh
 CID=$(printf 'hello' | shasum -a 256 | cut -d' ' -f1)
@@ -121,28 +98,142 @@ LINK=$(curl -s -X POST -H 'Authorization: Bearer did:plc:me' \
   --data-binary 'hello' \
   http://127.0.0.1:8080/xrpc/com.atproto.repo.uploadBlob \
   | sed -E 's/.*"\$link":"([^"]+)".*/\1/')
-curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.getBlob?did=did:plc:me&cid=$LINK"   # -> hello
-curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.listBlobs?did=did:plc:me"           # -> {"cids":[...]}
+curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.getBlob?did=did:plc:me&cid=$LINK"  # -> hello
+curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.listBlobs?did=did:plc:me"          # -> {"cids":[...]}
 ```
 
-## Develop
+## API surface
 
-Standalone crate. From the repo root:
+### S3-compatible metering plane
+
+| Method | Path | Meaning |
+|---|---|---|
+| `PUT` | `/{did}/objects/{key}` | Store bytes; content-addressed by SHA-256; metered (provider-signed **upload** receipt). Returns `{cid, bytes, receipt_mode}` + `ETag`. |
+| `GET` | `/{did}/objects/{cid}` | Return the exact bytes (re-verified against the CID); metered (**download** receipt). |
+| `PUT` | `/{did}/manifest` | Store the customer's signed manifest (header `x-croft-pubkey`; the DID must be the key's fingerprint). The rent base. |
+| `GET` | `/{did}/manifest` | The stored signed manifest. |
+| `GET` | `/{did}/meter` | Metering summary: `{receipt_count, upload_bytes, download_bytes, running_total_bytes, postage_cents}`. |
+
+DELETE / LIST / HEAD / multipart are a `SEAM:` behind the fallback (`501`), not in v0.
+
+### atproto PDS blob surface
+
+Canonical lexicon shapes, a thin layer over the *same* metered byte-path — an
+atproto transfer produces the same signed receipts as an S3 one. The network
+speaks CIDv1 (`ref.$link`); the backend is keyed by the same digest in hex, and
+`cidv1.rs` bridges the two losslessly.
+
+| Method | Path | Meaning |
+|---|---|---|
+| `POST` | `/xrpc/com.atproto.repo.uploadBlob` | **Auth required.** Store the raw-body blob in the authed repo; metered. Returns `{"blob":{"$type":"blob","ref":{"$link":"<CIDv1>"},"mimeType":"<ct>","size":<int>}}`. |
+| `GET` | `/xrpc/com.atproto.sync.getBlob?did=&cid=` | **Public.** Return the raw bytes addressed by the CIDv1; metered. |
+| `GET` | `/xrpc/com.atproto.sync.listBlobs?did=` | **Public.** The CIDv1 addresses a DID has uploaded: `{"cids":[...]}`. |
+
+### Operational endpoints
+
+| Method | Path | Meaning |
+|---|---|---|
+| `GET` | `/healthz` | `200 ok` once serving. Fast, side-effect-free (croft-stack readiness probe). |
+
+## Configuration
+
+The binary takes exactly two flags (the croft-stack tenant contract) and manages
+everything else itself:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--data-dir <path>` | `./data` | Root of all state. `meter.sqlite`, `blocks/`, `tmp/` live here. Created on start. |
+| `--listen <host:port>` | `127.0.0.1:8080` | Bind address. Always a port ≥ 1024 (TLS is Caddy's job). |
+
+- The **provider key seed** is generated on first start and persisted in
+  `meter.sqlite`, so the signing identity survives a backup/restore with no
+  external secret wiring. `SEAM:` a real deployment loads it from a KMS.
+- A systemd **socket-activation** fd is inherited when offered
+  (`LISTEN_FDS`/`LISTEN_PID`); **SIGTERM** triggers a graceful drain + a WAL
+  checkpoint before exit.
+
+## Repository layout
+
+```
+src/
+  # Layer 2 — the metered boundary
+  server.rs        the S3 boundary + Op-dispatch + metering hook + HTTP mapping
+  pds_api.rs       the atproto blob surface (uploadBlob/getBlob/listBlobs)
+  cidv1.rs         real CIDv1 (raw+sha-256) <-> hex-digest bridge for blob refs
+  main.rs          the runnable binary (flags, layout, graceful shutdown)
+  # Layer 1 — the dumb backend
+  blobstore.rs     BlobStore trait + MemoryBlobStore + FsBlobStore ({did}/{cid})
+  # The E0–E9 ledger core (proven; ported from the item-storage-protocol)
+  crypto.rs        SHA-256 fingerprints + Ed25519 sign/verify (zeroized keys)
+  identity.rs      an actor is a keypair; its id is derived from its public key
+  item.rs          content-addressed items + the in-memory content store
+  manifest.rs      the customer's signed Merkle manifest (what to store; rent base)
+  receipts.rs      signed transfer receipts (Bilateral | Unilateral postage)
+  ledger.rs        append-only, hash-linked, signed per-actor ledgers
+  statements.rs    balance-forward statements + byte-day rent + rollup/purge
+  audit.rs         k-sample spot-check audit (detection math over a seeded RNG)
+  dial.rs          the assurance dial — priced, signed assurance setting
+  seal.rs          seal / tombstone tiers (pin-a-root, fail-closed ceremonies)
+  grace.rs         the grace ledger — co-signed mercy events that net to zero
+  pricing.rs       the price list (integer cents; postage + rent)
+  canonical.rs     the one canonical byte-string every signature/hash is taken over
+  clock.rs         a deterministic day clock (time advances only when told)
+  rng.rs           a seeded deterministic PRNG (mulberry32; bit-exact parity)
+  persist.rs       per-DID SQLite (manifests, receipts, statements, meta kv)
+tests/
+  e0..e9_*.rs      per-tier behavioral suites (the E0–E9 oracle parity)
+  e86_abuse.rs     end-to-end abuse suite (forge/replay/tamper/walkaway/…)
+  wiring_*.rs      anti-dead-code gates: s3_metered, pds_blob, contract, persist, checkpoint
+docs/              ARCHITECTURE.md, DEPLOYMENT.md
+```
+
+## Testing & quality gates
 
 ```sh
 cargo test                              # full suite (unit + wiring + abuse)
-cargo test --test wiring_s3_metered     # the Phase-7 anti-dead-code wiring gate
-cargo test --test wiring_pds_blob       # the Phase-8 atproto wiring gate
+cargo test --test wiring_s3_metered     # Phase-7 S3 anti-dead-code gate
+cargo test --test wiring_pds_blob       # Phase-8 atproto gate
+cargo test --test wiring_contract       # Phase-9 croft-stack contract gate
 cargo test --test e86_abuse             # the end-to-end abuse suite
 cargo clippy --all-targets -- -W clippy::pedantic -D warnings
 cargo fmt --check
 cargo mutants --file src/server.rs --file src/blobstore.rs   # mutation gate
-cargo mutants --file src/cidv1.rs --file src/pds_api.rs       # Phase-8 mutation gate
+cargo mutants --file src/cidv1.rs  --file src/pds_api.rs     # (Phase-8)
 ```
 
-## Provenance
+Discipline: TDD (every wiring test is RED→GREEN), `clippy::pedantic` clean, no
+`unwrap`/`expect` on production paths, `Zeroize` on key material, and a
+mutation-testing gate (kill real survivors; exclude only genuinely-equivalent
+mutants with a rationale in `.cargo/mutants.toml`).
 
-CISS is the productionization of the `item-storage-protocol` experiment. The
-full build plan (problem, reasoning, phase-by-phase design, decisions) lives in
-the `discovery` repo:
-`discovery/alpha/plans/2026-07-31-1-plan-coop-metered-storage-service.md`.
+## Deployment
+
+CISS runs as a governed, hardened [croft-stack](https://github.com/CroftCommunity/croft-stack)
+tenant behind Caddy TLS. It is fronted on `443` (name-routed by hostname) and
+binds loopback-only (`127.0.0.1:8301` in production); the firewall never exposes
+its port. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the release model,
+the systemd unit + hardening + cgroup governance, the data profile + backup, and
+the incident runbook (list / disable / enable a fronted backend).
+
+## Security posture (summary)
+
+- **Untrusted backend.** Layer 1 is never trusted; Layer 2 re-verifies content
+  addresses on read, so tamper-at-rest is caught and named.
+- **No key leakage.** Signing keys are `Zeroize`d and never `Debug`-printed or
+  logged; journald carries only the *public* provider id.
+- **Fail loud.** No silent fallbacks — a bilateral receipt at the raw S3 boundary,
+  a byte-count mismatch, a bad manifest signature, or a DID/key mismatch are all
+  hard errors, not degraded modes.
+- **Hardened unit.** In production: unprivileged user, `ProtectSystem=strict`,
+  `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service`, full cgroup
+  accounting + limits (`systemd-analyze security` ≈ 1.5).
+
+## Provenance & license
+
+CISS graduated from the `discovery` corpus's `item-storage-protocol` experiment
+after its network boundary was built (Phases 7–8) and now deploys via croft-stack
+(Phase 9). The design record — problem, reasoning, per-phase design, decisions,
+and the E0–E9 provenance — lives in `discovery`
+(`alpha/plans/2026-07-31-1-plan-coop-metered-storage-service.md`).
+
+See [`LICENSE`](LICENSE).

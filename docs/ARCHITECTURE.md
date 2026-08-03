@@ -1,0 +1,192 @@
+# CISS architecture
+
+How CISS is put together, why the pieces are shaped the way they are, and where
+the deliberate seams for future work sit. For the operational/deploy view see
+[`DEPLOYMENT.md`](DEPLOYMENT.md); for the API surface see the [README](../README.md).
+
+## 1. The two-layer split
+
+The whole design turns on one principle — **meter the boundary, not the machine** —
+which forces a strict separation:
+
+```
+   ┌─ Layer 2: the metered boundary (server.rs, pds_api.rs, cidv1.rs) ─────────┐
+   │  · content-addresses bytes (SHA-256) and RE-VERIFIES them on read         │
+   │  · signs a receipt for every transfer (postage)                           │
+   │  · derives rent from the customer's OWN signed manifest                    │
+   │  · owns all provenance: the two parties' keys + the manifest              │
+   └───────────────────────────────┬───────────────────────────────────────────┘
+                                    │ BlobStore trait (put/get/has by (DID,CID))
+   ┌────────────────────────────────▼──────────────────────────────────────────┐
+   │  Layer 1: the dumb backend (blobstore.rs)                                   │
+   │  · holds bytes under a key; that is ALL                                     │
+   │  · never meters, never content-checks, never trusted                       │
+   │  · MemoryBlobStore (tests) · FsBlobStore ({root}/blocks/{did}/{cid})        │
+   └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why the backend is dumb on purpose.** If the backend could meter or vouch for
+content, then trusting the bill would mean trusting the storage — exactly the
+thing a non-extractive co-op can't ask its members to do. By keeping Layer 1
+incapable of provenance, a compromised, buggy, or third-party backend (R2, a
+community Garage node) still cannot forge a receipt, inflate rent, or serve a
+tampered blob past the Layer-2 re-verify. The backend is swappable precisely
+because nothing depends on it being honest.
+
+## 2. The metered byte-path
+
+Every request enters through an `Op`-dispatch boundary (`server::dispatch`) so a
+future per-DID compute-observability wrapper (see §7, E83) has one attach point.
+Both the S3 plane and the atproto plane route through the *same* dispatch, so
+they meter identically.
+
+**PUT / uploadBlob (upload):**
+1. `cid = sha256_hex(bytes)` — the boundary computes the content address.
+2. `blobs.put(did, cid, bytes)` — Layer 1 writes and reports the byte count.
+3. **Byte-count integrity check:** the boundary byte count must equal what the
+   backend persisted, or it is a loud `500` (never a silent tally).
+4. A provider-signed **Unilateral** receipt (`Direction::Upload`) is appended to
+   the DID's ledger, carrying the running total.
+
+**GET / getBlob (download):**
+1. `blobs.get(did, cid)` returns the raw stored bytes (unverified — dumb backend).
+2. Layer 2 **re-fingerprints** them: if `sha256(stored) != cid`, that is
+   tamper-at-rest → a loud `500` naming the object, *not* a served bad blob.
+3. A provider-signed **Download** receipt is appended.
+
+`GET /{did}/meter` sums the ledger (upload/download bytes, running total,
+postage cents). The running total is recomputed from the ledger, not cached — the
+ledger is the source of truth.
+
+### Receipt modes (Unilateral vs Bilateral)
+
+A receipt is two-mode: **Unilateral** (provider-signed, our-side measurement) or
+**Bilateral** (co-signed by both parties). The raw S3/atproto boundary has no
+in-band channel for the customer to counter-sign, so v0 issues **Unilateral**
+receipts. A policy that selects Bilateral at that boundary is a hard
+`BilateralUnsupported` error — **never a silent downgrade**. Bilateral is the
+co-attested form the deferred capital layer will require; keeping the mode in the
+receipt from the start makes that forward-compatible.
+
+## 3. Content addressing and the CIDv1 bridge
+
+Internally CISS addresses content by a bare hex SHA-256 (the backend key). The
+atproto network, however, expects a real **CIDv1** in `blob.ref.$link` — `raw`
+codec (`0x55`) over a sha-256 multihash. `cidv1.rs` bridges the two losslessly:
+the 32-byte digest lives inside the multihash, so
+
+```
+blob_cid_string(bytes)  ==  from_sha256_hex(sha256_hex(bytes))
+to_sha256_hex(cidv1)    ==  the backend hex key
+```
+
+`to_sha256_hex` rejects anything that is not a CIDv1 `raw` + sha-256 CID (wrong
+version, codec, or hash algorithm) rather than coercing it — a bad `cid=` query
+is a `400`, never a mis-keyed lookup. This closes the one deliberate simplification
+the original experiment carried (`SEAM:` hex-for-CID), using the in-corpus
+`ipld-core` path that is byte-identical to real PDS records.
+
+`listBlobs` needs no backend enumeration primitive: it derives a DID's uploaded
+CIDs from that DID's **upload receipts** in the ledger, then maps each hex key to
+its CIDv1.
+
+## 4. The E0–E9 ledger model
+
+The metering machinery is the proven `item-storage-protocol` core, ported
+module-by-module under TDD. In dependency order:
+
+- **crypto / identity (E0).** An actor *is* an Ed25519 keypair; its identifier is
+  derived from its public key (`derive_id`), so identity and key are one fact and
+  no external key registry is needed — a manifest PUT verifies
+  `derive_id(presented_key) == claimed_did`. Signing keys are `Zeroize`d.
+- **item + manifest (E1–E2).** An **item**'s name is the fingerprint of its bytes
+  (content-addressed; change a byte, change the name). A **manifest** is the
+  customer's signed Merkle list of `(cid, size)` leaves — the authoritative
+  statement of *what the provider is supposed to be holding*, and the rent base.
+  Rent is a pure function of this customer-authored document.
+- **receipts + ledger (E3).** Each transfer yields a signed **receipt**; receipts
+  append to a hash-linked, per-actor **ledger**. Nothing is edited in place — a
+  forged or replayed receipt breaks the chain and is caught.
+- **statements (E4).** A monthly balance-forward **statement** nets `opening root
+  + Σ receipts + byte-days = closing root`; a **rollup/purge** compacts settled
+  history. Rent is the **byte-day** integral (bytes-at-rest × days) over the
+  manifest.
+- **audit + dial (E5–E6).** A **spot-check audit** samples `k` items uniformly at
+  random (seeded, deterministic RNG) and applies the detection math
+  `1 − (1 − f)^k`; the **dial** turns assurance into a *priced, signed* setting —
+  more assurance costs linearly more, and the choice is on the record.
+- **seal + tombstone (E7–E8).** **Sealing** pins a root for cold storage where the
+  plan is "no movement, verification proves it"; the **tombstone** ceremony is the
+  fail-closed key-destruction path. Both are pin-a-root, fail-closed ceremonies.
+- **grace (E9).** Mercy is *in the books, not off-book*: a co-signed **grace**
+  event that nets to zero, so a waived charge is auditable rather than a silent
+  adjustment.
+
+`canonical.rs` defines the single canonical byte-string every signature and hash
+is taken over (so two peers hash the same bytes); `pricing.rs` keeps every figure
+in integer cents; `clock.rs` and `rng.rs` are deterministic so every assertion is
+exact.
+
+## 5. Persistence
+
+Per Phase-0 discovery, storage mirrors the official-PDS **per-actor SQLite**
+layout:
+
+- `meter.sqlite` (**canonical**, WAL) co-locates each DID's `manifest`,
+  `receipt`, and `statement` rows, keyed by the `did` column, plus a small `meta`
+  key/value table.
+- The **provider key seed** lives in that `meta` table — generated with OS
+  randomness on first start and reused thereafter. Because it is in the canonical
+  SQLite (Litestream-backed), the signing identity survives a backup/restore, so
+  historical receipts stay verifiable. No env var or secret file is needed.
+- A `rusqlite::Connection` is `!Sync`; v0 resolves this with a single-writer
+  `Arc<Mutex<Store>>`. `SEAM:` a real deployment shards a `Store` per DID behind a
+  small pool.
+- On graceful shutdown, `wal_checkpoint(TRUNCATE)` flushes the WAL so a restart
+  opens a clean database (E87).
+
+Blob *bytes* never enter SQLite — they stay in the Layer-1 backend, keyed
+`(DID, CID)`.
+
+## 6. Trust boundaries / threat model
+
+| Actor / surface | Trusted for | NOT trusted for | Caught by |
+|---|---|---|---|
+| Layer-1 backend | holding bytes | content, provenance, integrity | Layer-2 re-verify on read |
+| The customer | signing their manifest | the byte counts (provider measures) | provider-signed receipts |
+| The provider | signing receipts | rent (customer's manifest is the base) | customer recomputes rent independently |
+| The network | delivering requests | anything | signatures + content addressing |
+
+The abuse suite (`tests/e86_abuse.rs`) actively drives the live engine to break
+it: forge/replay receipts, inflate the manifest, tamper at rest across the
+boundary, walk away mid-transfer, double-count an audit, feed malformed input.
+
+## 7. Deliberate seams (deferred, not stubbed)
+
+Marked `SEAM:` in code and tracked in `discovery/ROADMAP_TODO`:
+
+- **E83 — per-DID compute observability.** All requests route through
+  `server::dispatch`; `Op::is_heavy()` classifies each op. v0 ops are all cheap
+  (never cgroup-scoped), but the attach point exists so a later wrapper can scope
+  a *heavy* op (CAR export, MST rebuild, audit sampling) into a per-DID cgroup
+  without a handler rewrite.
+- **E84 — kernel-perf backend.** `FsBlobStore` uses `write` + atomic
+  same-filesystem `rename` (temp→permanent). The `BlobStore` trait is the attach
+  point for an `io_uring`/`copy_file_range`/reflink backend. **On the production
+  box this is N/A:** the filesystem is ext4 (no CoW/reflink), so temp→rename is
+  the whole story there.
+- **E85 — object index structure.** v0 uses a flat keyspace; MST/RBSR grouping is
+  tracked.
+- **E87 — zero-downtime upgrade.** The binary can inherit a systemd
+  socket-activation fd and drains on SIGTERM. v0 ships the *lean* strategy
+  (graceful drain + Caddy request-retry, see DEPLOYMENT.md); socket-activation /
+  `SO_REUSEPORT` blue-green is the stretch.
+- **Auth (Phase-8).** `uploadBlob` requires a bearer token; v0 uses a **mock**
+  check where the token stands in for the acting DID (`SEAM:`), with
+  `getBlob`/`listBlobs` public. Real atproto OAuth/DPoP session verification is a
+  later spike.
+- **getBlob Content-Type echo.** UNCONFIRMED in the lexicon; v0 returns
+  `application/octet-stream` rather than guess the echo behavior.
+
+Each seam is a real, load-bearing classification point — not a placeholder that
+silently does nothing.
