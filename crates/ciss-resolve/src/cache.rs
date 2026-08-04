@@ -161,6 +161,10 @@ impl<R: DidResolver, C: Clock> DidResolver for CachingResolver<R, C> {
         );
         Ok(keys)
     }
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        Some(self.stats())
+    }
 }
 
 #[cfg(test)]

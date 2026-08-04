@@ -79,4 +79,12 @@ pub trait DidResolver: Send + Sync {
     ///
     /// Returns [`ResolveError`] for any failure; never returns an unverified key.
     async fn resolve(&self, did: &str, force_refresh: bool) -> Result<ResolvedKeys, ResolveError>;
+
+    /// A cheap operational snapshot of the resolution cache, if this resolver (or
+    /// one it wraps) has one. The wrapping layers delegate inward so an operator
+    /// heartbeat can read it through the composed `Arc<dyn DidResolver>`. Default
+    /// [`None`] for layers with no cache.
+    fn cache_stats(&self) -> Option<CacheStats> {
+        None
+    }
 }
