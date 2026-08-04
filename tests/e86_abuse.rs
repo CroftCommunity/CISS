@@ -102,7 +102,7 @@ async fn manifest_forgery_is_rejected_every_way() {
     let leaves = [ManifestLeaf::new(&sha256_hex(b"x"), 1)];
 
     // (a) key not bound to the DID: present the attacker's key for `did`.
-    let honest = build_manifest(&leaves, &did, &customer);
+    let honest = build_manifest(&leaves, &did, &customer, 1);
     let r = client
         .put(server.url(&format!("/{did}/manifest")))
         .header("x-croft-pubkey", attacker.public_key_hex())
@@ -117,7 +117,7 @@ async fn manifest_forgery_is_rejected_every_way() {
     );
 
     // (b) signed by the attacker but claiming to be the customer's manifest.
-    let forged = build_manifest(&leaves, &did, &attacker);
+    let forged = build_manifest(&leaves, &did, &attacker, 1);
     let r = client
         .put(server.url(&format!("/{did}/manifest")))
         .header("x-croft-pubkey", customer.public_key_hex())

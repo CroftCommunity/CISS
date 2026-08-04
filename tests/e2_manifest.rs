@@ -46,7 +46,7 @@ fn e2_manifest_is_the_bills_source_of_truth() {
         .iter()
         .map(|i| ManifestLeaf::new(i.cid(), i.size()))
         .collect();
-    let manifest = build_manifest(&leaves, &customer_id, &customer);
+    let manifest = build_manifest(&leaves, &customer_id, &customer, 1);
 
     // The customer's signature over the root verifies under her pinned key.
     assert!(

@@ -627,8 +627,19 @@ fn op_put_manifest(
         return Err(ServerError::BadManifest("manifest signature/root invalid"));
     }
 
-    lock_store(&state.store).save_manifest(did, &manifest)?;
-    tracing::info!(%did, root = manifest.root(), total_bytes = manifest.total_bytes(), "manifest stored");
+    // Replay/rollback protection (I5): a stored manifest may only be replaced by a
+    // strictly-newer one. Load + compare + save under one lock so the check is
+    // atomic against a concurrent writer.
+    let store = lock_store(&state.store);
+    if let Some(existing) = store.load_manifest(did)? {
+        if manifest.seq() <= existing.seq() {
+            return Err(ServerError::BadManifest(
+                "manifest seq is not newer than the stored manifest",
+            ));
+        }
+    }
+    store.save_manifest(did, &manifest)?;
+    tracing::info!(%did, root = manifest.root(), seq = manifest.seq(), total_bytes = manifest.total_bytes(), "manifest stored");
     Ok(OpOutcome::ManifestSaved {
         root: manifest.root().to_owned(),
         total_bytes: as_u64(manifest.total_bytes()),

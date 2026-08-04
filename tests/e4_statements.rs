@@ -30,7 +30,7 @@ fn root_of(items: &[&Item], customer_id: &str, key: &ciss::crypto::Keypair) -> S
         .iter()
         .map(|i| ManifestLeaf::new(i.cid(), i.size()))
         .collect();
-    build_manifest(&leaves, customer_id, key).root().to_owned()
+    build_manifest(&leaves, customer_id, key, 1).root().to_owned()
 }
 
 fn total_bytes(items: &[&Item]) -> u64 {

@@ -232,8 +232,8 @@ mod tests {
         let did = derive_id(&customer.verifying_key());
         let store = Store::open_in_memory().expect("open");
 
-        let m1 = build_manifest(&[ManifestLeaf::new("aaaa", 1)], &did, &customer);
-        let m2 = build_manifest(&[ManifestLeaf::new("bbbb", 2)], &did, &customer);
+        let m1 = build_manifest(&[ManifestLeaf::new("aaaa", 1)], &did, &customer, 1);
+        let m2 = build_manifest(&[ManifestLeaf::new("bbbb", 2)], &did, &customer, 2);
         store.save_manifest(&did, &m1).expect("save m1");
         store.save_manifest(&did, &m2).expect("save m2 (upsert)");
 

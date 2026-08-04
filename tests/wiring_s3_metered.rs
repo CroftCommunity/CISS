@@ -119,7 +119,7 @@ async fn http_put_get_is_metered_end_to_end_and_releases_the_port() {
     );
 
     // --- Rent: recomputable from the customer's own signed manifest. ---
-    let manifest = build_manifest(&[ManifestLeaf::new(&cid, payload.len())], &did, &customer);
+    let manifest = build_manifest(&[ManifestLeaf::new(&cid, payload.len())], &did, &customer, 1);
     let put_manifest = client
         .put(server.url(&format!("/{did}/manifest")))
         .header("x-croft-pubkey", customer.public_key_hex())

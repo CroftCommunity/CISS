@@ -38,7 +38,7 @@ fn sealing_pins_the_root_and_makes_the_write_path_fail_closed() {
     let customer = derive_keypair(MASTER, "customer");
     let customer_id = derive_id(&customer.verifying_key());
     let (leaves, mut store, _items) = build_corpus();
-    let manifest = build_manifest(&leaves, &customer_id, &customer);
+    let manifest = build_manifest(&leaves, &customer_id, &customer, 1);
     let pinned = manifest.root().to_owned();
 
     // Ada signs the seal; it verifies under her key, and not under another's.
@@ -75,7 +75,7 @@ fn sealed_audits_pass_and_a_direct_mutation_is_caught_against_the_pinned_root() 
     let customer_id = derive_id(&customer.verifying_key());
     let (leaves, mut store, items) = build_corpus();
     // Pin the root (the manifest the audits verify against).
-    let _pinned = build_manifest(&leaves, &customer_id, &customer);
+    let _pinned = build_manifest(&leaves, &customer_id, &customer, 1);
 
     // Honest sealed periods: every scheduled audit passes.
     let mut rng = Rng::new("e7/sealed-audits");

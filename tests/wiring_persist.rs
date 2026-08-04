@@ -56,7 +56,7 @@ fn per_did_records_round_trip_through_sqlite() {
         ManifestLeaf::new(a.cid(), a.size()),
         ManifestLeaf::new(b.cid(), b.size()),
     ];
-    let manifest = build_manifest(&leaves, &did, &customer);
+    let manifest = build_manifest(&leaves, &did, &customer, 1);
 
     let r0 = make_bilateral_receipt(
         ReceiptCore::new(
