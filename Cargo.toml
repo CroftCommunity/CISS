@@ -35,9 +35,12 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal",
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 libc = "0.2"
+# Production DID resolution (Phase 5): the reqwest fetcher behind ciss-resolve's
+# DidDocFetcher port. rustls (no OpenSSL) keeps the static-build path open.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "charset"] }
+async-trait = "0.1"
 
 [dev-dependencies]
-reqwest = { version = "0.13.4", default-features = false }
 # Flow harness (tests/common): mint real secp256k1 service-auth JWTs for the
 # atproto persona so Model-R auth is exercised end-to-end over HTTP.
 k256 = { version = "0.13", features = ["ecdsa"] }

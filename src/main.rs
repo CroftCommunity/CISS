@@ -104,13 +104,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The provider signing key comes from a unit-supplied secret (systemd
     // credential or CISS_PROVIDER_SEED), never from the canonical database (I8);
     // only the public key is persisted, as a verification anchor.
-    let app = App::with_provider_from_secret(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?;
+    // Compose the production DID resolver (Model R): pinned admins → TTL cache →
+    // hard timeout → plc.directory/did:web fetch. A malformed admin-pin file fails
+    // startup loudly.
+    let resolve_cfg = ciss::did_resolver::ResolveConfig::from_env()?;
+    let service_did = resolve_cfg.service_did.clone();
+    let admin_pin_count = resolve_cfg.admin_pins.len();
+    let resolver = ciss::did_resolver::build_resolver(&resolve_cfg);
+
+    let app = App::with_provider_from_secret(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?
+        .with_did_resolver(resolver, service_did.clone());
 
     let listener = listen(&config.listen).await?;
     tracing::info!(
         provider = %app.provider_id(),
         data_dir = %config.data_dir.display(),
         local = ?listener.local_addr().ok(),
+        %service_did,
+        admin_pins = admin_pin_count,
+        plc_url = %resolve_cfg.plc_url,
         "CISS starting"
     );
 
