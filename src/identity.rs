@@ -11,14 +11,16 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::crypto::{public_key_from_hex, sha256_hex, CryptoError};
 
-/// The number of hex characters of the public-key digest kept in an identifier.
-const ID_DIGEST_HEX_LEN: usize = 16;
+/// The number of hex characters of the public-key digest kept in an identifier —
+/// the **full** 256-bit digest (64 hex). A truncated id would give only 64 bits
+/// of collision resistance for a billing identity (finding I7).
+const ID_DIGEST_HEX_LEN: usize = 64;
 
 /// Derive an actor's stable identifier from its public key.
 ///
-/// The identifier is `"id:" ++ SHA-256(raw public key)[..16 hex chars]`, matching
-/// the TypeScript oracle. It is a pure function of the public key, so recognition
-/// (signature verification) and counting (this derivation) rest on the same fact.
+/// The identifier is `"id:" ++ SHA-256(raw public key)` (the full 64-hex digest).
+/// It is a pure function of the public key, so recognition (signature
+/// verification) and counting (this derivation) rest on the same fact.
 #[must_use]
 pub fn derive_id(verifying_key: &VerifyingKey) -> String {
     let digest = sha256_hex(&verifying_key.to_bytes());
@@ -82,7 +84,7 @@ mod tests {
         let kp = derive_keypair("master", "customer");
         let id = derive_id(&kp.verifying_key());
         assert!(id.starts_with("id:"));
-        assert_eq!(id.len(), "id:".len() + 16);
+        assert_eq!(id.len(), "id:".len() + 64);
     }
 
     #[test]

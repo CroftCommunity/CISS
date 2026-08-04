@@ -50,7 +50,7 @@ pub struct Did(String);
 impl Did {
     /// Parse and validate a `did` from an untrusted request string.
     ///
-    /// Accepts exactly `id:[0-9a-f]{16}` or `did:[a-z0-9]+:<msid>` where `msid`
+    /// Accepts exactly `id:[0-9a-f]{64}` or `did:[a-z0-9]+:<msid>` where `msid`
     /// is a non-empty run of `[A-Za-z0-9._%:-]` (no path separator, whitespace,
     /// or control byte). Everything else is [`IdentifierError`].
     ///
@@ -144,7 +144,7 @@ fn is_lower_hex(s: &str) -> bool {
 /// Whether `raw` is an accepted `did` shape (`id:<16 hex>` or `did:<method>:<msid>`).
 fn is_valid_did(raw: &str) -> bool {
     if let Some(rest) = raw.strip_prefix("id:") {
-        return rest.len() == 16 && is_lower_hex(rest);
+        return rest.len() == 64 && is_lower_hex(rest);
     }
     if let Some(rest) = raw.strip_prefix("did:") {
         let Some((method, msid)) = rest.split_once(':') else {
@@ -170,7 +170,11 @@ mod tests {
 
     #[test]
     fn accepts_the_two_legitimate_did_shapes() {
-        assert!(Did::parse("id:0123456789abcdef").is_ok(), "id:<16 hex>");
+        assert!(
+            Did::parse("id:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                .is_ok(),
+            "id:<64 hex>",
+        );
         assert!(Did::parse("did:plc:ciss-phase8-test").is_ok(), "did:plc:...");
         assert!(Did::parse("did:web:example.com").is_ok(), "did:web:...");
     }
@@ -193,9 +197,9 @@ mod tests {
 
     #[test]
     fn rejects_wrong_length_id_and_uppercase_hex() {
-        assert_eq!(Did::parse("id:abc"), Err(IdentifierError::Malformed));
+        assert_eq!(Did::parse("id:abc"), Err(IdentifierError::Malformed), "too short");
         assert_eq!(
-            Did::parse("id:0123456789ABCDEF"),
+            Did::parse("id:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"),
             Err(IdentifierError::Malformed),
             "id hex must be lowercase (matches derive_id output)",
         );

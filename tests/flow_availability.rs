@@ -65,7 +65,7 @@ async fn a_get_of_an_oversized_object_is_refused_not_buffered() {
     // Stage an oversized object directly on disk under blocks/{did}/{cid}, with
     // cid == its true fingerprint so it passes the content-address check and the
     // only thing standing between the request and a full read is a size cap.
-    let did = "id:00000000000badd0"; // a valid id:<16 hex> (Phase-1 identifier check).
+    let did = "id:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"; // valid id:<64 hex>
     let bytes = vec![0u8; 16 * 1024 * 1024]; // 16 MiB — larger than the read cap.
     let cid = sha256_hex(&bytes);
     let path = data_dir.join("blocks").join(did).join(&cid);
@@ -93,7 +93,7 @@ async fn a_fifo_at_a_content_path_is_refused_promptly_not_blocked_on() {
 
     // A valid identifier + content address (they pass Phase-1 validation), but
     // the on-disk node is a FIFO rather than a regular file.
-    let did = "id:0000000000000000";
+    let did = "id:0000000000000000000000000000000000000000000000000000000000000000";
     let cid = "a".repeat(64);
     let path = data_dir.join("blocks").join(did).join(&cid);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir blocks");

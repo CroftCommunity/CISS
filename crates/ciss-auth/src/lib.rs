@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 const PUBLIC_KEY_LEN: usize = 32;
 
 /// The number of hex characters of the public-key digest kept in an `id:` DID —
-/// must match `ciss::identity::derive_id` (the core derives DIDs the same way).
-const ID_DIGEST_HEX_LEN: usize = 16;
+/// the full 64-hex digest, matching `ciss::identity::derive_id` (I7).
+const ID_DIGEST_HEX_LEN: usize = 64;
 
 /// Why authentication failed. Every variant means "not authenticated"; the
 /// caller maps them to a 401.
