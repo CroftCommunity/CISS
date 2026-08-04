@@ -103,11 +103,31 @@ impl Store {
                  did            TEXT PRIMARY KEY,
                  receipt_count  INTEGER NOT NULL DEFAULT 0,
                  upload_bytes   INTEGER NOT NULL DEFAULT 0,
-                 download_bytes INTEGER NOT NULL DEFAULT 0
+                 download_bytes INTEGER NOT NULL DEFAULT 0,
+                 stored_bytes   INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
-             CREATE INDEX IF NOT EXISTS statement_did ON statement(did);",
+             CREATE INDEX IF NOT EXISTS statement_did ON statement(did);
+             CREATE VIEW IF NOT EXISTS did_usage AS
+                 SELECT did,
+                        stored_bytes,
+                        upload_bytes,
+                        download_bytes,
+                        upload_bytes + download_bytes AS transferred_bytes,
+                        receipt_count
+                 FROM did_total;",
         )?;
+        // Defensive migration for a did_total created before `stored_bytes`
+        // existed (a dev database); ignore the duplicate-column error.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE did_total ADD COLUMN stored_bytes INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
         Ok(Self { conn })
     }
 
@@ -235,6 +255,52 @@ impl Store {
             Some(totals) => Ok(totals),
             None => self.sum_receipts(did),
         }
+    }
+
+    /// The total distinct bytes at rest across all DIDs — the store footprint the
+    /// store ceiling bounds. Derived (`SUM`) so it cannot drift from the per-DID
+    /// counters; cheap for a co-op's small DID set.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn store_usage(&self) -> Result<u64, PersistError> {
+        let total: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(SUM(stored_bytes), 0) FROM did_total", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    /// The distinct bytes at rest for one DID.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn did_stored_bytes(&self, did: &str) -> Result<u64, PersistError> {
+        let bytes: Option<i64> = self
+            .conn
+            .query_row("SELECT stored_bytes FROM did_total WHERE did = ?1", [did], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(bytes.and_then(|b| u64::try_from(b).ok()).unwrap_or(0))
+    }
+
+    /// Record a genuinely-new (non-dedup) blob store: add its size to the DID's
+    /// distinct bytes at rest. A dedup write must NOT call this (it consumes no
+    /// disk). Ensures the DID's cache row exists first.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn add_stored_bytes(&self, did: &str, size: u64) -> Result<(), PersistError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.ensure_total_row(did)?;
+        self.conn.execute(
+            "UPDATE did_total SET stored_bytes = stored_bytes + ?2 WHERE did = ?1",
+            rusqlite::params![did, size],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Insert a backfilled cache row for `did` if one does not already exist.
@@ -397,6 +463,21 @@ mod tests {
             store.running_totals("id:none").expect("empty"),
             ReceiptTotals::default(),
         );
+    }
+
+    #[test]
+    fn stored_bytes_accounting_is_per_did_and_summed_globally() {
+        let store = Store::open_in_memory().expect("open");
+        assert_eq!(store.store_usage().expect("usage"), 0);
+        assert_eq!(store.did_stored_bytes("id:a").expect("a"), 0);
+
+        store.add_stored_bytes("id:a", 100).expect("a1");
+        store.add_stored_bytes("id:a", 50).expect("a2");
+        store.add_stored_bytes("id:b", 30).expect("b1");
+
+        assert_eq!(store.did_stored_bytes("id:a").expect("a"), 150);
+        assert_eq!(store.did_stored_bytes("id:b").expect("b"), 30);
+        assert_eq!(store.store_usage().expect("usage"), 180, "global = sum of per-DID");
     }
 
     #[test]

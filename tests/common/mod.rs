@@ -114,6 +114,18 @@ impl World {
         Self::from_app(app, None).await
     }
 
+    /// A world with explicit storage-quota limits (for V5 quota flows): an
+    /// in-memory backend with the given store ceiling and optional per-DID cap.
+    pub async fn spawn_with_limits(store_ceiling: u64, did_cap: Option<u64>) -> Self {
+        let limits = ciss::server::Limits {
+            store_ceiling,
+            did_cap,
+        };
+        let app = App::with_limits("test-provider", Blobs::Memory, Db::Memory, limits)
+            .expect("build app");
+        Self::from_app(app, None).await
+    }
+
     /// A world on the filesystem blob backend (in-memory ledger), rooted at a
     /// fresh temp dir exposed via [`World::data_dir`].
     pub async fn spawn_fs() -> Self {

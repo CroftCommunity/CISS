@@ -111,6 +111,50 @@ pub enum Db {
     File(PathBuf),
 }
 
+/// The default whole-store ceiling when `CISS_MAX_STORE_BYTES` is unset: 50 GiB.
+const DEFAULT_STORE_CEILING_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// Env var for the whole-store distinct-bytes ceiling.
+const STORE_CEILING_ENV: &str = "CISS_MAX_STORE_BYTES";
+/// Env var for the optional per-DID distinct-bytes cap (unset ⇒ opportunistic).
+const DID_CAP_ENV: &str = "CISS_MAX_DID_BYTES";
+/// `meta` keys under which the effective limits are persisted (so the read
+/// surface / CLI report what is actually enforced).
+const STORE_CEILING_META: &str = "store_ceiling";
+const DID_CAP_META: &str = "did_cap";
+
+/// The storage-quota limits (finding V5). The whole-store ceiling is always
+/// enforced; the per-DID cap is optional — absent means DIDs fill the store
+/// opportunistically (the default).
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// The whole-store distinct-bytes ceiling.
+    pub store_ceiling: u64,
+    /// The optional per-DID distinct-bytes cap; `None` ⇒ opportunistic.
+    pub did_cap: Option<u64>,
+}
+
+impl Limits {
+    /// Resolve limits from the environment: `CISS_MAX_STORE_BYTES` (default
+    /// 50 GiB) and the optional `CISS_MAX_DID_BYTES` (unset / empty / `0` ⇒ no
+    /// per-DID cap).
+    #[must_use]
+    pub fn from_env() -> Self {
+        let store_ceiling = std::env::var(STORE_CEILING_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_STORE_CEILING_BYTES);
+        let did_cap = std::env::var(DID_CAP_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0);
+        Self {
+            store_ceiling,
+            did_cap,
+        }
+    }
+}
+
 /// Shared server state — all `Arc`-wrapped so the router can clone it per
 /// request. The `Store` is behind a `Mutex` because a `rusqlite::Connection` is
 /// `!Sync` (the Phase-4b pooling `SEAM:`): v0 resolves it as a single-writer
@@ -122,6 +166,8 @@ pub(crate) struct AppState {
     provider: Arc<Provider>,
     blobs: Arc<dyn BlobStore>,
     store: Arc<Mutex<Store>>,
+    /// The storage-quota limits (V5).
+    limits: Limits,
     /// The accounting day stamped on receipts. `SEAM:` v0 uses a fixed day;
     /// a real clock (byte-day rent integrates over wall-clock days) lands with
     /// the statement-close scheduler.
@@ -141,8 +187,20 @@ impl App {
     ///
     /// Returns [`ServerError`] if the metering store cannot be opened.
     pub fn new(seed: &str, blobs: Blobs, db: Db) -> Result<Self, ServerError> {
+        Self::with_limits(seed, blobs, db, Limits::from_env())
+    }
+
+    /// Build a server with explicit storage-quota [`Limits`] (the injection point
+    /// for tests that need a small ceiling; the deployment path resolves limits
+    /// from the environment).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the metering store cannot be opened.
+    pub fn with_limits(seed: &str, blobs: Blobs, db: Db, limits: Limits) -> Result<Self, ServerError> {
         let store = open_store(db)?;
-        Ok(Self::assemble(Provider::from_seed(seed), blobs, store))
+        persist_limits(&store, limits)?;
+        Ok(Self::assemble(Provider::from_seed(seed), blobs, store, limits))
     }
 
     /// Build a server whose provider signing key comes from a **unit-supplied
@@ -167,11 +225,18 @@ impl App {
         let provider = Provider::from_seed(&seed);
         // Durable, non-secret verification anchor — never the seed.
         store.put_meta(PROVIDER_PUBKEY_KEY, &provider.public_key_hex())?;
-        tracing::info!(provider = %provider.id, "provider identity loaded from secret");
-        Ok(Self::assemble(provider, blobs, store))
+        let limits = Limits::from_env();
+        persist_limits(&store, limits)?;
+        tracing::info!(
+            provider = %provider.id,
+            store_ceiling = limits.store_ceiling,
+            did_cap = ?limits.did_cap,
+            "provider identity loaded from secret",
+        );
+        Ok(Self::assemble(provider, blobs, store, limits))
     }
 
-    fn assemble(provider: Provider, blobs: Blobs, store: Store) -> Self {
+    fn assemble(provider: Provider, blobs: Blobs, store: Store, limits: Limits) -> Self {
         let blobs: Arc<dyn BlobStore> = match blobs {
             Blobs::Memory => Arc::new(MemoryBlobStore::new()),
             Blobs::Fs(root) => Arc::new(FsBlobStore::new(root)),
@@ -181,6 +246,7 @@ impl App {
                 provider: Arc::new(provider),
                 blobs,
                 store: Arc::new(Mutex::new(store)),
+                limits,
                 day: 0,
             },
         }
@@ -256,6 +322,18 @@ const PROVIDER_SEED_CREDENTIAL: &str = "provider-seed";
 /// The environment variable carrying the provider seed (a dev / non-systemd
 /// alternative to the systemd credential).
 const PROVIDER_SEED_ENV: &str = "CISS_PROVIDER_SEED";
+
+/// Persist the effective storage limits to the store's `meta` so the read
+/// surface (`did_usage` + these keys) and the `ciss usage` CLI report exactly
+/// what the running service enforces.
+fn persist_limits(store: &Store, limits: Limits) -> Result<(), ServerError> {
+    store.put_meta(STORE_CEILING_META, &limits.store_ceiling.to_string())?;
+    store.put_meta(
+        DID_CAP_META,
+        &limits.did_cap.map(|c| c.to_string()).unwrap_or_default(),
+    )?;
+    Ok(())
+}
 
 /// Open the metering store from a [`Db`] config.
 fn open_store(db: Db) -> Result<Store, ServerError> {
@@ -541,6 +619,28 @@ fn op_put_object(
     // getBlob(cid).
     tracing::debug!(%did, object_key = ?key, %cid, "object key -> content address");
 
+    // Storage quota (V5): a *new* (non-dedup) store consumes disk, so it is gated
+    // before writing; a dedup store adds no disk and is always allowed. The
+    // whole-store ceiling is always enforced; the per-DID cap only if configured.
+    let is_new_store = !state.blobs.has(did, &cid);
+    if is_new_store {
+        let size = as_u64(boundary);
+        let (store_used, did_stored) = {
+            let store = lock_store(&state.store);
+            (store.store_usage()?, store.did_stored_bytes(did)?)
+        };
+        if store_used.saturating_add(size) > state.limits.store_ceiling {
+            tracing::warn!(%did, store_used, ceiling = state.limits.store_ceiling, "store at capacity");
+            return Err(ServerError::StoreFull);
+        }
+        if let Some(cap) = state.limits.did_cap {
+            if did_stored.saturating_add(size) > cap {
+                tracing::warn!(%did, did_stored, cap, "did storage quota exceeded");
+                return Err(ServerError::DidQuotaExceeded);
+            }
+        }
+    }
+
     // Layer 1: dumb backend write. It reports the bytes it wrote.
     let written = state.blobs.put(did, &cid, bytes)?;
     tracing::debug!(%did, %cid, bytes = written, "blob written to backend");
@@ -577,6 +677,10 @@ fn op_put_object(
         ReceiptMode::Unilateral,
     );
     let receipt = build_boundary_receipt(state, core, mode)?;
+    // A new store adds to the DID's distinct bytes at rest; a dedup store does not.
+    if is_new_store {
+        store.add_stored_bytes(did, as_u64(boundary))?;
+    }
     store.append_receipt(did, &receipt)?;
     tracing::info!(
         %did, %cid, receipt = receipt.content_hash(), mode = ?receipt.mode(),
@@ -993,6 +1097,12 @@ pub enum ServerError {
     /// A request identifier (`did`/content address) failed boundary validation.
     #[error("invalid identifier: {0}")]
     BadIdentifier(#[from] crate::identifiers::IdentifierError),
+    /// The whole store is at its distinct-bytes ceiling (V5).
+    #[error("store at capacity")]
+    StoreFull,
+    /// The DID is at its per-DID distinct-bytes cap (V5).
+    #[error("did storage quota exceeded")]
+    DidQuotaExceeded,
     /// The requested object is larger than the read limit (resource safety).
     #[error("object is {size} bytes, over the {max}-byte limit")]
     ObjectTooLarge {
@@ -1018,6 +1128,9 @@ impl IntoResponse for ServerError {
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::StoreFull | ServerError::DidQuotaExceeded => {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
             ServerError::Tampered { .. } | ServerError::ByteCountMismatch { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -1032,8 +1145,10 @@ impl IntoResponse for ServerError {
         // internal state — the content-hash of tampered bytes, an OS io-error, a
         // raw SQLite/serde message. Log the full detail; return a fixed public
         // string. 4xx messages describe the *client's own* request (a bad
-        // manifest, a malformed identifier), so they are safe to return.
-        let body = if status.is_server_error() {
+        // manifest, a malformed identifier), so they are safe to return — as are
+        // the quota 507s, which are intentional, non-leaking capacity signals (V5).
+        let quota = matches!(self, ServerError::StoreFull | ServerError::DidQuotaExceeded);
+        let body = if status.is_server_error() && !quota {
             tracing::error!(%status, error = %self, "boundary request failed");
             "internal error".to_owned()
         } else {
