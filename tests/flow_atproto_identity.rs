@@ -147,6 +147,26 @@ async fn a_world_readable_blob_stays_publicly_readable() {
     world.shutdown().await;
 }
 
+#[tokio::test]
+async fn ciss_serves_its_own_did_web_document() {
+    // did:web:ciss.croft.ing resolves at https://ciss.croft.ing/.well-known/did.json
+    // so external clients can address CISS as a service-auth `aud`.
+    let world = World::spawn().await;
+    let resp = reqwest::get(world.url("/.well-known/did.json"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "did.json must be public");
+    let body = resp.bytes().await.expect("body");
+    let doc: serde_json::Value = serde_json::from_slice(&body).expect("json doc");
+    assert_eq!(doc["id"], "did:web:ciss.croft.ing");
+    assert!(doc["service"].is_array(), "a service entry");
+    assert_eq!(
+        doc["service"][0]["serviceEndpoint"],
+        "https://ciss.croft.ing",
+    );
+    world.shutdown().await;
+}
+
 /// The current unix time in seconds (flows that mint custom-`exp` tokens).
 fn common_now() -> u64 {
     std::time::SystemTime::now()
