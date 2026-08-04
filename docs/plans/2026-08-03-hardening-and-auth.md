@@ -168,6 +168,32 @@ timeouts/concurrency limit); blunts V3.
 
 **Validation:** all Phase-3 flows green; PDS-compat lifecycle flow still green.
 
+### Phase 3 status & tracked follow-on (atproto identity)
+
+**Done (increments 1–2):** the `ciss-auth` crate + a verified signed session over
+the **`id:` identity space**, owner authorization at `dispatch`, findings A1/A2
+closed. The `id:` space needs no resolution (the DID is the hash of the presented
+key).
+
+**OUTSTANDING — atproto identity increment (OAuth/DPoP + DID resolution).** Not
+yet built; the `did:plc` / `did:web` spaces and their token verification land
+together. Requirements are specified in
+[`../adr/0001-auth-and-access-control-model.md`](../adr/0001-auth-and-access-control-model.md)
+§5 and repeated here as the tracked checklist so they are not lost:
+
+- handle→DID and DID→signing-key resolution (`did:plc` via plc.directory,
+  `did:web` via HTTPS);
+- a **runtime TTL cache**; async; **hard-timeout-bounded**; **fail-closed**
+  (unresolvable/timed-out ⇒ reject, never fall through);
+- a **pinned admin-DID set resolved locally** — break-glass: a poisoned or
+  unreachable plc.directory/DNS cannot rotate an admin key, and admin auth still
+  works when the resolver is down;
+- (later) verify the `did:plc` signed operation log so a poisoned directory
+  cannot forge current state.
+
+This is caught inline with the OAuth/DPoP work; until then the interim session is
+`id:`-only and replay-limited (no server nonce), as noted above.
+
 ## Phase 4 — Manifest / billing integrity
 
 **Problem:** I1 (`total_bytes` unbound), I2 (Merkle padding ambiguous), I5 (replay),
