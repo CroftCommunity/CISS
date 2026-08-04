@@ -33,6 +33,10 @@ impl<R: DidResolver> DidResolver for TimeoutResolver<R> {
             Err(_elapsed) => Err(ResolveError::Timeout),
         }
     }
+
+    fn cache_stats(&self) -> Option<crate::CacheStats> {
+        self.inner.cache_stats()
+    }
 }
 
 #[cfg(test)]

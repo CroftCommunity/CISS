@@ -220,13 +220,15 @@ The `aud` anchor: a service-auth JWT must be *addressed* to CISS.
 
 ## Tracked follow-ons
 
-- **Resolver cache observability (built; always-on surface pending).** The
-  `CachingResolver` now tracks relaxed atomic hits/misses + a `CacheStats` snapshot
-  (size, hits, misses, hit_rate) via `stats()`, and logs a compact cache line at
-  **DEBUG** on each network resolve. Auth decisions log too: grants at DEBUG,
-  denials at INFO. **Remaining:** an *always-on* surface (a periodic INFO heartbeat
-  or wiring `stats()` into `ciss usage`) — DEBUG-only means the metric is visible
-  only when debugging; `stats()` is exposed for that future surface.
+- **Resolver cache observability (built, always-on).** `CachingResolver` tracks
+  relaxed atomic hits/misses + a `CacheStats` snapshot (size, hits, misses,
+  hit_rate), reachable through the composed resolver via `DidResolver::cache_stats()`
+  (Pinned/Timeout delegate inward). A **periodic INFO heartbeat** (`main.rs`, 60s,
+  change-gated so idle is silent) samples it for ongoing monitoring via journald —
+  no prod DEBUG needed. A per-network-resolve line stays at DEBUG for detail. Auth
+  decisions log too: grants DEBUG, denials INFO. **Follow-up:** feed it to the
+  cgroup-based telemetry poller (croft-stack) if it should appear on the dashboard,
+  not just in journald.
 - **Populate `CISS_ADMIN_PINS_FILE`** — empty as deployed (no `did:` break-glass yet).
 
 ## Cross-repo follow-ons (not this increment)

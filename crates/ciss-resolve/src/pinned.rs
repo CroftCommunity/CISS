@@ -35,6 +35,10 @@ impl<R: DidResolver> DidResolver for PinnedResolver<R> {
         }
         self.inner.resolve(did, force_refresh).await
     }
+
+    fn cache_stats(&self) -> Option<crate::CacheStats> {
+        self.inner.cache_stats()
+    }
 }
 
 #[cfg(test)]
@@ -78,6 +82,19 @@ mod tests {
             .await
             .expect("delegated");
         assert_eq!(keys.signing_key(), "did:key:zQ3shDelegated");
+    }
+
+    #[tokio::test]
+    async fn cache_stats_delegate_through_the_pinned_layer() {
+        // The heartbeat reads cache stats through the composed resolver; the pin
+        // layer must forward to the caching layer it wraps.
+        use crate::{CachingResolver, SystemClock};
+        let caching = CachingResolver::new(FakeResolver::returning("did:key:zX"), SystemClock, 5_000);
+        let resolver = PinnedResolver::new(caching, HashMap::new());
+        resolver.resolve("did:plc:x", false).await.expect("resolve"); // one miss
+        let stats = resolver.cache_stats().expect("stats visible through Pinned");
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.size, 1);
     }
 
     #[tokio::test]

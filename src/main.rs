@@ -112,8 +112,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_pin_count = resolve_cfg.admin_pins.len();
     let resolver = ciss::did_resolver::build_resolver(&resolve_cfg);
 
+    let resolver_for_heartbeat = resolver.clone();
     let app = App::with_provider_from_secret(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?
         .with_did_resolver(resolver, service_did.clone());
+
+    // Resolver-cache heartbeat: a periodic INFO sample of cache condition for
+    // ongoing monitoring via journald (not DEBUG — production stays out of debug).
+    // It logs only when activity changed since the last tick, so an idle server
+    // is quiet and rotation/retention is journald's job.
+    tokio::spawn(cache_stats_heartbeat(resolver_for_heartbeat));
 
     let listener = listen(&config.listen).await?;
     tracing::info!(
@@ -134,6 +141,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.checkpoint()?;
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// How often the resolver-cache heartbeat samples cache condition (seconds).
+const CACHE_STATS_INTERVAL_S: u64 = 60;
+
+/// Periodically log the DID-resolution cache condition at INFO for ongoing
+/// monitoring. Emits only when activity (hits + misses) changed since the last
+/// tick, so an idle server produces no noise. Runs for the process lifetime.
+async fn cache_stats_heartbeat(resolver: std::sync::Arc<dyn ciss_resolve::DidResolver>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(CACHE_STATS_INTERVAL_S));
+    let mut last_activity = 0u64;
+    loop {
+        tick.tick().await;
+        if let Some(stats) = resolver.cache_stats() {
+            let activity = stats.hits + stats.misses;
+            if activity != last_activity {
+                last_activity = activity;
+                tracing::info!(
+                    cache_size = stats.size,
+                    hits = stats.hits,
+                    misses = stats.misses,
+                    hit_rate = stats.hit_rate(),
+                    "DID resolution cache",
+                );
+            }
+        }
+    }
 }
 
 /// Parse `--data-dir <path>` and `--listen <host:port>` from the arguments.
