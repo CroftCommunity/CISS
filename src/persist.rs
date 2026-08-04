@@ -17,8 +17,28 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::manifest::Manifest;
-use crate::receipts::Receipt;
+use crate::receipts::{Direction, Receipt};
 use crate::statements::Statement;
+
+/// A DID's cumulative transfer totals — maintained incrementally so a metered
+/// request is O(1) rather than re-summing the whole ledger every time (V3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiptTotals {
+    /// Number of receipts recorded for the DID.
+    pub receipt_count: u64,
+    /// Total bytes uploaded (customer -> provider).
+    pub upload_bytes: u64,
+    /// Total bytes downloaded (provider -> customer).
+    pub download_bytes: u64,
+}
+
+impl ReceiptTotals {
+    /// Bytes transferred both ways.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.upload_bytes + self.download_bytes
+    }
+}
 
 /// An error persisting or loading records.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +98,12 @@ impl Store {
                  id   INTEGER PRIMARY KEY AUTOINCREMENT,
                  did  TEXT NOT NULL,
                  json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS did_total (
+                 did            TEXT PRIMARY KEY,
+                 receipt_count  INTEGER NOT NULL DEFAULT 0,
+                 upload_bytes   INTEGER NOT NULL DEFAULT 0,
+                 download_bytes INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);",
@@ -147,17 +173,107 @@ impl Store {
         }
     }
 
-    /// Append a receipt to the DID's co-signed record set.
+    /// Append a receipt to the DID's co-signed record set, keeping the cached
+    /// [`ReceiptTotals`] in step — atomically, so the O(1) cache can never drift
+    /// from the ledger (V3).
     ///
     /// # Errors
     /// Returns [`PersistError`] on a SQLite or serialization failure.
+    ///
+    /// # Panics
+    /// Only if a receipt's byte count exceeds `u64` — impossible on a 64-bit
+    /// machine, where a `usize` byte count fits `u64`.
     pub fn append_receipt(&self, did: &str, receipt: &Receipt) -> Result<(), PersistError> {
         let json = serde_json::to_string(receipt)?;
+        let bytes = u64::try_from(receipt.bytes()).expect("a byte count fits u64");
+        let (up, down) = match receipt.core().direction {
+            Direction::Upload => (bytes, 0),
+            Direction::Download => (0, bytes),
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        // Backfill the cache row from any pre-existing receipts the first time we
+        // touch this DID, so the incremental counter is correct even for a ledger
+        // written before the cache existed.
+        self.ensure_total_row(did)?;
         self.conn.execute(
             "INSERT INTO receipt (did, json) VALUES (?1, ?2)",
             rusqlite::params![did, json],
         )?;
+        self.conn.execute(
+            "UPDATE did_total
+                 SET receipt_count = receipt_count + 1,
+                     upload_bytes = upload_bytes + ?2,
+                     download_bytes = download_bytes + ?3
+             WHERE did = ?1",
+            rusqlite::params![did, up, down],
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The DID's cumulative transfer totals, read from the O(1) cache (or computed
+    /// from the ledger once if the cache row is not yet populated).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite or deserialization failure.
+    pub fn running_totals(&self, did: &str) -> Result<ReceiptTotals, PersistError> {
+        let cached = self
+            .conn
+            .query_row(
+                "SELECT receipt_count, upload_bytes, download_bytes FROM did_total WHERE did = ?1",
+                [did],
+                |row| {
+                    Ok(ReceiptTotals {
+                        receipt_count: row.get(0)?,
+                        upload_bytes: row.get(1)?,
+                        download_bytes: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        match cached {
+            Some(totals) => Ok(totals),
+            None => self.sum_receipts(did),
+        }
+    }
+
+    /// Insert a backfilled cache row for `did` if one does not already exist.
+    fn ensure_total_row(&self, did: &str) -> Result<(), PersistError> {
+        let present = self
+            .conn
+            .query_row("SELECT 1 FROM did_total WHERE did = ?1", [did], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !present {
+            let totals = self.sum_receipts(did)?;
+            self.conn.execute(
+                "INSERT INTO did_total (did, receipt_count, upload_bytes, download_bytes)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    did,
+                    totals.receipt_count,
+                    totals.upload_bytes,
+                    totals.download_bytes
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Compute a DID's totals by scanning its ledger — the O(n) path, used only to
+    /// backfill the cache once (or read a DID whose cache is not yet populated).
+    fn sum_receipts(&self, did: &str) -> Result<ReceiptTotals, PersistError> {
+        let receipts = self.load_receipts(did)?;
+        let mut totals = ReceiptTotals::default();
+        for receipt in &receipts {
+            let bytes = u64::try_from(receipt.bytes()).expect("a byte count fits u64");
+            totals.receipt_count += 1;
+            match receipt.core().direction {
+                Direction::Upload => totals.upload_bytes += bytes,
+                Direction::Download => totals.download_bytes += bytes,
+            }
+        }
+        Ok(totals)
     }
 
     /// Load the DID's receipts in insertion order.
@@ -239,6 +355,48 @@ mod tests {
 
         let loaded = store.load_manifest(&did).expect("load").expect("present");
         assert_eq!(loaded.root(), m2.root(), "upsert keeps the latest manifest");
+    }
+
+    #[test]
+    fn running_totals_track_appends_and_match_the_ledger() {
+        use super::ReceiptTotals;
+        use crate::receipts::{make_unilateral_receipt, Direction, ReceiptCore};
+
+        let provider = derive_keypair("m", "p");
+        let store = Store::open_in_memory().expect("open");
+        let did = "id:tester";
+        let mk = |dir, bytes, rt| {
+            make_unilateral_receipt(
+                ReceiptCore::new(dir, "cid", (0, bytes), rt, 0, "id:r", "id:s"),
+                "id:s",
+                &provider,
+            )
+        };
+
+        store.append_receipt(did, &mk(Direction::Upload, 10, 10)).expect("up");
+        store.append_receipt(did, &mk(Direction::Download, 5, 15)).expect("down");
+        store.append_receipt(did, &mk(Direction::Upload, 20, 35)).expect("up");
+
+        let totals = store.running_totals(did).expect("totals");
+        assert_eq!(totals.receipt_count, 3);
+        assert_eq!(totals.upload_bytes, 30);
+        assert_eq!(totals.download_bytes, 5);
+        assert_eq!(totals.total_bytes(), 35);
+
+        // The cache equals a full scan of the ledger (no drift).
+        let scanned: u64 = store
+            .load_receipts(did)
+            .expect("load")
+            .iter()
+            .map(|r| u64::try_from(r.bytes()).unwrap())
+            .sum();
+        assert_eq!(totals.total_bytes(), scanned, "cache matches the ledger");
+
+        // A DID with no receipts totals zero.
+        assert_eq!(
+            store.running_totals("id:none").expect("empty"),
+            ReceiptTotals::default(),
+        );
     }
 
     #[test]

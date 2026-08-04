@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::blobstore::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
 use ciss_auth::Principal;
@@ -246,13 +246,19 @@ fn open_store(db: Db) -> Result<Store, ServerError> {
 /// Return the persisted provider seed, generating and persisting a fresh random
 /// one on first start. The seed lives in the canonical SQLite so it is backed up
 /// with the ledger it signs.
-fn resolve_or_create_provider_seed(store: &Store) -> Result<String, ServerError> {
+fn resolve_or_create_provider_seed(store: &Store) -> Result<Zeroizing<String>, ServerError> {
+    // The seed is secret key material: hold it in a `Zeroizing` wrapper so the
+    // in-memory copy is scrubbed on drop (I8, memory hygiene). `SEAM:` the seed is
+    // still stored *at rest* in the canonical SQLite; not co-locating it with the
+    // data it authenticates (a `0600` file outside the backup set, or a KMS) is a
+    // deployment decision tracked in the security review — changing it rotates the
+    // live signing identity, so it is not done inline.
     if let Some(seed) = store.get_meta(PROVIDER_SEED_KEY)? {
-        return Ok(seed);
+        return Ok(Zeroizing::new(seed));
     }
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|_| ServerError::BadConfig)?;
-    let seed = hex::encode(bytes);
+    let seed = Zeroizing::new(hex::encode(bytes));
     bytes.zeroize();
     store.put_meta(PROVIDER_SEED_KEY, &seed)?;
     Ok(seed)
@@ -443,19 +449,6 @@ pub(crate) async fn dispatch_blocking(
         .map_err(|_| ServerError::TaskJoin)?
 }
 
-/// The running total of bytes metered for a DID so far (both directions) — the
-/// source of truth is the ledger, so we sum it rather than cache a counter.
-/// `SEAM:` cache this per DID for O(1) rather than O(n) per transfer.
-fn running_total(receipts: &[Receipt]) -> usize {
-    receipts.iter().map(Receipt::bytes).sum()
-}
-
-/// The running total after a new transfer of `boundary` bytes: the prior ledger
-/// total plus this transfer.
-fn next_running_total(prior: &[Receipt], boundary: usize) -> usize {
-    running_total(prior) + boundary
-}
-
 fn op_put_object(
     state: &AppState,
     did: &str,
@@ -486,8 +479,8 @@ fn op_put_object(
     }
 
     let store = lock_store(&state.store);
-    let prior = store.load_receipts(did)?;
-    let total = next_running_total(&prior, boundary);
+    let totals = store.running_totals(did)?;
+    let total = usize::try_from(totals.total_bytes()).expect("byte total fits usize") + boundary;
 
     // Upload: customer -> provider. receiver = provider, sender = customer.
     let core = ReceiptCore::new(
@@ -510,7 +503,7 @@ fn op_put_object(
     store.append_receipt(did, &receipt)?;
     tracing::info!(
         %did, %cid, receipt = receipt.content_hash(), mode = ?receipt.mode(),
-        running_total = total, ledger_index = prior.len(),
+        running_total = total, ledger_index = totals.receipt_count,
         "upload receipt recorded"
     );
 
@@ -544,8 +537,8 @@ fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, Se
 
     let boundary = data.len();
     let store = lock_store(&state.store);
-    let prior = store.load_receipts(did)?;
-    let total = next_running_total(&prior, boundary);
+    let totals = store.running_totals(did)?;
+    let total = usize::try_from(totals.total_bytes()).expect("byte total fits usize") + boundary;
 
     // Download: provider -> customer. receiver = customer, sender = provider.
     let core = ReceiptCore::new(
@@ -568,7 +561,7 @@ fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, Se
     store.append_receipt(did, &receipt)?;
     tracing::info!(
         %did, %cid, receipt = receipt.content_hash(), mode = ?receipt.mode(),
-        running_total = total, ledger_index = prior.len(),
+        running_total = total, ledger_index = totals.receipt_count,
         "download receipt recorded"
     );
 
@@ -656,24 +649,14 @@ fn op_get_manifest(state: &AppState, did: &str) -> Result<OpOutcome, ServerError
 }
 
 fn op_get_meter(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
-    let receipts = lock_store(&state.store).load_receipts(did)?;
-    let upload_bytes: usize = receipts
-        .iter()
-        .filter(|r| r.core().direction == Direction::Upload)
-        .map(Receipt::bytes)
-        .sum();
-    let download_bytes: usize = receipts
-        .iter()
-        .filter(|r| r.core().direction == Direction::Download)
-        .map(Receipt::bytes)
-        .sum();
-    let total = upload_bytes + download_bytes;
+    // Read the O(1) cached totals rather than re-summing the whole ledger (V3).
+    let totals = lock_store(&state.store).running_totals(did)?;
     Ok(OpOutcome::Meter {
-        receipt_count: as_u64(receipts.len()),
-        upload_bytes: as_u64(upload_bytes),
-        download_bytes: as_u64(download_bytes),
-        running_total_bytes: as_u64(total),
-        postage_cents: postage_cents(as_u64(total)),
+        receipt_count: totals.receipt_count,
+        upload_bytes: totals.upload_bytes,
+        download_bytes: totals.download_bytes,
+        running_total_bytes: totals.total_bytes(),
+        postage_cents: postage_cents(totals.total_bytes()),
     })
 }
 
@@ -1001,39 +984,8 @@ pub fn inherit_fd_requested(
 
 #[cfg(test)]
 mod tests {
-    use super::{inherit_fd_requested, next_running_total, running_total, App, Blobs, Db, Op};
-    use crate::crypto::derive_keypair;
-    use crate::receipts::{
-        make_unilateral_receipt, select_mode, Direction, ReceiptCore, ReceiptMode, TransferContext,
-    };
-
-    #[test]
-    fn running_total_accumulates_bytes_across_the_ledger() {
-        let provider = derive_keypair("s", "provider");
-        let receipt = |bytes: usize, rt: usize| {
-            make_unilateral_receipt(
-                ReceiptCore::new(Direction::Upload, "cid", (0, bytes), rt, 0, "id:p", "id:c"),
-                "id:p",
-                &provider,
-            )
-        };
-        assert_eq!(running_total(&[]), 0, "an empty ledger totals zero");
-        let r10 = receipt(10, 10);
-        assert_eq!(
-            running_total(std::slice::from_ref(&r10)),
-            10,
-            "one receipt totals its bytes",
-        );
-        let r25 = receipt(25, 35);
-        assert_eq!(
-            running_total(&[r10.clone(), r25]),
-            35,
-            "sums across receipts"
-        );
-        // next = prior total + this transfer (pins +, so +->* and +->- fail).
-        assert_eq!(next_running_total(&[], 25), 25);
-        assert_eq!(next_running_total(std::slice::from_ref(&r10), 25), 35);
-    }
+    use super::{inherit_fd_requested, App, Blobs, Db, Op};
+    use crate::receipts::{select_mode, ReceiptMode, TransferContext};
 
     #[test]
     fn provider_id_is_deterministic_from_the_seed() {
