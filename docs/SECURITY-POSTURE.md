@@ -73,7 +73,10 @@ public key. There are two identity spaces, kept distinct by type:
   codebase's native space; needs no external resolution (the DID *is* the key
   hash).
 - `did:plc` / `did:web` — atproto identities resolved from an external document.
-  **Not yet implemented** (the OAuth/DPoP + resolution increment, ADR 0001 §5).
+  **Built** (Model R: service-auth JWT verification + DID resolution, ADR 0001 §3
+  amended / §5; `docs/notes/atproto-integration-model.md`). CISS is a resource
+  server: it verifies a bsky-delegated service-auth JWT signed by the caller's repo
+  key, and issues nothing.
 
 **Invariant A1 — no unauthenticated identity assertion.** A caller may only act
 as a DID it can prove it holds the key for. Enforced by `ciss-auth::verify_session`:
@@ -88,9 +91,39 @@ never grants access by the mere presence of a credential. The allow/deny decisio
 lives at the `dispatch` boundary (§5). This is the anti-pattern the audit's A2
 finding was about (a "401 that authenticates any string").
 
-**Known interim limitations (by design, tracked):** `id:`-only; the session
-signature is not nonce-bound (replay-limited), closed by DPoP later; `did:plc`
-resolution + pinned-admin break-glass is the tracked follow-on.
+**Invariant A3 — a service-auth JWT is verified against the resolved DID key, and
+the verification curve comes from the key, never the token.** `iss` is resolved
+to its `did:key` (secp256k1/P-256), and `ciss_auth::verify_service_auth_jwt` checks
+the signature under that key with the curve the key declares — so a forged
+`alg` (`none`/`HS256`) cannot downgrade the check. The signature is verified
+**before** any claim is trusted. A token that merely *names* a victim `iss` but is
+signed by another key fails (`SignatureInvalid`) — A2 on the `did:` space.
+
+**Invariant A4 — request binding: `aud`, `lxm`, `exp`.** A verified token must name
+this service (`aud` == `CISS_SERVICE_DID`), be bound to the called method
+(`lxm` == the XRPC), and be unexpired. A method-less token is refused (it would be
+replayable across methods). This bounds a stolen bearer to one service, one method,
+~60s.
+
+**Invariant A5 — canonical signatures only.** ECDSA signatures must be low-S
+(high-S is rejected as malleable) and fixed-length; ported from `rsky-crypto`.
+
+**Invariant A6 — `jti` replay defense.** A token carrying a `jti` is single-use
+within its validity window (`ReplayGuard`, a bounded seen-set pruned by `exp`).
+
+**Invariant A7 — resolution fails closed, admins are pinned.** DID resolution is
+async, hard-timeout-bounded, and TTL-cached; any failure (timeout, transport,
+unknown DID, malformed/wrong-subject document) is a **rejection**, never a
+fall-through to an unverified key. A pinned admin-DID set is resolved **locally**
+and never via the network (even under cache force-refresh), so a poisoned or
+unreachable `plc.directory`/DNS can neither rotate an admin key nor lock admins out
+(break-glass, ADR 0001 §5). A present-but-invalid credential yields `Anonymous`
+(→ dispatch 401), never the DID it named.
+
+**Known interim limitations (by design, tracked):** the `id:` session signature is
+not nonce-bound (replay-limited); `did:plc` signed-oplog verification (so a poisoned
+directory cannot forge current key state) is a tracked follow-on; DPoP access-token
+(Model M2) auth is not built (not needed for the resource-server path).
 
 ## 5. Authorization (namespace mode bits)
 
@@ -247,6 +280,11 @@ inside the hardened sandbox (§11).
 |---|---|---|
 | A1 | act only as a key-proven DID | `ciss-auth::verify_session` |
 | A2 | auth never grants; authz at dispatch | `server::authorize` / `dispatch` |
+| A3 | JWT verified vs resolved key; curve from key, not `alg` | `ciss-auth::verify_service_auth_jwt` |
+| A4 | request binding: `aud` + `lxm` + `exp` | `verify_service_auth_jwt` |
+| A5 | canonical low-S signatures only | `ciss-auth::did_key` (ported rsky-crypto) |
+| A6 | `jti` single-use in its window | `ciss-auth::ReplayGuard` |
+| A7 | resolution fails closed; admins pinned local | `ciss-resolve` (`Pinned`/`Caching`/`Timeout`) |
 | Z1 | reads are world-readable (PDS-compat) | `authorize` (read ops → Ok) |
 | Z2 | writes + meter are owner-only | `require_owner` |
 | Z3 | manifest self-authorizes | `op_put_manifest` |

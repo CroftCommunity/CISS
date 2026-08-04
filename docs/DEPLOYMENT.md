@@ -44,6 +44,30 @@ CISS satisfies `croft-stack/CONTRACT.md` so it drops in with no kit changes:
   [`adr/0002-healthz-exposure-and-limit-exemption.md`](adr/0002-healthz-exposure-and-limit-exemption.md).
   **TODO (croft-stack):** restrict `/healthz` on the `ciss.croft.ing` vhost to a
   loopback + monitoring-host allowlist; currently it answers the public internet.
+- `GET /.well-known/did.json` → CISS's `did:web` document. **Must stay public** —
+  external atproto clients resolve `did:web:ciss.croft.ing` here to address CISS as
+  a service-auth `aud`. Any future `/healthz` edge allowlist must **not** also gate
+  `/.well-known/*` (see the atproto-identity note below).
+
+### atproto identity (Model R) — config
+
+CISS verifies bsky-delegated **service-auth JWTs** against the caller's
+DID-resolved key (`docs/notes/atproto-integration-model.md`). Deploy config, all
+optional with safe defaults:
+
+| env | default | meaning |
+|---|---|---|
+| `CISS_SERVICE_DID` | `did:web:ciss.croft.ing` | the JWT `aud`; also the served `did.json` id |
+| `CISS_PLC_DIRECTORY_URL` | `https://plc.directory` | `did:plc` resolution base |
+| `CISS_DID_RESOLVE_TIMEOUT_MS` | `3000` | hard resolve timeout (fails closed) |
+| `CISS_DID_CACHE_TTL_S` | `300` | resolution cache TTL |
+| `CISS_ADMIN_PINS_FILE` | — | pinned-admin-DID file (break-glass) |
+
+The admin-pin file (lines `<did> <did:key>`) is security-sensitive break-glass
+material; provision it like `provider-seed` (a systemd credential / mode-0400
+path) and point `CISS_ADMIN_PINS_FILE` at it. A malformed file fails startup
+loudly. Resolution reaches `plc.directory` outbound over HTTPS (rustls) — the only
+egress CISS makes.
 - **All** state under the data dir; no root; port ≥ 1024 (TLS is Caddy's).
 - Self-managed layout matching the manifest's `data_profile`:
   `meter.sqlite` (canonical) + `blocks/` (blobs) + `tmp/` (staging, outside the mirror).

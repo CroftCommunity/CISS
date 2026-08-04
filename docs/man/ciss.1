@@ -82,6 +82,33 @@ An optional per\-DID distinct\-bytes cap. If unset (or 0), DIDs fill the store
 opportunistically up to the whole\-store ceiling. If set, a DID's new store past
 the cap is refused with
 .BR 507 .
+.TP
+.B CISS_SERVICE_DID
+This service's atproto DID \(em the
+.I aud
+a service\-auth JWT must name. Also the document served at
+.IR /.well-known/did.json .
+Default:
+.IR did:web:ciss.croft.ing .
+.TP
+.B CISS_PLC_DIRECTORY_URL
+The
+.I did:plc
+directory base URL for DID resolution. Default:
+.IR https://plc.directory .
+.TP
+.B CISS_DID_RESOLVE_TIMEOUT_MS
+Hard timeout for a DID resolution (milliseconds). An overrun fails closed.
+Default: 3000.
+.TP
+.B CISS_DID_CACHE_TTL_S
+TTL for the DID\-resolution cache (seconds). Default: 300.
+.TP
+.B CISS_ADMIN_PINS_FILE
+Optional path to a pinned\-admin\-DID file: non\-empty, non\-`#` lines of
+.IR "<did> <did:key>" .
+Pinned DIDs resolve locally, never via the network (poisoning\-resistant
+break\-glass). A malformed file fails startup loudly.
 .SH FILES
 .TP
 .I <data-dir>/meter.sqlite
