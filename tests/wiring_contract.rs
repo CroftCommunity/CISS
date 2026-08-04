@@ -1,10 +1,12 @@
 //! Phase-9 wiring test (the croft-stack tenant contract): the deployment
-//! constructor `App::with_persistent_provider` self-manages its layout, serves
-//! `GET /healthz` → `ok`, and keeps a **stable** provider identity across
-//! restarts (persisted seed) while distinct data dirs get distinct identities.
+//! constructor `App::with_provider_from_secret` self-manages its layout, serves
+//! `GET /healthz` → `ok`, and sources a **stable** provider identity from the
+//! unit-supplied secret (I8) — so the identity is the deployment's, the same
+//! across restarts and independent of the data dir, and is never read from the
+//! canonical database.
 //!
 //! This mirrors how the systemd unit runs the binary: point it at a data dir,
-//! everything under it, no external seed/secret wiring.
+//! everything under it, with the signing seed provided as a secret.
 
 mod common;
 
@@ -28,15 +30,18 @@ fn fresh_data_dir(tag: &str) -> PathBuf {
 /// the blob backend is rooted at the data dir (content under `blocks/`, staging
 /// under `tmp/`) and the metering store is `meter.sqlite` beside it.
 fn app_at(data_dir: &std::path::Path) -> App {
-    App::with_persistent_provider(
+    App::with_provider_from_secret(
         Blobs::Fs(data_dir.to_path_buf()),
         Db::File(data_dir.join("meter.sqlite")),
     )
-    .expect("build persistent app")
+    .expect("build app from secret")
 }
 
 #[test]
-fn provider_identity_persists_across_restart_and_is_per_data_dir() {
+fn provider_identity_comes_from_the_secret_and_layout_is_self_managed() {
+    // The unit supplies the signing seed as a secret; here, via the env var.
+    std::env::set_var("CISS_PROVIDER_SEED", "contract-test-provider-seed");
+
     let dir_a = fresh_data_dir("a");
     let dir_b = fresh_data_dir("b");
 
@@ -55,16 +60,17 @@ fn provider_identity_persists_across_restart_and_is_per_data_dir() {
     assert_eq!(
         restarted.provider_id(),
         id1,
-        "the persisted seed yields the same provider identity across a restart",
+        "the same secret yields the same provider identity across a restart",
     );
 
     let other = app_at(&dir_b);
-    assert_ne!(
+    assert_eq!(
         other.provider_id(),
         id1,
-        "a fresh data dir gets its own randomly-generated provider identity",
+        "the provider identity is the deployment's secret, independent of the data dir",
     );
 
+    std::env::remove_var("CISS_PROVIDER_SEED");
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }

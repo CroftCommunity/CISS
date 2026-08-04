@@ -8,8 +8,9 @@
 //! ≥ 1024 (Caddy terminates TLS). It self-manages its layout under the data dir:
 //!
 //! - `<data-dir>/meter.sqlite` — the per-DID metering ledger (**canonical**;
-//!   Litestream-backed). Also holds the persisted provider key seed, so the
-//!   signing identity survives a backup/restore.
+//!   Litestream-backed). Holds the provider's **public** key as a verification
+//!   anchor; the private signing seed is supplied by the unit at start (a systemd
+//!   credential), never persisted here, so it is safe to replicate off-box (I8).
 //! - `<data-dir>/blocks/` — content-addressed blob bytes (**blobs**;
 //!   rclone-mirrored, `--immutable`).
 //!
@@ -44,9 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // declared path on start"; the store creates `meter.sqlite` on open.
     std::fs::create_dir_all(config.data_dir.join("blocks"))?;
 
-    // The provider identity is persisted in the metering store (generated on
-    // first start), so no seed/secret needs wiring into the unit.
-    let app = App::with_persistent_provider(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?;
+    // The provider signing key comes from a unit-supplied secret (systemd
+    // credential or CISS_PROVIDER_SEED), never from the canonical database (I8);
+    // only the public key is persisted, as a verification anchor.
+    let app = App::with_provider_from_secret(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?;
 
     let listener = listen(&config.listen).await?;
     tracing::info!(

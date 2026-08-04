@@ -88,6 +88,11 @@ impl Provider {
         let id = derive_id(&keypair.verifying_key());
         Self { id, keypair }
     }
+
+    /// The provider's public key (hex) — a non-secret verification anchor.
+    fn public_key_hex(&self) -> String {
+        self.keypair.public_key_hex()
+    }
 }
 
 /// Which blob backend the server runs on.
@@ -140,24 +145,30 @@ impl App {
         Ok(Self::assemble(Provider::from_seed(seed), blobs, store))
     }
 
-    /// Build a server whose provider identity is **persisted** in the metering
-    /// store: on first start a fresh random seed is generated and saved; on every
-    /// later start the saved seed is reused. Because the seed lives in the
-    /// canonical SQLite (Litestream-backed), the signing identity survives a
-    /// backup/restore, so historical receipts stay verifiable. This is the
-    /// deployment constructor — no external seed/secret wiring is required.
+    /// Build a server whose provider signing key comes from a **unit-supplied
+    /// secret**, never from the canonical database (I8). The seed is read from a
+    /// systemd credential (`$CREDENTIALS_DIRECTORY/provider-seed`) or the
+    /// `CISS_PROVIDER_SEED` environment variable; under systemd with neither wired
+    /// it **fails closed** rather than run a throwaway identity. Outside systemd
+    /// (dev) it falls back to an ephemeral random seed with a loud warning.
     ///
-    /// `SEAM:` a real deployment loads the provider key from a KMS, not a seed
-    /// persisted at rest.
+    /// The provider's **public** key is persisted to the metering store as a
+    /// durable, non-secret verification anchor, so historical receipts stay
+    /// verifiable even if the private key is later rotated or lost. The private
+    /// seed is never written to SQLite (and so never reaches an off-box backup).
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError`] if the store cannot be opened or the seed cannot
-    /// be read/generated/persisted.
-    pub fn with_persistent_provider(blobs: Blobs, db: Db) -> Result<Self, ServerError> {
+    /// Returns [`ServerError`] if the store cannot be opened, the secret is
+    /// missing under systemd, or the pubkey anchor cannot be persisted.
+    pub fn with_provider_from_secret(blobs: Blobs, db: Db) -> Result<Self, ServerError> {
         let store = open_store(db)?;
-        let seed = resolve_or_create_provider_seed(&store)?;
-        Ok(Self::assemble(Provider::from_seed(&seed), blobs, store))
+        let seed = resolve_provider_seed()?;
+        let provider = Provider::from_seed(&seed);
+        // Durable, non-secret verification anchor — never the seed.
+        store.put_meta(PROVIDER_PUBKEY_KEY, &provider.public_key_hex())?;
+        tracing::info!(provider = %provider.id, "provider identity loaded from secret");
+        Ok(Self::assemble(provider, blobs, store))
     }
 
     fn assemble(provider: Provider, blobs: Blobs, store: Store) -> Self {
@@ -232,8 +243,19 @@ impl App {
     }
 }
 
-/// The `meta` key under which the provider's key seed is persisted.
-const PROVIDER_SEED_KEY: &str = "provider_seed";
+/// The `meta` key under which the provider's PUBLIC key is persisted — a
+/// non-secret verification anchor so historical receipts stay verifiable even if
+/// the private key is later rotated or lost. The private seed is never stored
+/// here (I8).
+const PROVIDER_PUBKEY_KEY: &str = "provider_pubkey";
+
+/// The systemd credential name (under `$CREDENTIALS_DIRECTORY`) carrying the
+/// provider's signing seed.
+const PROVIDER_SEED_CREDENTIAL: &str = "provider-seed";
+
+/// The environment variable carrying the provider seed (a dev / non-systemd
+/// alternative to the systemd credential).
+const PROVIDER_SEED_ENV: &str = "CISS_PROVIDER_SEED";
 
 /// Open the metering store from a [`Db`] config.
 fn open_store(db: Db) -> Result<Store, ServerError> {
@@ -246,22 +268,77 @@ fn open_store(db: Db) -> Result<Store, ServerError> {
 /// Return the persisted provider seed, generating and persisting a fresh random
 /// one on first start. The seed lives in the canonical SQLite so it is backed up
 /// with the ledger it signs.
-fn resolve_or_create_provider_seed(store: &Store) -> Result<Zeroizing<String>, ServerError> {
-    // The seed is secret key material: hold it in a `Zeroizing` wrapper so the
-    // in-memory copy is scrubbed on drop (I8, memory hygiene). `SEAM:` the seed is
-    // still stored *at rest* in the canonical SQLite; not co-locating it with the
-    // data it authenticates (a `0600` file outside the backup set, or a KMS) is a
-    // deployment decision tracked in the security review — changing it rotates the
-    // live signing identity, so it is not done inline.
-    if let Some(seed) = store.get_meta(PROVIDER_SEED_KEY)? {
-        return Ok(Zeroizing::new(seed));
+/// What to do about the provider seed given the available sources (a pure,
+/// testable decision — see [`resolve_provider_seed`] for the impure wiring).
+#[derive(Debug, PartialEq, Eq)]
+enum SeedDecision {
+    /// Use this configured seed.
+    Use(Zeroizing<String>),
+    /// No secret configured, but not under systemd (dev): generate an ephemeral
+    /// identity with a warning.
+    GenerateEphemeral,
+    /// No secret configured under systemd (a real unit): fail closed.
+    FailClosed,
+}
+
+/// Decide the seed source. A systemd credential wins over the env var; with
+/// neither, we fail closed under systemd and dev-generate otherwise.
+fn decide_seed(
+    credential: Option<Zeroizing<String>>,
+    env: Option<Zeroizing<String>>,
+    under_systemd: bool,
+) -> SeedDecision {
+    if let Some(seed) = credential.filter(|s| !s.is_empty()) {
+        return SeedDecision::Use(seed);
     }
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|_| ServerError::BadConfig)?;
-    let seed = Zeroizing::new(hex::encode(bytes));
-    bytes.zeroize();
-    store.put_meta(PROVIDER_SEED_KEY, &seed)?;
-    Ok(seed)
+    if let Some(seed) = env.filter(|s| !s.is_empty()) {
+        return SeedDecision::Use(seed);
+    }
+    if under_systemd {
+        SeedDecision::FailClosed
+    } else {
+        SeedDecision::GenerateEphemeral
+    }
+}
+
+/// Read the provider seed from the systemd credential directory, if present.
+fn seed_from_credential() -> Result<Option<Zeroizing<String>>, ServerError> {
+    let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(dir).join(PROVIDER_SEED_CREDENTIAL);
+    match std::fs::read_to_string(&path) {
+        Ok(seed) => Ok(Some(Zeroizing::new(seed.trim().to_owned()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ServerError::BadConfig),
+    }
+}
+
+/// Resolve the provider signing seed from the unit-supplied secret (I8): a
+/// systemd credential, else the env var; under systemd with neither, fail closed
+/// rather than run a throwaway identity; outside systemd (dev), generate an
+/// ephemeral seed with a loud warning. The seed is held in a `Zeroizing` wrapper
+/// so the in-memory copy is scrubbed on drop, and is never written to the store.
+fn resolve_provider_seed() -> Result<Zeroizing<String>, ServerError> {
+    let credential = seed_from_credential()?;
+    let env = std::env::var(PROVIDER_SEED_ENV).ok().map(Zeroizing::new);
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    match decide_seed(credential, env, under_systemd) {
+        SeedDecision::Use(seed) => Ok(seed),
+        SeedDecision::FailClosed => Err(ServerError::ProviderSeedMissing),
+        SeedDecision::GenerateEphemeral => {
+            tracing::warn!(
+                "no provider seed configured (no {PROVIDER_SEED_CREDENTIAL} credential or \
+                 {PROVIDER_SEED_ENV}); using an EPHEMERAL dev identity — receipts will not \
+                 verify across a restart"
+            );
+            let mut bytes = [0u8; 32];
+            getrandom::getrandom(&mut bytes).map_err(|_| ServerError::BadConfig)?;
+            let seed = Zeroizing::new(hex::encode(bytes));
+            bytes.zeroize();
+            Ok(seed)
+        }
+    }
 }
 
 /// Recover the store guard even if a prior writer panicked: the metering
@@ -910,6 +987,9 @@ pub enum ServerError {
     /// The server was misconfigured (e.g. a non-UTF-8 database path).
     #[error("bad configuration")]
     BadConfig,
+    /// No provider signing seed was supplied under systemd (startup, fail-closed).
+    #[error("no provider seed configured (wire the systemd credential or the env var)")]
+    ProviderSeedMissing,
     /// A request identifier (`did`/content address) failed boundary validation.
     #[error("invalid identifier: {0}")]
     BadIdentifier(#[from] crate::identifiers::IdentifierError),
@@ -945,6 +1025,7 @@ impl IntoResponse for ServerError {
             | ServerError::Blob(_)
             | ServerError::Json(_)
             | ServerError::BadConfig
+            | ServerError::ProviderSeedMissing
             | ServerError::TaskJoin => StatusCode::INTERNAL_SERVER_ERROR,
         };
         // Split internal from external representation (I4): a 5xx must not leak
@@ -984,8 +1065,36 @@ pub fn inherit_fd_requested(
 
 #[cfg(test)]
 mod tests {
-    use super::{inherit_fd_requested, App, Blobs, Db, Op};
+    use super::{decide_seed, inherit_fd_requested, App, Blobs, Db, Op, SeedDecision};
     use crate::receipts::{select_mode, ReceiptMode, TransferContext};
+    use zeroize::Zeroizing;
+
+    fn seed(s: &str) -> Zeroizing<String> {
+        Zeroizing::new(s.to_owned())
+    }
+
+    #[test]
+    fn seed_source_precedence_and_fail_closed() {
+        // A credential wins over the env var.
+        assert_eq!(
+            decide_seed(Some(seed("cred")), Some(seed("env")), true),
+            SeedDecision::Use(seed("cred")),
+        );
+        // The env var is used when there is no credential.
+        assert_eq!(
+            decide_seed(None, Some(seed("env")), true),
+            SeedDecision::Use(seed("env")),
+        );
+        // An empty credential is ignored (falls through to the env var).
+        assert_eq!(
+            decide_seed(Some(seed("")), Some(seed("env")), true),
+            SeedDecision::Use(seed("env")),
+        );
+        // Under systemd with no secret: fail closed (never an ephemeral identity).
+        assert_eq!(decide_seed(None, None, true), SeedDecision::FailClosed);
+        // Outside systemd (dev) with no secret: generate an ephemeral seed.
+        assert_eq!(decide_seed(None, None, false), SeedDecision::GenerateEphemeral);
+    }
 
     #[test]
     fn provider_id_is_deterministic_from_the_seed() {
