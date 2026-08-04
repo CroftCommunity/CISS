@@ -124,6 +124,31 @@ pub fn verify_service_auth_jwt(
     })
 }
 
+/// Extract the `iss` claim **without verifying** the signature — so the caller
+/// knows which DID to resolve before it can verify. The subsequent
+/// [`verify_service_auth_jwt`] re-checks `iss` against the resolved key, so this
+/// peek is safe: a lie here only points resolution at the wrong DID, whose key
+/// then fails to verify the signature.
+///
+/// # Errors
+///
+/// [`JwtError::BadJwtStructure`] if not three segments; [`JwtError::BadClaims`] if
+/// the payload is not JSON with a string `iss`.
+pub fn peek_iss(jwt: &str) -> Result<String, JwtError> {
+    #[derive(Deserialize)]
+    struct IssOnly {
+        iss: String,
+    }
+    let mut parts = jwt.split('.');
+    let (Some(_h), Some(p), Some(_s), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(JwtError::BadJwtStructure);
+    };
+    let claims: IssOnly = decode_json(p).map_err(|()| JwtError::BadClaims)?;
+    Ok(claims.iss)
+}
+
 /// base64url-decode a JWS segment and parse it as JSON.
 fn decode_json<T: for<'de> Deserialize<'de>>(segment: &str) -> Result<T, ()> {
     let bytes = URL_SAFE_NO_PAD.decode(segment).map_err(|_| ())?;
@@ -283,5 +308,12 @@ mod tests {
         let sk = signer();
         assert_eq!(verify("not.a.jwt.at.all", &sk), Err(JwtError::BadJwtStructure));
         assert_eq!(verify("onlyonesegment", &sk), Err(JwtError::BadJwtStructure));
+    }
+
+    #[test]
+    fn peek_iss_reads_the_issuer_before_verification() {
+        let sk = signer();
+        assert_eq!(super::peek_iss(&valid_token(&sk)).as_deref(), Ok(ISS));
+        assert_eq!(super::peek_iss("garbage"), Err(JwtError::BadJwtStructure));
     }
 }

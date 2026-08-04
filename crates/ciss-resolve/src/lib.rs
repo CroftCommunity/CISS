@@ -22,6 +22,7 @@ mod cache;
 mod doc;
 mod fetch;
 mod pinned;
+mod static_resolver;
 #[cfg(test)]
 mod testutil;
 mod timeout;
@@ -30,6 +31,7 @@ pub use cache::{CachingResolver, Clock, SystemClock};
 pub use doc::{signing_key_from_doc, DidDocument};
 pub use fetch::{DidDocFetcher, PlcWebResolver};
 pub use pinned::PinnedResolver;
+pub use static_resolver::StaticResolver;
 pub use timeout::TimeoutResolver;
 
 /// The default `did:plc` directory base URL.

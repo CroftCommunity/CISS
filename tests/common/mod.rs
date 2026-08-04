@@ -12,12 +12,22 @@
 //!   The `flow_*` suites use this.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciss::server::{App, Blobs, Db};
+use ciss_auth::ResolvedKeys;
+use ciss_resolve::{PinnedResolver, StaticResolver};
 use tokio::sync::oneshot;
+
+/// This test service's atproto DID — the `aud` a valid service-auth JWT must name.
+pub const SERVICE_DID: &str = "did:web:ciss.test";
+/// The XRPC method the atproto upload path binds `lxm` to.
+pub const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
 
 /// A running test server bound to an ephemeral port, driven over real HTTP.
 pub struct TestServer {
@@ -193,6 +203,50 @@ impl World {
         }
     }
 
+    /// A world with a **healthy** fixture DID resolver wired for the named atproto
+    /// personas. Each name gets a deterministic secp256k1 key; the resolver maps
+    /// its `did:web:<name>.test` DID to the derived `did:key`, so the persona can
+    /// mint service-auth JWTs the server verifies with no network (Model R).
+    pub async fn spawn_atproto(names: &[&str]) -> Self {
+        let mut resolver = StaticResolver::default();
+        for name in names {
+            let kp = atproto_keypair(name);
+            resolver = resolver.with(kp.did.clone(), kp.did_key());
+        }
+        Self::from_atproto(Arc::new(resolver)).await
+    }
+
+    /// A world simulating a **resolver outage**: only the pinned admin personas
+    /// resolve (locally, break-glass); every other DID fails closed. Models the
+    /// poisoning/outage resistance of the pinned-admin set (ADR 0001 §5).
+    pub async fn spawn_atproto_resolver_down(admin_names: &[&str]) -> Self {
+        let mut pins = HashMap::new();
+        for name in admin_names {
+            let kp = atproto_keypair(name);
+            pins.insert(kp.did.clone(), ResolvedKeys::new(kp.did_key()));
+        }
+        // Empty inner resolver => every non-pinned DID is NotFound (the outage).
+        let resolver = PinnedResolver::new(StaticResolver::default(), pins);
+        Self::from_atproto(Arc::new(resolver)).await
+    }
+
+    async fn from_atproto(resolver: Arc<dyn ciss_resolve::DidResolver>) -> Self {
+        let app = App::new("test-provider", Blobs::Memory, Db::Memory)
+            .expect("build app")
+            .with_did_resolver(resolver, SERVICE_DID);
+        Self::from_app(app, None).await
+    }
+
+    /// An atproto persona `name` — holds a secp256k1 key and mints service-auth
+    /// JWTs as `did:web:<name>.test`.
+    pub fn atproto_actor(&self, name: &str) -> AtprotoActor {
+        AtprotoActor {
+            client: self.client.clone(),
+            base: self.base.clone(),
+            key: atproto_keypair(name),
+        }
+    }
+
     /// Tear down the server and remove any filesystem root.
     pub async fn shutdown(mut self) {
         if let Some(server) = self.server.take() {
@@ -321,6 +375,107 @@ impl Actor {
     pub async fn healthz(&self) -> Outcome {
         Self::run(self.client.get(format!("{}/healthz", self.base))).await
     }
+}
+
+/// A deterministic secp256k1 identity for an atproto persona (Model R).
+struct AtprotoKeypair {
+    did: String,
+    sk: k256::ecdsa::SigningKey,
+}
+
+/// Derive a persona's secp256k1 key + `did:web:<name>.test` DID deterministically,
+/// so the fixture resolver map and the actor always agree on the key.
+fn atproto_keypair(name: &str) -> AtprotoKeypair {
+    // A valid, non-zero scalar seed built from the name (no extra hash dep needed).
+    let mut seed = [1u8; 32];
+    for (i, b) in name.bytes().enumerate() {
+        seed[i % 32] ^= b;
+    }
+    let sk = k256::ecdsa::SigningKey::from_slice(&seed).expect("valid scalar");
+    AtprotoKeypair {
+        did: format!("did:web:{name}.test"),
+        sk,
+    }
+}
+
+impl AtprotoKeypair {
+    /// The persona's atproto signing key as a secp256k1 `did:key:` string.
+    fn did_key(&self) -> String {
+        let point = self.sk.verifying_key().to_encoded_point(true);
+        let bytes = [&[0xe7u8, 0x01], point.as_bytes()].concat();
+        format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, bytes))
+    }
+}
+
+/// An atproto persona: authenticates to the atproto plane with a service-auth JWT
+/// (Model R) signed by its own repo key, verified server-side against the DID it
+/// resolves to. Public reads use the plain [`Actor`] (`World::anonymous`).
+pub struct AtprotoActor {
+    client: reqwest::Client,
+    base: String,
+    key: AtprotoKeypair,
+}
+
+impl AtprotoActor {
+    /// This persona's DID.
+    pub fn did(&self) -> &str {
+        &self.key.did
+    }
+
+    /// Sign a service-auth JWT with this persona's key and explicit claims — so a
+    /// flow can forge `iss`, misname `aud`/`lxm`, or expire it.
+    pub fn sign_token(&self, iss: &str, aud: &str, lxm: &str, exp_unix: u64, jti: &str) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use k256::ecdsa::{signature::Signer, Signature};
+        let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ES256K"}"#);
+        let claims =
+            format!(r#"{{"iss":"{iss}","aud":"{aud}","lxm":"{lxm}","exp":{exp_unix},"jti":"{jti}"}}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let sig: Signature = self.key.sk.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    /// A valid upload token: `iss`=self, `aud`=service, `lxm`=upload, unexpired.
+    pub fn valid_upload_token(&self, jti: &str) -> String {
+        self.sign_token(&self.key.did, SERVICE_DID, UPLOAD_LXM, now_s() + 300, jti)
+    }
+
+    /// `uploadBlob` presenting `token` as the bearer.
+    pub async fn upload_blob_with_token(&self, token: &str, bytes: &[u8]) -> Outcome {
+        let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", self.base);
+        Actor::run(
+            self.client
+                .post(url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(bytes.to_vec()),
+        )
+        .await
+    }
+
+    /// `uploadBlob` with a fresh valid service-auth JWT (unique `jti` per content).
+    pub async fn upload_blob(&self, bytes: &[u8]) -> Outcome {
+        let token = self.valid_upload_token(&jti_for(bytes));
+        self.upload_blob_with_token(&token, bytes).await
+    }
+}
+
+/// The current time in unix seconds.
+fn now_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A content-derived `jti` so distinct uploads don't collide in the replay guard.
+fn jti_for(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("jti-{h:016x}")
 }
 
 /// The result of an [`Actor`] operation — status + body, with intent-named
