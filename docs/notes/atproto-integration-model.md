@@ -200,6 +200,31 @@ Fail-closed on writes while public reads keep serving is the intended posture.
    that mints/relays a service-auth JWT (`aud`+`lxm`) using the held session. This is
    **croft-stack work** and comes *after* CISS can verify (the floor works without it).
 
+## Downstream option — per-object read ACLs (the private-"PDS" read case)
+
+Verified DIDs make read-gating cheap: the hard part is proving "you are `did:X`"
+(this increment); authorization is then a lookup. So an object can be stored with
+an **allowed-reader DID list**, and a read requires a service-auth JWT proving a
+DID on that list — the private-repo read case that falls out of piggybacking on
+bsky, with **no new trust root** (same DID verification, same delegation).
+
+```
+  stored:   { bytes, reader_dids: [did:plc:alice, did:plc:bob] }   (owner-set, write-side)
+  read:     Bearer <service-auth JWT, iss=did:plc:alice, lxm=getBlob>
+  CISS:     verify JWT (proves alice) → alice ∈ reader_dids?
+              yes → bytes ;  no / anonymous → 404 (no existence oracle; listBlobs omits)
+  scope:    exactly this object — the JWT proved identity, nothing more
+```
+
+**This is an authorization-layer decision, after this (authentication) increment.**
+It reopens a **grain** choice: ADR 0001 §2 chose namespace-grain `{read_class,
+write_class}` mode bits and *explicitly rejected per-object ACLs* ("the complexity
+and leakage surface of per-object ACLs"). Per-object reader lists are finer than
+that; the two compose (namespace default + per-object override) but the tradeoff
+(a `reader_dids` list as object metadata, the `listBlobs` leakage rule, the
+existence-oracle 404 discipline) must be decided when the authorization model is
+built, not assumed here. Tracked, not designed.
+
 ## Security notes
 
 - The public-client fallback holds the bsky **session** in the browser (more exposed

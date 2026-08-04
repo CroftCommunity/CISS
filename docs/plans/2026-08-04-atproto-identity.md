@@ -216,6 +216,12 @@ prerequisite for the flow test to be real.
   without it; it is the convenience path. See `atproto-integration-model.md`.
 - **DPoP OAuth access tokens (Model M2)** — only if CISS later joins an OAuth
   access-token chain. Parked.
+- **Per-object read ACLs (private-"PDS" reads)** — an authorization-layer feature
+  that falls out of verified DIDs: an object stored with an allowed-reader DID list,
+  read-gated by a service-auth JWT proving a listed DID (404 + `listBlobs`-omit on
+  denial). Reopens ADR 0001 §2's namespace-vs-per-object grain choice; decide when
+  the authorization model is built. See `docs/notes/atproto-integration-model.md`
+  §"Downstream option".
 - **`did:plc` signed-oplog verification** — so a poisoned directory cannot forge
   current key state (ADR 0001 §5, last bullet). Tracked, not v1.
 - **Handle→DID resolution** (DNS TXT / HTTPS well-known) — only when grants against
