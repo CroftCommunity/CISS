@@ -590,16 +590,25 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 /// Verify a service-auth JWT (Model R). Returns [`Principal::Anonymous`] on any
 /// failure — never a fall-through to the DID the token named.
+///
+/// Auth-impacting decisions are logged: a **grant** at DEBUG (the DID + method
+/// authorized), a **denied attempt** at INFO with the reason (visible in
+/// production without debug), so an operator can see who was let in and why an
+/// attempt failed. Tokens and keys are never logged — only DIDs (public), the
+/// method, and the reason.
 async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principal {
     let Ok(iss) = ciss_auth::peek_iss(jwt) else {
+        tracing::info!(lxm, reason = "malformed token", "service-auth denied");
         return Principal::Anonymous;
     };
     // The `iss` must be an atproto `did:*`, never an internal `id:` (Phase 1
     // space typing): the atproto plane cannot assert a native identifier.
     let Ok(did) = Did::parse(&iss) else {
+        tracing::info!(%iss, lxm, reason = "malformed iss", "service-auth denied");
         return Principal::Anonymous;
     };
     if did.require_atproto().is_err() {
+        tracing::info!(%iss, lxm, reason = "iss not an atproto did", "service-auth denied");
         return Principal::Anonymous;
     }
     let now = now_unix_s();
@@ -612,20 +621,28 @@ async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principa
     // Resolve, verify; on a signature mismatch retry once with a force-refreshed
     // key (survives a key rotation between cache-fill and now).
     let Ok(keys) = state.resolver.resolve(&iss, false).await else {
+        tracing::info!(%iss, lxm, reason = "did resolution failed", "service-auth denied");
         return Principal::Anonymous;
     };
     let verified = match ciss_auth::verify_service_auth_jwt(jwt, &keys, &params) {
         Ok(v) => v,
         Err(ciss_auth::JwtError::SignatureInvalid) => {
             let Ok(fresh) = state.resolver.resolve(&iss, true).await else {
+                tracing::info!(%iss, lxm, reason = "did resolution failed", "service-auth denied");
                 return Principal::Anonymous;
             };
             match ciss_auth::verify_service_auth_jwt(jwt, &fresh, &params) {
                 Ok(v) => v,
-                Err(_) => return Principal::Anonymous,
+                Err(reason) => {
+                    tracing::info!(%iss, lxm, %reason, "service-auth denied");
+                    return Principal::Anonymous;
+                }
             }
         }
-        Err(_) => return Principal::Anonymous,
+        Err(reason) => {
+            tracing::info!(%iss, lxm, %reason, "service-auth denied");
+            return Principal::Anonymous;
+        }
     };
     // Replay defense: a token carrying a `jti` is single-use within its window.
     if let Some(jti) = &verified.jti {
@@ -634,9 +651,12 @@ async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principa
             .check_and_record(jti, verified.exp_unix_s, now)
             .is_err()
         {
+            tracing::info!(%iss, lxm, reason = "replayed jti", "service-auth denied");
             return Principal::Anonymous;
         }
     }
+    // Grant: this DID is authorized for this method (the auth-impacting decision).
+    tracing::debug!(did = %verified.did, lxm, aud = %state.service_did, "service-auth granted");
     verified.principal()
 }
 
@@ -687,9 +707,19 @@ async fn well_known_did_handler(State(state): State<AppState>) -> Response {
 /// who is not the owner is a 403 (no retry will help).
 fn require_owner(principal: &Principal, did: &str) -> Result<(), ServerError> {
     match principal.did() {
-        None => Err(ServerError::Unauthorized),
-        Some(owner) if owner == did => Ok(()),
-        Some(_) => Err(ServerError::Forbidden),
+        None => {
+            tracing::info!(resource = %did, reason = "unauthenticated", "owner-authz denied");
+            Err(ServerError::Unauthorized)
+        }
+        Some(owner) if owner == did => {
+            // The auth-impacting grant: this DID is authorized for its own namespace.
+            tracing::debug!(did = %owner, resource = %did, "owner-authz granted");
+            Ok(())
+        }
+        Some(other) => {
+            tracing::info!(actor = %other, resource = %did, reason = "not owner", "owner-authz denied");
+            Err(ServerError::Forbidden)
+        }
     }
 }
 
