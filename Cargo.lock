@@ -179,6 +179,7 @@ dependencies = [
  "getrandom",
  "hex",
  "ipld-core",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

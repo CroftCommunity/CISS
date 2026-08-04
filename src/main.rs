@@ -31,9 +31,16 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Subcommand: `ciss usage [--did <did>] --data-dir <path>` is a sync, read-only
+    // reporting tool over the same data dir; the bare form runs the service.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("usage") {
+        return run_usage(&argv[1..]).map_err(Into::into);
+    }
+
     init_tracing();
 
-    let config = parse_args(std::env::args().skip(1))?;
+    let config = parse_args(argv.into_iter())?;
     let db_path = config.data_dir.join("meter.sqlite");
 
     // Provision the layout the binary owns (fail loud if we cannot). The blob
@@ -88,6 +95,173 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config, String> {
     Ok(Config { data_dir, listen })
 }
 
+/// The `ciss usage [--did <did>] --data-dir <path>` subcommand: a read-only report
+/// over the live metering store (the `did_usage` view + the persisted limits) plus
+/// the data-dir partition size, so an operator can see the store ceiling as a % of
+/// the partition and each DID's on-disk + cumulative-transferred bytes.
+fn run_usage(args: &[String]) -> Result<(), String> {
+    let mut data_dir: Option<PathBuf> = None;
+    let mut did: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--data-dir" => {
+                data_dir = Some(PathBuf::from(it.next().ok_or("--data-dir requires a value")?));
+            }
+            "--did" => did = Some(it.next().ok_or("--did requires a value")?.clone()),
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    let data_dir = data_dir.ok_or("usage requires --data-dir")?;
+    let db = data_dir.join("meter.sqlite");
+    let store = ciss::persist::Store::open_readonly(db.to_str().ok_or("non-UTF-8 data-dir")?)
+        .map_err(|e| format!("open store: {e}"))?;
+
+    let meta_u64 = |key: &str| -> Result<Option<u64>, String> {
+        Ok(store
+            .get_meta(key)
+            .map_err(|e| e.to_string())?
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<u64>().ok()))
+    };
+    let store_ceiling = meta_u64("store_ceiling")?;
+    let did_cap = meta_u64("did_cap")?;
+    let store_used = store.store_usage().map_err(|e| e.to_string())?;
+    let rows = match &did {
+        Some(d) => store
+            .usage_for(d)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect::<Vec<_>>(),
+        None => store.usage_all().map_err(|e| e.to_string())?,
+    };
+    let partition = partition_bytes(&data_dir);
+
+    print!(
+        "{}",
+        format_usage_report(
+            &data_dir,
+            store_ceiling,
+            did_cap,
+            store_used,
+            partition,
+            &rows,
+            did.as_deref(),
+        )
+    );
+    Ok(())
+}
+
+/// A percentage of `whole` (0.0 when `whole` is 0).
+#[allow(clippy::cast_precision_loss)] // display only
+fn pct(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
+}
+
+/// A human-readable byte size (e.g. `1.2 GiB`).
+#[allow(clippy::cast_precision_loss)] // display only
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// `(total, available)` bytes of the filesystem `path` lives on, if resolvable.
+#[cfg(unix)]
+// statvfs field widths vary by platform; try_from is the portable choice.
+#[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
+fn partition_bytes(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated path; stat is a valid out-param.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let frsize = u64::try_from(stat.f_frsize).unwrap_or(0);
+    Some((
+        u64::try_from(stat.f_blocks).unwrap_or(0) * frsize,
+        u64::try_from(stat.f_bavail).unwrap_or(0) * frsize,
+    ))
+}
+
+#[cfg(not(unix))]
+fn partition_bytes(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Render the usage report (pure — the testable core of `run_usage`).
+fn format_usage_report(
+    data_dir: &std::path::Path,
+    store_ceiling: Option<u64>,
+    did_cap: Option<u64>,
+    store_used: u64,
+    partition: Option<(u64, u64)>,
+    rows: &[ciss::persist::UsageRow],
+    single_did: Option<&str>,
+) -> String {
+    let mut out = format!("CISS storage — data-dir {}\n", data_dir.display());
+    if let Some((total, free)) = partition {
+        out.push_str(&format!("  partition:     {} total, {} free\n", human(total), human(free)));
+    }
+    match store_ceiling {
+        Some(ceiling) => {
+            let of_part = partition
+                .map(|(t, _)| format!("  ({:.1}% of partition)", pct(ceiling, t)))
+                .unwrap_or_default();
+            out.push_str(&format!("  store ceiling: {}{}\n", human(ceiling), of_part));
+            let of_part_used = partition
+                .map(|(t, _)| format!(" · {:.1}% of partition", pct(store_used, t)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  store used:    {}  ({:.1}% of ceiling{})\n",
+                human(store_used),
+                pct(store_used, ceiling),
+                of_part_used,
+            ));
+        }
+        None => out.push_str(&format!("  store used:    {}  (ceiling not initialized)\n", human(store_used))),
+    }
+    match did_cap {
+        Some(cap) => out.push_str(&format!("  per-DID cap:   {}\n", human(cap))),
+        None => out.push_str("  per-DID cap:   (none — opportunistic)\n"),
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "  {:<46} {:>14} {:>18} {:>9}\n",
+        "DID", "stored (disk)", "transferred (cum)", "receipts"
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "  {:<46} {:>14} {:>18} {:>9}\n",
+            r.did,
+            human(r.stored_bytes),
+            human(r.transferred_bytes),
+            r.receipt_count,
+        ));
+    }
+    if rows.is_empty() {
+        match single_did {
+            Some(d) => out.push_str(&format!("  (no usage recorded for {d})\n")),
+            None => out.push_str("  (no DIDs yet)\n"),
+        }
+    }
+    out
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -140,8 +314,53 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{format_usage_report, parse_args};
     use std::path::PathBuf;
+
+    #[test]
+    fn usage_report_shows_ceiling_percent_and_per_did() {
+        let rows = vec![ciss::persist::UsageRow {
+            did: "id:abc".to_owned(),
+            stored_bytes: 1_200_000_000,
+            upload_bytes: 2_000_000_000,
+            download_bytes: 1_400_000_000,
+            transferred_bytes: 3_400_000_000,
+            receipt_count: 412,
+        }];
+        let gib = 1024 * 1024 * 1024;
+        let report = format_usage_report(
+            std::path::Path::new("/var/lib/ciss"),
+            Some(50 * gib),
+            None,
+            1_200_000_000,
+            Some((99 * gib, 91 * gib)),
+            &rows,
+            None,
+        );
+        assert!(report.contains("store ceiling: 50.0 GiB"), "{report}");
+        assert!(report.contains("% of partition"), "{report}");
+        assert!(
+            report.contains("per-DID cap:   (none — opportunistic)"),
+            "{report}",
+        );
+        assert!(report.contains("id:abc"), "{report}");
+        assert!(report.contains("stored (disk)"), "{report}");
+    }
+
+    #[test]
+    fn usage_report_shows_a_configured_per_did_cap() {
+        let report = format_usage_report(
+            std::path::Path::new("/data"),
+            Some(1000),
+            Some(100),
+            0,
+            None,
+            &[],
+            None,
+        );
+        assert!(report.contains("per-DID cap:   100 B"), "{report}");
+        assert!(report.contains("(no DIDs yet)"), "{report}");
+    }
 
     fn parse(args: &[&str]) -> Result<(PathBuf, String), String> {
         let cfg = parse_args(args.iter().map(|s| (*s).to_owned()))?;

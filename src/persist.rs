@@ -51,6 +51,36 @@ pub enum PersistError {
     Json(#[from] serde_json::Error),
 }
 
+/// One row of the `did_usage` read surface: a DID's storage + transfer usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRow {
+    /// The DID.
+    pub did: String,
+    /// Distinct bytes at rest (the store footprint this DID contributes).
+    pub stored_bytes: u64,
+    /// Cumulative bytes uploaded.
+    pub upload_bytes: u64,
+    /// Cumulative bytes downloaded.
+    pub download_bytes: u64,
+    /// Cumulative bytes transferred (upload + download).
+    pub transferred_bytes: u64,
+    /// Number of receipts.
+    pub receipt_count: u64,
+}
+
+/// Map a `did_usage` row to a [`UsageRow`] (SQLite integers are `i64`).
+fn row_to_usage(row: &rusqlite::Row) -> rusqlite::Result<UsageRow> {
+    let u = |i: usize| -> rusqlite::Result<u64> { Ok(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0)) };
+    Ok(UsageRow {
+        did: row.get(0)?,
+        stored_bytes: u(1)?,
+        upload_bytes: u(2)?,
+        download_bytes: u(3)?,
+        transferred_bytes: u(4)?,
+        receipt_count: u(5)?,
+    })
+}
+
 /// A per-DID record store backed by SQLite.
 pub struct Store {
     conn: Connection,
@@ -73,6 +103,52 @@ impl Store {
     /// Returns [`PersistError`] if the database cannot be opened or migrated.
     pub fn open(path: &str) -> Result<Self, PersistError> {
         Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an existing store **read-only**, without migrating — for tooling (the
+    /// `ciss usage` CLI, monitors) reading the live database while the service
+    /// holds the writer (WAL allows concurrent readers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if the database cannot be opened.
+    pub fn open_readonly(path: &str) -> Result<Self, PersistError> {
+        let conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
+    }
+
+    /// Every DID's usage from the `did_usage` read surface, heaviest first.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn usage_all(&self) -> Result<Vec<UsageRow>, PersistError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT did, stored_bytes, upload_bytes, download_bytes, transferred_bytes, \
+             receipt_count FROM did_usage ORDER BY stored_bytes DESC, did",
+        )?;
+        let rows = stmt.query_map([], row_to_usage)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One DID's usage from the `did_usage` read surface, if present.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn usage_for(&self, did: &str) -> Result<Option<UsageRow>, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT did, stored_bytes, upload_bytes, download_bytes, transferred_bytes, \
+                 receipt_count FROM did_usage WHERE did = ?1",
+                [did],
+                row_to_usage,
+            )
+            .optional()
+            .map_err(PersistError::from)
     }
 
     fn from_connection(conn: Connection) -> Result<Self, PersistError> {
@@ -463,6 +539,33 @@ mod tests {
             store.running_totals("id:none").expect("empty"),
             ReceiptTotals::default(),
         );
+    }
+
+    #[test]
+    fn did_usage_view_reflects_stores_and_transfers() {
+        use crate::receipts::{make_unilateral_receipt, Direction, ReceiptCore};
+        let provider = derive_keypair("m", "p");
+        let store = Store::open_in_memory().expect("open");
+        let did = "id:u";
+        store
+            .append_receipt(
+                did,
+                &make_unilateral_receipt(
+                    ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 0, "id:r", "id:s"),
+                    "id:s",
+                    &provider,
+                ),
+            )
+            .expect("receipt");
+        store.add_stored_bytes(did, 100).expect("store");
+
+        let row = store.usage_for(did).expect("query").expect("present");
+        assert_eq!(row.stored_bytes, 100);
+        assert_eq!(row.upload_bytes, 100);
+        assert_eq!(row.transferred_bytes, 100);
+        assert_eq!(row.receipt_count, 1);
+        assert_eq!(store.usage_all().expect("all").len(), 1);
+        assert!(store.usage_for("id:none").expect("absent").is_none());
     }
 
     #[test]
