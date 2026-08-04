@@ -68,6 +68,13 @@ material; provision it like `provider-seed` (a systemd credential / mode-0400
 path) and point `CISS_ADMIN_PINS_FILE` at it. A malformed file fails startup
 loudly. Resolution reaches `plc.directory` outbound over HTTPS (rustls) — the only
 egress CISS makes.
+
+> **TODO (croft-stack): `CISS_ADMIN_PINS_FILE` is not yet populated.** As deployed,
+> the pin set is **empty** — every `did:` resolves via the network, so there is no
+> break-glass for the admin identities and a `plc.directory` outage means `did:`
+> auth fails closed for everyone (the `id:` session path is unaffected). Provision
+> the pin file (admin DID → `did:key`, like `provider-seed`) and set
+> `CISS_ADMIN_PINS_FILE` before relying on `did:` auth in an outage.
 - **All** state under the data dir; no root; port ≥ 1024 (TLS is Caddy's).
 - Self-managed layout matching the manifest's `data_profile`:
   `meter.sqlite` (canonical) + `blocks/` (blobs) + `tmp/` (staging, outside the mirror).
