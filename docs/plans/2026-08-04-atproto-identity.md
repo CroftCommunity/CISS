@@ -218,6 +218,15 @@ The `aud` anchor: a service-auth JWT must be *addressed* to CISS.
   change required for defaults. *(Deploy itself is out of this increment — the
   branch is unmerged.)*
 
+## Tracked follow-ons
+
+- **Resolver cache observability (not built).** The `CachingResolver` exposes no
+  metrics — no size gauge, no hit/miss counters, no cache logging — and CISS emits
+  no app-level metrics (telemetry is cgroup-only). Add hit/miss/size/eviction
+  counters surfaced via `ciss usage` (the existing operator read surface) or a
+  metrics line, so the `did:plc` lookup cache is observable in production.
+- **Populate `CISS_ADMIN_PINS_FILE`** — empty as deployed (no `did:` break-glass yet).
+
 ## Cross-repo follow-ons (not this increment)
 
 - **Broker `getServiceAuth` relay endpoint** (croft-stack) — mints/relays a
