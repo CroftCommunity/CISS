@@ -201,15 +201,22 @@ The `aud` anchor: a service-auth JWT must be *addressed* to CISS.
 - **GREEN:** wiring; `AppState` resolver; config for the pinned admin set, the plc
   endpoint, timeout, TTL, CISS `aud`.
 
-### Phase 5 — Posture + ADR + deploy surface
+### Phase 5 — Posture + ADR + deploy surface · **DONE 2026-08-04**
 
-- New invariants in `docs/SECURITY-POSTURE.md`: resolution **fail-closed**; admin
-  **pin** (never network-rotatable); JWT `aud`/`lxm`/`exp` binding; low-S/canonical
-  enforcement; `jti` replay window.
-- Env + man page: `CISS_SERVICE_DID` (the `aud`), `CISS_PLC_DIRECTORY_URL`,
-  `CISS_DID_RESOLVE_TIMEOUT_MS`, `CISS_DID_CACHE_TTL_S`, and the pinned-admin-DID
-  material (a file, flowed through croft-stack like `provider-seed`). Update
-  `docs/DEPLOYMENT.md` + croft-stack.
+- Production resolver wired into `main.rs` (`src/did_resolver.rs`): `Pinned →
+  Caching → Timeout → PlcWeb(ReqwestFetcher, rustls)`, config via `ResolveConfig::
+  from_env`; malformed admin-pin file fails startup loudly (`parse_admin_pins`).
+- `docs/SECURITY-POSTURE.md`: new invariants **A3–A7** (JWT verified vs resolved
+  key + curve-from-key; `aud`/`lxm`/`exp` binding; canonical low-S; `jti` replay;
+  resolution fail-closed + admin pin) + checklist rows.
+- Man page + `docs/DEPLOYMENT.md`: `CISS_SERVICE_DID`, `CISS_PLC_DIRECTORY_URL`,
+  `CISS_DID_RESOLVE_TIMEOUT_MS`, `CISS_DID_CACHE_TTL_S`, `CISS_ADMIN_PINS_FILE`
+  (defaults safe; admin-pin file flowed like `provider-seed`). `/.well-known/did.json`
+  documented as must-stay-public (not gated by the `/healthz` allowlist TODO).
+- **croft-stack (when deploying):** provision the admin-pin credential, optionally
+  set `CISS_SERVICE_DID`; ensure no edge allowlist gates `/.well-known/*`. No
+  change required for defaults. *(Deploy itself is out of this increment — the
+  branch is unmerged.)*
 
 ## Cross-repo follow-ons (not this increment)
 
