@@ -33,7 +33,7 @@ use serde::Deserialize;
 
 use crate::cidv1;
 use crate::identifiers::Did;
-use crate::server::{authenticate, dispatch_blocking, AppState, Op, OpOutcome, ServerError};
+use crate::server::{authenticate_atproto, dispatch_blocking, AppState, Op, OpOutcome, ServerError};
 
 /// The mime returned when a request declares none, and echoed by `getBlob`.
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -73,10 +73,11 @@ async fn upload_blob(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    // The acting DID is the caller's verified session identity — a blob is
-    // uploaded to the repo whose key signed the session, never to a DID named in
-    // an unverified header (ADR 0001; closes the mock-bearer A2).
-    let principal = authenticate(&headers);
+    // The acting DID is the caller's verified identity — either a Model-R
+    // service-auth JWT (atproto `did:`, verified against its resolved key) or the
+    // interim `id:` signed session — never a DID named in an unverified header
+    // (ADR 0001; closes the mock-bearer A2 on both identity spaces).
+    let principal = authenticate_atproto(&state, &headers, "com.atproto.repo.uploadBlob").await;
     let did = principal
         .did()
         .ok_or(ServerError::Unauthorized)?

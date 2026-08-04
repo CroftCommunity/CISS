@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -35,7 +35,8 @@ use axum::{Json, Router};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::blobstore::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
-use ciss_auth::Principal;
+use ciss_auth::{Principal, ReplayGuard, ServiceAuthParams};
+use ciss_resolve::{DidResolver, StaticResolver};
 
 use crate::crypto::{derive_keypair, public_key_from_hex, sha256_hex, Keypair};
 use crate::identifiers::{ContentAddr, Did};
@@ -172,6 +173,15 @@ pub(crate) struct AppState {
     /// a real clock (byte-day rent integrates over wall-clock days) lands with
     /// the statement-close scheduler.
     day: u64,
+    /// Resolves an atproto DID to its signing key for service-auth JWT
+    /// verification (Model R). Defaults to an empty [`StaticResolver`] (all `did:`
+    /// auth fails closed) until a real resolver is wired via
+    /// [`App::with_did_resolver`]; the production network resolver lands at deploy.
+    resolver: Arc<dyn DidResolver>,
+    /// Replay guard for verified service-auth JWTs (`jti` seen-set).
+    replay: Arc<ReplayGuard>,
+    /// This service's atproto DID — the `aud` a service-auth JWT must name.
+    service_did: Arc<str>,
 }
 
 /// The cooperative metered-storage server.
@@ -248,8 +258,27 @@ impl App {
                 store: Arc::new(Mutex::new(store)),
                 limits,
                 day: 0,
+                // Fail-closed default: no DID resolves until a real resolver is
+                // wired (tests inject a fixture; deploy composes the network stack).
+                resolver: Arc::new(StaticResolver::default()),
+                replay: Arc::new(ReplayGuard::new()),
+                service_did: Arc::from(default_service_did().as_str()),
             },
         }
+    }
+
+    /// Wire the atproto DID resolver and this service's `aud` DID (Model R). The
+    /// injection point for tests (a fixture [`StaticResolver`]) and, at deploy, the
+    /// composed network resolver. Without it, `did:` service-auth fails closed.
+    #[must_use]
+    pub fn with_did_resolver(
+        mut self,
+        resolver: Arc<dyn DidResolver>,
+        service_did: impl Into<Arc<str>>,
+    ) -> Self {
+        self.state.resolver = resolver;
+        self.state.service_did = service_did.into();
+        self
     }
 
     /// The provider's derived id (the boundary's signing identity).
@@ -530,6 +559,95 @@ pub(crate) fn authenticate(headers: &HeaderMap) -> Principal {
     let challenge = format!("{SESSION_CHALLENGE_PREFIX}{did}");
     ciss_auth::verify_session(&did, pubkey_hex, challenge.as_bytes(), sig_hex)
         .unwrap_or(Principal::Anonymous)
+}
+
+/// Authenticate an atproto-plane request into a [`Principal`], **non-rejecting**
+/// (an invalid credential yields [`Principal::Anonymous`], never the DID it named).
+///
+/// Two mechanisms, selected by header:
+/// - `Authorization: Bearer <service-auth jwt>` → Model R: resolve the `iss` DID,
+///   verify the JWT (sig + `aud`==this service + `lxm`==`lxm` + `exp`), replay-check.
+/// - `x-croft-*` → the interim `id:` signed session (unchanged).
+pub(crate) async fn authenticate_atproto(state: &AppState, headers: &HeaderMap, lxm: &str) -> Principal {
+    if let Some(jwt) = bearer_token(headers) {
+        return verify_service_auth(state, jwt, lxm).await;
+    }
+    authenticate(headers)
+}
+
+/// The `Authorization: Bearer <token>` value, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+}
+
+/// Verify a service-auth JWT (Model R). Returns [`Principal::Anonymous`] on any
+/// failure — never a fall-through to the DID the token named.
+async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principal {
+    let Ok(iss) = ciss_auth::peek_iss(jwt) else {
+        return Principal::Anonymous;
+    };
+    // The `iss` must be an atproto `did:*`, never an internal `id:` (Phase 1
+    // space typing): the atproto plane cannot assert a native identifier.
+    let Ok(did) = Did::parse(&iss) else {
+        return Principal::Anonymous;
+    };
+    if did.require_atproto().is_err() {
+        return Principal::Anonymous;
+    }
+    let now = now_unix_s();
+    let params = ServiceAuthParams {
+        expected_iss: &iss,
+        expected_aud: &state.service_did,
+        expected_lxm: lxm,
+        now_unix_s: now,
+    };
+    // Resolve, verify; on a signature mismatch retry once with a force-refreshed
+    // key (survives a key rotation between cache-fill and now).
+    let Ok(keys) = state.resolver.resolve(&iss, false).await else {
+        return Principal::Anonymous;
+    };
+    let verified = match ciss_auth::verify_service_auth_jwt(jwt, &keys, &params) {
+        Ok(v) => v,
+        Err(ciss_auth::JwtError::SignatureInvalid) => {
+            let Ok(fresh) = state.resolver.resolve(&iss, true).await else {
+                return Principal::Anonymous;
+            };
+            match ciss_auth::verify_service_auth_jwt(jwt, &fresh, &params) {
+                Ok(v) => v,
+                Err(_) => return Principal::Anonymous,
+            }
+        }
+        Err(_) => return Principal::Anonymous,
+    };
+    // Replay defense: a token carrying a `jti` is single-use within its window.
+    if let Some(jti) = &verified.jti {
+        if state
+            .replay
+            .check_and_record(jti, verified.exp_unix_s, now)
+            .is_err()
+        {
+            return Principal::Anonymous;
+        }
+    }
+    verified.principal()
+}
+
+/// The current time in unix seconds (for JWT `exp`).
+fn now_unix_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// This service's atproto DID (the `aud` a service-auth JWT must name) — from
+/// `CISS_SERVICE_DID`, else the deployed default.
+fn default_service_did() -> String {
+    std::env::var("CISS_SERVICE_DID").unwrap_or_else(|_| "did:web:ciss.croft.ing".to_owned())
 }
 
 /// Owner-gated authorization: the principal must be the verified owner of `did`.

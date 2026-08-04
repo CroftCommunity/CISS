@@ -191,12 +191,16 @@ name = "ciss"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "base64",
  "ciss-auth",
+ "ciss-resolve",
  "ed25519-dalek",
  "getrandom",
  "hex",
  "ipld-core",
+ "k256",
  "libc",
+ "multibase",
  "reqwest",
  "rusqlite",
  "serde",

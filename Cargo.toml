@@ -17,6 +17,7 @@ resolver = "2"
 
 [dependencies]
 ciss-auth = { path = "crates/ciss-auth" }
+ciss-resolve = { path = "crates/ciss-resolve" }
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 sha2 = "0.10"
 hex = "0.4"
@@ -37,6 +38,11 @@ libc = "0.2"
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", default-features = false }
+# Flow harness (tests/common): mint real secp256k1 service-auth JWTs for the
+# atproto persona so Model-R auth is exercised end-to-end over HTTP.
+k256 = { version = "0.13", features = ["ecdsa"] }
+multibase = "0.9"
+base64 = "0.22"
 
 [profile.release]
 # Metering arithmetic must never silently wrap: a wrapped byte count corrupts a
