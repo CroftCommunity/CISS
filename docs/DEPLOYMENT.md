@@ -67,11 +67,18 @@ croft-stack uses for the iroh relay):
    stripped **glibc** build. *(A fully-static `x86_64-unknown-linux-musl` build is
    the portability hardening follow-up; on a single trixie box the glibc build is
    correct and simplest.)*
-2. Package + checksum: `tar czf ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz ciss` and
-   record its `sha256sum`.
+2. Package + checksum: the tarball ships the binary **and the man page** so the
+   operator tooling is deployed with CISS —
+   `tar czf ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz ciss docs/man/ciss.1` — and record
+   its `sha256sum`.
 3. Publish: `gh release create vX.Y.Z -R CroftCommunity/CISS <tarball>`.
 4. Pin it in `croft-stack/ansible/group_vars/all.yml` under the `ciss`
    `active_tenants` entry: `binary_version`, `binary_url`, `binary_sha256`.
+
+The `ciss usage` operator report is the same binary (a subcommand, not a separate
+tool), so it is deployed with the service. The croft-stack `tenants` role installs
+`ciss.1` to the man path and symlinks `/usr/local/bin/ciss → /opt/ciss/current/ciss`
+so `ciss usage …`, `ciss -h`, and `man ciss` work on the box.
 
 The croft-stack `tenants` role then `get_url`s the tarball (verifying the
 checksum) and unpacks `ciss` to `/opt/ciss/current/ciss` — the exact path the

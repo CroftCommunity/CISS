@@ -23,6 +23,46 @@ use std::path::PathBuf;
 
 use ciss::server::{inherit_fd_requested, App, Blobs, Db};
 
+/// Top-level `--help` text.
+const TOP_HELP: &str = "\
+ciss — Croft Item Storage Server (metered PDS-like object store)
+
+USAGE:
+    ciss --data-dir <path> --listen <host:port>   run the metered-storage server
+    ciss usage --data-dir <path> [--did <did>]    print a storage-usage report
+    ciss --help                                   show this help
+
+SERVER FLAGS:
+    --data-dir <path>      state dir (meter.sqlite, blocks/, tmp/); default ./data
+    --listen <host:port>   loopback bind (TLS is Caddy's); default 127.0.0.1:8080
+
+ENVIRONMENT:
+    CISS_PROVIDER_SEED     provider signing seed (hex). Normally a systemd
+                           credential ($CREDENTIALS_DIRECTORY/provider-seed);
+                           REQUIRED under systemd (the service fails closed).
+    CISS_MAX_STORE_BYTES   whole-store distinct-bytes ceiling (default 50 GiB)
+    CISS_MAX_DID_BYTES     optional per-DID cap; unset => opportunistic fill
+
+See `ciss usage --help` for the report subcommand, and ciss(1) for the man page.
+";
+
+/// `ciss usage --help` text.
+const USAGE_HELP: &str = "\
+ciss usage — storage-usage report (read-only)
+
+USAGE:
+    ciss usage --data-dir <path> [--did <did>]
+
+Prints the store ceiling (and its % of the partition the data dir is on) and each
+DID's on-disk stored bytes alongside cumulative transferred bytes. With --did,
+reports one DID. Reads the live database read-only — safe while the service runs.
+
+OPTIONS:
+    --data-dir <path>   the CISS data directory (contains meter.sqlite)
+    --did <did>         report a single DID (default: all DIDs)
+    -h, --help          show this help
+";
+
 /// Resolved runtime configuration from the command line.
 struct Config {
     data_dir: PathBuf,
@@ -34,8 +74,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subcommand: `ciss usage [--did <did>] --data-dir <path>` is a sync, read-only
     // reporting tool over the same data dir; the bare form runs the service.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let has_help = |args: &[String]| args.iter().any(|a| a == "-h" || a == "--help");
     if argv.first().map(String::as_str) == Some("usage") {
+        if has_help(&argv[1..]) {
+            print!("{USAGE_HELP}");
+            return Ok(());
+        }
         return run_usage(&argv[1..]).map_err(Into::into);
+    }
+    if has_help(&argv) {
+        print!("{TOP_HELP}");
+        return Ok(());
     }
 
     init_tracing();

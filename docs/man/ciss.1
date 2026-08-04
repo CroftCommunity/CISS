@@ -1,0 +1,120 @@
+.TH CISS 1 "2026-08-04" "CISS" "Croft Item Storage Server"
+.SH NAME
+ciss \- Croft Item Storage Server: a metered, PDS-like object store
+.SH SYNOPSIS
+.B ciss
+.B \-\-data\-dir
+.I path
+.B \-\-listen
+.I host:port
+.br
+.B ciss usage
+.B \-\-data\-dir
+.I path
+.RB [ \-\-did
+.IR did ]
+.br
+.B ciss \-\-help
+.SH DESCRIPTION
+.B ciss
+is a cooperative metered\-storage server. It exposes an S3\-compatible object
+interface and an atproto PDS blob API over one metered byte\-path: every byte that
+crosses the boundary is metered with a provider\-signed receipt, and rent is
+derived from the customer's own signed manifest.
+.PP
+The bare invocation runs the server. The
+.B usage
+subcommand is a read\-only operator report over the same data directory.
+.SH COMMANDS
+.TP
+.B (server)
+Run the metered\-storage server. Binds a loopback port (TLS is terminated by the
+front proxy) and self\-manages its layout under
+.IR \-\-data\-dir .
+.TP
+.B usage
+Print a storage\-usage report: the whole\-store distinct\-bytes ceiling and its
+percentage of the partition the data dir is on, and, per DID, on\-disk stored bytes
+alongside cumulative transferred bytes. Opens the live database
+.B read\-only
+(safe while the service is running). With
+.B \-\-did
+it reports a single DID.
+.SH OPTIONS
+.TP
+.BI \-\-data\-dir " path"
+State directory. Holds
+.IR meter.sqlite " (the per\-DID metering ledger and the provider public key),"
+.IR blocks/ " (content\-addressed blobs), and " tmp/ " (write staging)."
+Default:
+.IR ./data .
+.TP
+.BI \-\-listen " host:port"
+Loopback bind address for the server. Default:
+.IR 127.0.0.1:8080 .
+.TP
+.BI \-\-did " did"
+.RB ( usage
+only) report a single DID instead of all DIDs.
+.TP
+.BR \-h ", " \-\-help
+Show help (top\-level, or for the
+.B usage
+subcommand).
+.SH ENVIRONMENT
+.TP
+.B CISS_PROVIDER_SEED
+The provider signing seed (hex). In production this is supplied as a systemd
+encrypted credential at
+.IR $CREDENTIALS_DIRECTORY/provider\-seed ;
+the seed is never stored in the database. Under systemd, if neither the
+credential nor this variable is present, the service
+.B fails closed.
+.TP
+.B CISS_MAX_STORE_BYTES
+The whole\-store distinct\-bytes ceiling, always enforced. A new store that would
+exceed it is refused with
+.BR "507 Insufficient Storage" .
+Default: 50 GiB.
+.TP
+.B CISS_MAX_DID_BYTES
+An optional per\-DID distinct\-bytes cap. If unset (or 0), DIDs fill the store
+opportunistically up to the whole\-store ceiling. If set, a DID's new store past
+the cap is refused with
+.BR 507 .
+.SH FILES
+.TP
+.I <data-dir>/meter.sqlite
+The canonical metering ledger and the durable provider public key. Exposes a
+.B did_usage
+view (the stable, read\-only usage API that
+.B ciss usage
+consumes).
+.TP
+.I <data-dir>/blocks/{did}/{cid}
+Content\-addressed blob bytes.
+.SH EXAMPLES
+Run the server:
+.PP
+.RS
+.EX
+ciss \-\-data\-dir /var/lib/ciss \-\-listen 127.0.0.1:8301
+.EE
+.RE
+.PP
+Report storage usage for all DIDs, then one DID:
+.PP
+.RS
+.EX
+ciss usage \-\-data\-dir /var/lib/ciss
+ciss usage \-\-data\-dir /var/lib/ciss \-\-did id:me
+.EE
+.RE
+.SH SECURITY
+See
+.I docs/SECURITY\-POSTURE.md
+in the source tree for the trust model and the security invariants (the design
+reference for audits).
+.SH SEE ALSO
+.BR systemd\-creds (1),
+.BR statvfs (3)
