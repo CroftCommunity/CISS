@@ -1,9 +1,23 @@
 # ADR 0001 — Authentication and access-control model
 
-- **Status:** Proposed
+- **Status:** Proposed — **amended 2026-08-04** (see "Amendment" below; §3's
+  token-source model was corrected after the Phase-0 probe).
 - **Date:** 2026-08-03
 - **Deciders:** CISS maintainers (Croft)
 - **Supersedes:** the Phase-8 mock-bearer `SEAM:` (`docs/ARCHITECTURE.md` §7 → "Auth")
+
+> **Amendment (2026-08-04) — read with §3.** The Phase-0 probe
+> (`docs/notes/atproto-token-shape.md`) found the deployed broker
+> (`account.croft.ing`) is a confidential OAuth **client**, not an issuer: it mints
+> **no** token for CISS to verify. §3's "DPoP-bound tokens / service-auth JWTs that
+> flow from that broker" is therefore corrected: **CISS verifies an atproto
+> service-auth JWT signed by the caller's own repo key (ES256K/ES256), obtained via
+> `com.atproto.server.getServiceAuth` — relayed by the broker when up, or fetched
+> by the client directly — and validated by resolving the caller's DID.** The broker
+> is a courier, never a trust root (Model R). The full model, the rejected
+> broker-as-issuer alternative (Model B), and the degraded-mode design are in
+> `docs/notes/atproto-integration-model.md`. The crib source is `rsky-crypto`
+> (in-corpus reference), not `rsky-pds` (not in the local corpus).
 
 ---
 
@@ -233,8 +247,11 @@ ship as one story. Full detail in the audit report.
 
 ## Open questions
 
-- Exact token type CISS accepts from `account.croft.ing` (OAuth access token vs
-  service-auth JWT) — pin against what the broker actually issues before coding.
+- ~~Exact token type CISS accepts from `account.croft.ing` (OAuth access token vs
+  service-auth JWT)~~ — **RESOLVED 2026-08-04 (Phase 0).** CISS accepts an atproto
+  **service-auth JWT** signed by the caller's repo key, verified via DID resolution
+  (Model R). The broker issues no CISS token. See the Amendment and
+  `docs/notes/atproto-integration-model.md`.
 - Namespace policy storage shape, and how a namespace's mode bits are set and
   changed (an owner-signed policy record is the likely form).
 - `did:plc` audit-log verification: v1 or a tracked follow-up.
