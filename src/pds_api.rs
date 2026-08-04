@@ -38,6 +38,27 @@ use crate::server::{authenticate, dispatch_blocking, AppState, Op, OpOutcome, Se
 /// The mime returned when a request declares none, and echoed by `getBlob`.
 const DEFAULT_MIME: &str = "application/octet-stream";
 
+/// The maximum length of an accepted media type.
+const MAX_MEDIA_TYPE_LEN: usize = 128;
+
+/// Whether `s` is a simple, bounded `type/subtype` media type over a safe charset
+/// (no control bytes, no `<`/`>`, no parameters) — I13.
+fn is_valid_media_type(s: &str) -> bool {
+    s.len() <= MAX_MEDIA_TYPE_LEN
+        && s.split_once('/').is_some_and(|(t, sub)| !t.is_empty() && !sub.is_empty())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'+' | b'-'))
+}
+
+/// The media type to store/echo for an upload: the declared value if it is a
+/// valid, bounded media type, else the default (never a reflected garbage value).
+fn sanitize_media_type(declared: Option<&str>) -> String {
+    match declared.map(str::trim) {
+        Some(s) if is_valid_media_type(s) => s.to_owned(),
+        _ => DEFAULT_MIME.to_owned(),
+    }
+}
+
 /// The atproto blob endpoints, ready to merge into the server's router.
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -60,12 +81,10 @@ async fn upload_blob(
         .did()
         .ok_or(ServerError::Unauthorized)?
         .to_owned();
-    let mime = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_MIME)
-        .to_owned();
+    // Validate the declared media type (I13): an unbounded or non-media-type
+    // Content-Type must not be stored and echoed back to atproto clients. An
+    // invalid value falls back to the default rather than reflecting garbage.
+    let mime = sanitize_media_type(headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()));
     tracing::info!(endpoint = "uploadBlob", %did, bytes = body.len(), mime = ?mime, "atproto blob boundary");
 
     let outcome = dispatch_blocking(
@@ -129,7 +148,12 @@ async fn get_blob(
 
     // SEAM: atproto getBlob echoing the original upload mime is behavioral and
     // UNCONFIRMED in the lexicon (D2); v0 returns octet-stream rather than guess.
-    Ok(([(CONTENT_TYPE, DEFAULT_MIME)], data).into_response())
+    let mut resp = ([(CONTENT_TYPE, DEFAULT_MIME)], data).into_response();
+    for (name, value) in crate::server::BLOB_SECURITY_HEADERS {
+        resp.headers_mut()
+            .insert(name, axum::http::HeaderValue::from_static(value));
+    }
+    Ok(resp)
 }
 
 /// Query for `listBlobs`: the owning DID.

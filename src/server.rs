@@ -802,6 +802,15 @@ async fn unimplemented_s3() -> Response {
         .into_response()
 }
 
+/// Security headers for a served blob (I9): never content-sniff, always download
+/// rather than render, and a locked-down CSP — so attacker-uploaded bytes served
+/// from this origin cannot execute or be sniffed as same-origin HTML/JS.
+pub(crate) const BLOB_SECURITY_HEADERS: [(&str, &str); 3] = [
+    ("x-content-type-options", "nosniff"),
+    ("content-disposition", "attachment"),
+    ("content-security-policy", "default-src 'none'; sandbox"),
+];
+
 /// An `ETag` header value for a content address (`"<cid>"`, quoted per HTTP).
 fn etag(cid: &str) -> HeaderValue {
     HeaderValue::from_str(&format!("\"{cid}\""))
@@ -827,7 +836,11 @@ impl IntoResponse for OpOutcome {
             }
             OpOutcome::Bytes { cid, data } => {
                 let mut resp = (StatusCode::OK, data).into_response();
-                resp.headers_mut().insert("etag", etag(&cid));
+                let headers = resp.headers_mut();
+                headers.insert("etag", etag(&cid));
+                for (name, value) in BLOB_SECURITY_HEADERS {
+                    headers.insert(name, HeaderValue::from_static(value));
+                }
                 resp
             }
             OpOutcome::ManifestSaved { root, total_bytes } => Json(serde_json::json!({
@@ -951,11 +964,18 @@ impl IntoResponse for ServerError {
             | ServerError::BadConfig
             | ServerError::TaskJoin => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let message = self.to_string();
-        if status.is_server_error() {
-            tracing::error!(%status, error = %message, "boundary request failed");
-        }
-        (status, message).into_response()
+        // Split internal from external representation (I4): a 5xx must not leak
+        // internal state — the content-hash of tampered bytes, an OS io-error, a
+        // raw SQLite/serde message. Log the full detail; return a fixed public
+        // string. 4xx messages describe the *client's own* request (a bad
+        // manifest, a malformed identifier), so they are safe to return.
+        let body = if status.is_server_error() {
+            tracing::error!(%status, error = %self, "boundary request failed");
+            "internal error".to_owned()
+        } else {
+            self.to_string()
+        };
+        (status, body).into_response()
     }
 }
 
