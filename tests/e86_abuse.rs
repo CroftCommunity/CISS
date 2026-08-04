@@ -26,13 +26,17 @@ async fn server_content_addresses_so_a_client_cannot_misname_bytes() {
     let app = App::new("prov", Blobs::Memory, Db::Memory).expect("app");
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
-    let did = derive_id(&derive_keypair("cust", "c").verifying_key());
+    let customer = derive_keypair("cust", "c");
+    let did = derive_id(&customer.verifying_key());
+    let (pubkey, session) = common::session_headers(&customer, &did);
 
     let payload = b"authentic bytes".to_vec();
     // The client PUTs under a lying object key; the server ignores the key for
     // addressing and returns the TRUE fingerprint.
     let put = client
         .put(server.url(&format!("/{did}/objects/pretend-this-is-something-else")))
+        .header("x-croft-pubkey", pubkey.as_str())
+        .header("x-croft-session", session.as_str())
         .body(payload.clone())
         .send()
         .await
@@ -52,12 +56,16 @@ async fn tamper_at_rest_is_caught_on_the_way_out() {
     let app = App::new("prov", Blobs::Fs(root.clone()), Db::Memory).expect("app");
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
-    let did = derive_id(&derive_keypair("cust", "c").verifying_key());
+    let customer = derive_keypair("cust", "c");
+    let did = derive_id(&customer.verifying_key());
+    let (pubkey, session) = common::session_headers(&customer, &did);
 
     let payload = b"trust but verify".to_vec();
     let cid = sha256_hex(&payload);
     let put = client
         .put(server.url(&format!("/{did}/objects/doc")))
+        .header("x-croft-pubkey", pubkey.as_str())
+        .header("x-croft-session", session.as_str())
         .body(payload.clone())
         .send()
         .await
@@ -148,7 +156,9 @@ async fn no_bytes_no_receipt_walkaway_leaves_the_ledger_empty() {
     let app = App::new("prov", Blobs::Memory, Db::Memory).expect("app");
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
-    let did = derive_id(&derive_keypair("cust", "ghost").verifying_key());
+    let customer = derive_keypair("cust", "ghost");
+    let did = derive_id(&customer.verifying_key());
+    let (pubkey, session) = common::session_headers(&customer, &did);
 
     // Fetch an object that was never uploaded: 404, and no receipt is minted.
     let get = client
@@ -165,6 +175,8 @@ async fn no_bytes_no_receipt_walkaway_leaves_the_ledger_empty() {
     let meter = body_json(
         client
             .get(server.url(&format!("/{did}/meter")))
+            .header("x-croft-pubkey", pubkey.as_str())
+            .header("x-croft-session", session.as_str())
             .send()
             .await
             .expect("meter"),
@@ -179,13 +191,17 @@ async fn replays_dedup_at_rest_but_meter_per_transfer() {
     let app = App::new("prov", Blobs::Memory, Db::Memory).expect("app");
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
-    let did = derive_id(&derive_keypair("cust", "c").verifying_key());
+    let customer = derive_keypair("cust", "c");
+    let did = derive_id(&customer.verifying_key());
+    let (pubkey, session) = common::session_headers(&customer, &did);
 
     let payload = b"replayed payload".to_vec();
     let n = payload.len() as u64;
     for _ in 0..2 {
         let put = client
             .put(server.url(&format!("/{did}/objects/dup")))
+            .header("x-croft-pubkey", pubkey.as_str())
+            .header("x-croft-session", session.as_str())
             .body(payload.clone())
             .send()
             .await
@@ -195,6 +211,8 @@ async fn replays_dedup_at_rest_but_meter_per_transfer() {
     let meter = body_json(
         client
             .get(server.url(&format!("/{did}/meter")))
+            .header("x-croft-pubkey", pubkey.as_str())
+            .header("x-croft-session", session.as_str())
             .send()
             .await
             .expect("meter"),

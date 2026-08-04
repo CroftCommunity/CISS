@@ -70,9 +70,10 @@ async fn an_overlong_did_is_refused() {
 #[tokio::test]
 async fn a_well_formed_identifier_is_accepted() {
     let world = World::spawn().await;
-    let did = common::derive_did("legit");
-    // A store + fetch round-trip over valid identifiers succeeds.
-    let cid = world.anonymous().put_object(&did, "note", b"hello").await.ok().cid();
+    let legit = world.actor("legit");
+    let did = legit.did().to_owned();
+    // A store (authenticated) + public fetch round-trip over valid identifiers.
+    let cid = legit.put_object(&did, "note", b"hello").await.ok().cid();
     world.anonymous().get_object(&did, &cid).await.returns(b"hello");
     world.shutdown().await;
 }

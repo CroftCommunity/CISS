@@ -23,16 +23,17 @@
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ciss_auth::Principal;
 use serde::Deserialize;
 
 use crate::cidv1;
 use crate::identifiers::Did;
-use crate::server::{dispatch_blocking, AppState, Op, OpOutcome, ServerError};
+use crate::server::{authenticate, dispatch_blocking, AppState, Op, OpOutcome, ServerError};
 
 /// The mime returned when a request declares none, and echoed by `getBlob`.
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -45,30 +46,20 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/xrpc/com.atproto.sync.listBlobs", get(list_blobs))
 }
 
-/// The acting DID for an authenticated request.
-///
-/// `SEAM:` (Phase-8 auth) v0 stands in a mock bearer check for atproto's real
-/// OAuth/DPoP session: a non-empty `Authorization: Bearer <token>` authorizes,
-/// and the token *is* the acting DID (a real JWT carries the DID as its `sub`).
-/// A missing or empty bearer is a loud 401 — never an anonymous write.
-fn authed_did(headers: &HeaderMap) -> Result<String, ServerError> {
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .ok_or(ServerError::Unauthorized)
-}
-
 /// `com.atproto.repo.uploadBlob` — store a blob in the authed repo, metered.
 async fn upload_blob(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    let did = Did::parse(&authed_did(&headers)?)?;
+    // The acting DID is the caller's verified session identity — a blob is
+    // uploaded to the repo whose key signed the session, never to a DID named in
+    // an unverified header (ADR 0001; closes the mock-bearer A2).
+    let principal = authenticate(&headers);
+    let did = principal
+        .did()
+        .ok_or(ServerError::Unauthorized)?
+        .to_owned();
     let mime = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -79,8 +70,9 @@ async fn upload_blob(
 
     let outcome = dispatch_blocking(
         &state,
+        principal,
         Op::PutObject {
-            did: did.into_string(),
+            did,
             key: "uploadBlob".to_owned(),
             bytes: body.to_vec(),
         },
@@ -121,8 +113,10 @@ async fn get_blob(
     let hex = cidv1::to_sha256_hex(&params.cid)?;
     tracing::info!(endpoint = "getBlob", did = %did, blob_cid = %params.cid, "atproto blob boundary");
 
+    // getBlob is public (PDS-compat world read).
     let outcome = dispatch_blocking(
         &state,
+        Principal::Anonymous,
         Op::GetObject {
             did: did.into_string(),
             cid: hex,
@@ -152,7 +146,10 @@ async fn list_blobs(
     let did = Did::parse(&params.did)?;
     tracing::info!(endpoint = "listBlobs", did = %did, "atproto blob boundary");
 
-    let outcome = dispatch_blocking(&state, Op::ListBlobs { did: did.into_string() }).await?;
+    // listBlobs is public (PDS-compat world read).
+    let outcome =
+        dispatch_blocking(&state, Principal::Anonymous, Op::ListBlobs { did: did.into_string() })
+            .await?;
     let OpOutcome::BlobList { cids } = outcome else {
         return Err(ServerError::BadConfig);
     };

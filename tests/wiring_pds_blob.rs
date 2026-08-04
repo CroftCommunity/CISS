@@ -2,18 +2,25 @@
 //! `getBlob` / `listBlobs` round-trip reaches the *same* metered byte-path as
 //! the S3 plane — not `pds_api` in isolation.
 //!
-//! Proves: `uploadBlob` requires a bearer session (401 without) and returns the
+//! Proves: `uploadBlob` requires a verified session (401 without) and returns the
 //! exact D2-confirmed `blob` shape with a real CIDv1 `ref.$link`; `getBlob`
 //! returns the exact bytes addressed by that CIDv1; `listBlobs` reports the
 //! uploaded CIDv1; and the transfers are metered (an upload + a download receipt
 //! land in the ledger, byte counts intact) — the atproto surface and the S3
 //! surface share one metering plane.
+//!
+//! Auth note: the acting DID is the caller's verified session identity (ADR 0001,
+//! Phase 3). The interim session mechanism verifies the `id:` identity space, so
+//! the test acts as an `id:` DID derived from a keypair; atproto `did:plc`/`did:web`
+//! resolution lands with the OAuth/DPoP increment.
 
 mod common;
 
 use common::TestServer;
 
 use ciss::cidv1;
+use ciss::crypto::derive_keypair;
+use ciss::identity::derive_id;
 use ciss::server::{App, Blobs, Db};
 
 /// Parse a JSON body into a `serde_json::Value`.
@@ -28,8 +35,11 @@ async fn atproto_blob_roundtrip_is_metered_and_matches_the_confirmed_shape() {
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
 
-    // A mock atproto session: the bearer token IS the acting DID (SEAM).
-    let did = "did:plc:ciss-phase8-test";
+    // The acting DID is the caller's verified session identity.
+    let customer = derive_keypair("atproto-master", "phase8");
+    let did = derive_id(&customer.verifying_key());
+    let (pubkey, session) = common::session_headers(&customer, &did);
+
     let payload = b"a blob crosses the atproto boundary".to_vec();
     let n = payload.len() as u64;
     let expected_link = cidv1::blob_cid_string(&payload);
@@ -48,13 +58,14 @@ async fn atproto_blob_roundtrip_is_metered_and_matches_the_confirmed_shape() {
     assert_eq!(
         no_auth.status().as_u16(),
         401,
-        "uploadBlob requires a bearer session",
+        "uploadBlob requires a verified session",
     );
 
     // --- uploadBlob with a session: returns the exact D2-confirmed blob shape. ---
     let upload = client
         .post(server.url("/xrpc/com.atproto.repo.uploadBlob"))
-        .header("authorization", format!("Bearer {did}"))
+        .header("x-croft-pubkey", pubkey.as_str())
+        .header("x-croft-session", session.as_str())
         .header("content-type", "text/plain")
         .body(payload.clone())
         .send()
@@ -74,7 +85,7 @@ async fn atproto_blob_roundtrip_is_metered_and_matches_the_confirmed_shape() {
     );
     assert_eq!(blob["size"], n, "size is the byte count");
 
-    // --- getBlob: the exact bytes, addressed by the CIDv1. ---
+    // --- getBlob: the exact bytes, addressed by the CIDv1 (public). ---
     let get = client
         .get(server.url(&format!(
             "/xrpc/com.atproto.sync.getBlob?did={did}&cid={expected_link}"
@@ -104,7 +115,7 @@ async fn atproto_blob_roundtrip_is_metered_and_matches_the_confirmed_shape() {
         "a malformed CID is a bad request"
     );
 
-    // --- listBlobs: reports the uploaded CIDv1. ---
+    // --- listBlobs: reports the uploaded CIDv1 (public). ---
     let list = json(
         client
             .get(server.url(&format!("/xrpc/com.atproto.sync.listBlobs?did={did}")))
@@ -121,6 +132,8 @@ async fn atproto_blob_roundtrip_is_metered_and_matches_the_confirmed_shape() {
     let meter = json(
         client
             .get(server.url(&format!("/{did}/meter")))
+            .header("x-croft-pubkey", pubkey.as_str())
+            .header("x-croft-session", session.as_str())
             .send()
             .await
             .expect("meter send"),
@@ -150,7 +163,10 @@ async fn list_blobs_reports_distinct_uploads_only() {
     let app = App::new("provider-master", Blobs::Memory, Db::Memory).expect("build app");
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
-    let did = "did:plc:ciss-listblobs";
+
+    let customer = derive_keypair("atproto-master", "listblobs");
+    let did = derive_id(&customer.verifying_key());
+    let (pubkey, session) = common::session_headers(&customer, &did);
 
     let a = b"blob A".to_vec();
     let b = b"blob B and then some".to_vec();
@@ -160,7 +176,8 @@ async fn list_blobs_reports_distinct_uploads_only() {
     let upload = |bytes: Vec<u8>| {
         client
             .post(server.url("/xrpc/com.atproto.repo.uploadBlob"))
-            .header("authorization", format!("Bearer {did}"))
+            .header("x-croft-pubkey", pubkey.as_str())
+            .header("x-croft-session", session.as_str())
             .body(bytes)
             .send()
     };

@@ -145,42 +145,39 @@ impl World {
         format!("{}{path}", self.base)
     }
 
-    /// A legitimate actor named `name`: a DID derived from the name, holding a
-    /// session for that DID.
-    ///
-    /// Today the mock boundary treats the bearer string as the acting DID, so a
-    /// legit actor's session is its DID. When real sessions land (ADR 0001,
-    /// Phase 3) this becomes a verifiable token minted from the actor's key; the
-    /// flow API does not change.
+    /// A legitimate actor named `name`: it holds the keypair whose id it acts as,
+    /// so it can sign a real session (x-croft-pubkey + x-croft-session) proving
+    /// key possession for that DID (ADR 0001).
     pub fn actor(&self, name: &str) -> Actor {
-        let did = derive_did(name);
+        let keypair = ciss::crypto::derive_keypair("flow-master", name);
+        let did = ciss::identity::derive_id(&keypair.verifying_key());
         Actor {
             client: self.client.clone(),
             base: self.base.clone(),
-            session: Some(did.clone()),
             did,
+            keypair: Some(keypair),
         }
     }
 
-    /// An anonymous caller — no credential of any kind.
+    /// An anonymous caller — no key, so it can sign no session.
     pub fn anonymous(&self) -> Actor {
         Actor {
             client: self.client.clone(),
             base: self.base.clone(),
             did: String::new(),
-            session: None,
+            keypair: None,
         }
     }
 
-    /// An impersonator: a caller presenting a bearer that *names* `victim_did`
-    /// without possessing its key. Models the forged-bearer attack (A2). Today
-    /// the boundary accepts it; the guard asserts it must be refused.
+    /// An impersonator: it *names* `victim_did` but holds no key for it, so it can
+    /// sign no valid session. Models the forged-bearer attack (A2): the boundary
+    /// must treat it as unauthenticated.
     pub fn impersonator(&self, victim_did: &str) -> Actor {
         Actor {
             client: self.client.clone(),
             base: self.base.clone(),
             did: victim_did.to_owned(),
-            session: Some(victim_did.to_owned()),
+            keypair: None,
         }
     }
 
@@ -212,13 +209,22 @@ pub fn derive_did(name: &str) -> String {
     derive_id(&derive_keypair("flow-master", name).verifying_key())
 }
 
+/// The `(x-croft-pubkey, x-croft-session)` header values for `keypair` acting as
+/// `did` — for raw-reqwest wiring tests that authenticate without the [`Actor`]
+/// DSL. The session is a signature over the domain-separated challenge the server
+/// reconstructs.
+pub fn session_headers(keypair: &ciss::crypto::Keypair, did: &str) -> (String, String) {
+    let challenge = format!("ciss-session/v1/{did}");
+    (keypair.public_key_hex(), keypair.sign_message(&challenge))
+}
+
 /// A persona acting against a [`World`] over real HTTP. Holds its identity and
 /// (optionally) a session credential; every operation returns an [`Outcome`].
 pub struct Actor {
     client: reqwest::Client,
     base: String,
     did: String,
-    session: Option<String>,
+    keypair: Option<ciss::crypto::Keypair>,
 }
 
 impl Actor {
@@ -227,9 +233,17 @@ impl Actor {
         &self.did
     }
 
+    /// Attach a signed session (x-croft-pubkey + x-croft-session) if this actor
+    /// holds a key. An actor with no key sends no session and is anonymous to the
+    /// boundary.
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.session {
-            Some(token) => builder.header("authorization", format!("Bearer {token}")),
+        match &self.keypair {
+            Some(keypair) => {
+                let challenge = format!("ciss-session/v1/{}", self.did);
+                builder
+                    .header("x-croft-pubkey", keypair.public_key_hex())
+                    .header("x-croft-session", keypair.sign_message(&challenge))
+            }
             None => builder,
         }
     }

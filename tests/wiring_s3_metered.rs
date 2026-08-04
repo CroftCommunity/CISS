@@ -40,6 +40,9 @@ async fn http_put_get_is_metered_end_to_end_and_releases_the_port() {
     let customer = derive_keypair("customer-master", "customer");
     let did = derive_id(&customer.verifying_key());
 
+    // The customer signs a session proving it holds the key deriving its DID.
+    let (pubkey, session) = common::session_headers(&customer, &did);
+
     let payload = b"the quick brown fox jumps over the lazy dog".to_vec();
     let n = payload.len() as u64;
     let cid = sha256_hex(&payload);
@@ -47,6 +50,8 @@ async fn http_put_get_is_metered_end_to_end_and_releases_the_port() {
     // --- PUT: upload bytes; expect a metered, content-addressed store. ---
     let put = client
         .put(server.url(&format!("/{did}/objects/greeting.txt")))
+        .header("x-croft-pubkey", pubkey.as_str())
+        .header("x-croft-session", session.as_str())
         .body(payload.clone())
         .send()
         .await
@@ -86,6 +91,8 @@ async fn http_put_get_is_metered_end_to_end_and_releases_the_port() {
     let meter = json(
         client
             .get(server.url(&format!("/{did}/meter")))
+            .header("x-croft-pubkey", pubkey.as_str())
+            .header("x-croft-session", session.as_str())
             .send()
             .await
             .expect("meter send"),

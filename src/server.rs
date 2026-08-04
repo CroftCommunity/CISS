@@ -35,6 +35,8 @@ use axum::{Json, Router};
 use zeroize::Zeroize;
 
 use crate::blobstore::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
+use ciss_auth::Principal;
+
 use crate::crypto::{derive_keypair, public_key_from_hex, sha256_hex, Keypair};
 use crate::identifiers::{ContentAddr, Did};
 use crate::identity::derive_id;
@@ -46,8 +48,19 @@ use crate::receipts::{
     TransferContext,
 };
 
-/// Header a client uses to present its public key when writing a signed manifest.
+/// Header a client uses to present its public key (for a signed manifest, and as
+/// the session identity for a signed-session write).
 const PUBKEY_HEADER: &str = "x-croft-pubkey";
+
+/// Header carrying the caller's session signature over the session challenge.
+const SESSION_HEADER: &str = "x-croft-session";
+
+/// Domain-separated session-challenge prefix. The caller signs
+/// `{SESSION_CHALLENGE_PREFIX}{did}` (where `did` is the id its key derives) to
+/// prove key possession — so it can only authenticate as its own DID. `SEAM:`
+/// (ADR 0001) this interim signed session is replaced by atproto OAuth/DPoP with
+/// a server-issued nonce; the [`Principal`] boundary does not change.
+const SESSION_CHALLENGE_PREFIX: &str = "ciss-session/v1/";
 
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -335,9 +348,64 @@ pub(crate) enum OpOutcome {
     },
 }
 
+/// Authenticate a request into a [`Principal`]. **Non-rejecting**: a missing or
+/// invalid session yields [`Principal::Anonymous`]; whether that is allowed is an
+/// authorization decision made at dispatch (401 vs 403), never inferred from the
+/// mere presence of a credential (ADR 0001).
+///
+/// The caller presents `x-croft-pubkey` (its public key) and `x-croft-session`
+/// (a signature over `ciss-session/v1/<did>`). The acting DID is the id the key
+/// derives, so a caller can only ever authenticate as the DID it holds the key
+/// for — naming a victim DID without its key cannot produce a valid session.
+pub(crate) fn authenticate(headers: &HeaderMap) -> Principal {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let (Some(pubkey_hex), Some(sig_hex)) = (header(PUBKEY_HEADER), header(SESSION_HEADER)) else {
+        return Principal::Anonymous;
+    };
+    let Ok(key) = public_key_from_hex(pubkey_hex) else {
+        return Principal::Anonymous;
+    };
+    let did = derive_id(&key);
+    let challenge = format!("{SESSION_CHALLENGE_PREFIX}{did}");
+    ciss_auth::verify_session(&did, pubkey_hex, challenge.as_bytes(), sig_hex)
+        .unwrap_or(Principal::Anonymous)
+}
+
+/// Owner-gated authorization: the principal must be the verified owner of `did`.
+/// An anonymous caller is a 401 (authenticate and retry); an authenticated caller
+/// who is not the owner is a 403 (no retry will help).
+fn require_owner(principal: &Principal, did: &str) -> Result<(), ServerError> {
+    match principal.did() {
+        None => Err(ServerError::Unauthorized),
+        Some(owner) if owner == did => Ok(()),
+        Some(_) => Err(ServerError::Forbidden),
+    }
+}
+
+/// Authorize an op against the caller's [`Principal`] — the ADR 0001 namespace
+/// mode bits, v0: object/blob reads and the (self-signed) manifest are
+/// world-readable (PDS-compat), while object writes and the billing meter are
+/// owner-only. `SEAM:` per-namespace mode bits + a grant model land here (gated
+/// reads for the history-convergence tier); v0 is the flat PDS-compat default.
+fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
+    match op {
+        Op::PutObject { did, .. } | Op::GetMeter { did } => require_owner(principal, did),
+        Op::GetObject { .. }
+        | Op::PutManifest { .. }
+        | Op::GetManifest { .. }
+        | Op::ListBlobs { .. } => Ok(()),
+    }
+}
+
 /// The single dispatch boundary. Every handler routes through here so the E83
-/// per-DID scope wrapper has one attach point.
-pub(crate) fn dispatch(state: &AppState, op: Op) -> Result<OpOutcome, ServerError> {
+/// per-DID scope wrapper has one attach point, and so authorization has a single
+/// choke point (ADR 0001).
+pub(crate) fn dispatch(
+    state: &AppState,
+    principal: &Principal,
+    op: Op,
+) -> Result<OpOutcome, ServerError> {
+    authorize(principal, &op)?;
     // SEAM (E83): a heavy op would enter a per-DID cgroup scope here; v0 ops are
     // all cheap, so dispatch runs in-process. The classification is live so the
     // wrapper slots in without a handler rewrite.
@@ -366,10 +434,11 @@ pub(crate) fn dispatch(state: &AppState, op: Op) -> Result<OpOutcome, ServerErro
 /// call this, not [`dispatch`] directly.
 pub(crate) async fn dispatch_blocking(
     state: &AppState,
+    principal: Principal,
     op: Op,
 ) -> Result<OpOutcome, ServerError> {
     let state = state.clone();
-    tokio::task::spawn_blocking(move || dispatch(&state, op))
+    tokio::task::spawn_blocking(move || dispatch(&state, &principal, op))
         .await
         .map_err(|_| ServerError::TaskJoin)?
 }
@@ -619,12 +688,15 @@ fn op_list_blobs(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> 
 async fn put_object_handler(
     State(state): State<AppState>,
     Path((did, key)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
+    let principal = authenticate(&headers);
     tracing::info!(method = "PUT", did = %did, key = ?key, bytes = body.len(), "object boundary");
     dispatch_blocking(
         &state,
+        principal,
         Op::PutObject {
             did: did.into_string(),
             key,
@@ -641,8 +713,10 @@ async fn get_object_handler(
     let did = Did::parse(&did)?;
     let addr = ContentAddr::parse(&addr)?;
     tracing::info!(method = "GET", did = %did, cid = %addr, "object boundary");
+    // Object reads are world-readable (PDS-compat default).
     dispatch_blocking(
         &state,
+        Principal::Anonymous,
         Op::GetObject {
             did: did.into_string(),
             cid: addr.into_string(),
@@ -663,8 +737,12 @@ async fn put_manifest_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_owned();
+    // The manifest is self-authorizing: op_put_manifest requires the presented
+    // key to derive the DID and to have signed the manifest, so it proves owner
+    // key-possession without the session header.
     dispatch_blocking(
         &state,
+        Principal::Anonymous,
         Op::PutManifest {
             did: did.into_string(),
             pubkey_hex,
@@ -679,15 +757,19 @@ async fn get_manifest_handler(
     Path(did): Path<String>,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    dispatch_blocking(&state, Op::GetManifest { did: did.into_string() }).await
+    // The manifest is a signed, world-readable record (PDS-compat).
+    dispatch_blocking(&state, Principal::Anonymous, Op::GetManifest { did: did.into_string() }).await
 }
 
 async fn get_meter_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
+    headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    dispatch_blocking(&state, Op::GetMeter { did: did.into_string() }).await
+    // The billing meter is private: owner-only (require_owner at dispatch).
+    let principal = authenticate(&headers);
+    dispatch_blocking(&state, principal, Op::GetMeter { did: did.into_string() }).await
 }
 
 /// Liveness/readiness: `200 ok`. Side-effect-free — it neither reads the store
@@ -798,9 +880,12 @@ pub enum ServerError {
     /// A bilateral receipt was requested at the raw S3 boundary (unsupported).
     #[error("bilateral co-signing is not supported at the raw S3 boundary (SEAM)")]
     BilateralUnsupported,
-    /// An atproto `uploadBlob` arrived without a valid session (mock auth SEAM).
-    #[error("unauthorized: uploadBlob requires a bearer session")]
+    /// The request needs a verified session and none was presented.
+    #[error("unauthorized: a verified session is required")]
     Unauthorized,
+    /// The caller is authenticated but is not the owner of the target namespace.
+    #[error("forbidden: not the owner of this namespace")]
+    Forbidden,
     /// A blob CID could not be parsed as a CIDv1 raw + sha-256 address.
     #[error("bad blob CID: {0}")]
     BadCid(#[from] crate::cidv1::CidError),
@@ -842,7 +927,7 @@ impl IntoResponse for ServerError {
             | ServerError::BadPubkey
             | ServerError::BadCid(_)
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
-            ServerError::DidKeyMismatch => StatusCode::FORBIDDEN,
+            ServerError::DidKeyMismatch | ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
