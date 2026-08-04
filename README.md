@@ -78,9 +78,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full model.
 cargo run -- --data-dir ./data --listen 127.0.0.1:8080
 # Two flags, nothing else (croft-stack contract). Dev defaults match the above,
 # so a bare `cargo run` also works. The binary self-manages its layout:
-#   <data-dir>/meter.sqlite   per-DID metering ledger (+ persisted provider seed)
+#   <data-dir>/meter.sqlite   per-DID metering ledger (+ the provider PUBLIC key)
 #   <data-dir>/blocks/        content-addressed blob bytes ({did}/{cid})
 #   <data-dir>/tmp/           write staging (temp→rename), outside blocks/
+# The provider signing seed comes from a unit-supplied secret (systemd credential
+# or CISS_PROVIDER_SEED), never the database. See docs/SECURITY-POSTURE.md §9.
 ```
 
 A metered round-trip over the S3 surface:
@@ -90,6 +92,14 @@ CID=$(printf 'hello' | shasum -a 256 | cut -d' ' -f1)
 curl -X PUT --data-binary 'hello' http://127.0.0.1:8080/id:me/objects/greeting
 curl http://127.0.0.1:8080/id:me/objects/$CID      # -> hello
 curl http://127.0.0.1:8080/id:me/meter             # -> receipt tally
+```
+
+Operator storage usage (a read-only report over the `did_usage` surface — store
+ceiling as a % of the partition, per-DID on-disk + cumulative-transferred bytes):
+
+```sh
+cargo run -- usage --data-dir ./data            # all DIDs
+cargo run -- usage --data-dir ./data --did id:me # one DID
 ```
 
 The same round-trip over the atproto surface (a real CIDv1 comes back):

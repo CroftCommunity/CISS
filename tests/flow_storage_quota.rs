@@ -63,6 +63,44 @@ async fn a_dedup_write_is_allowed_even_when_full() {
     world.shutdown().await;
 }
 
+/// V5 — the quota gates only NEW writes: reads and metering are never refused,
+/// even when the store is effectively full.
+#[tokio::test]
+async fn reads_and_metering_are_not_blocked_by_a_full_store() {
+    let world = World::spawn_with_limits(50, None).await;
+    let owner = world.actor("owner");
+    let did = owner.did().to_owned();
+
+    let cid = owner.put_object(&did, "a", &[b'a'; 40]).await.ok().cid(); // 40/50
+    // A new distinct object is refused (store effectively full)...
+    owner.put_object(&did, "b", &[b'b'; 40]).await.refused(507);
+    // ...but the existing object still reads, and the meter still reads.
+    owner.get_object(&did, &cid).await.returns(&[b'a'; 40]);
+    owner.read_meter(&did).await.ok();
+
+    world.shutdown().await;
+}
+
+/// V5 — with no per-DID cap, DIDs share the store opportunistically: one DID's
+/// fill reduces what the next can store, and a store past the shared ceiling is
+/// refused regardless of which DID it is (opportunistic, not per-DID-fair).
+#[tokio::test]
+async fn dids_share_the_store_opportunistically() {
+    let world = World::spawn_with_limits(100, None).await;
+    let alice = world.actor("alice");
+    let bob = world.actor("bob");
+    let a = alice.did().to_owned();
+    let b = bob.did().to_owned();
+
+    alice.put_object(&a, "x", &[b'a'; 60]).await.ok(); // store: 60/100
+    bob.put_object(&b, "y", &[b'b'; 30]).await.ok(); // store: 90/100
+    // Bob has stored only 30, but the *shared* store is near its ceiling, so his
+    // next distinct object is refused.
+    bob.put_object(&b, "z", &[b'c'; 30]).await.refused(507); // 90 + 30 > 100
+
+    world.shutdown().await;
+}
+
 /// V5 — with no per-DID cap, a single DID fills opportunistically up to the store
 /// ceiling with no per-DID refusal.
 #[tokio::test]

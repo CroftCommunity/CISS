@@ -198,12 +198,24 @@ inside the hardened sandbox (§11).
   `spawn_blocking`, so handler I/O never parks a tokio worker; `/healthz` stays
   responsive under load.
 - **Invariant V3 — bounded concurrency + timeouts.** A global in-flight cap bounds
-  aggregate memory and a request timeout drops stuck requests (findings V4/V5);
+  aggregate memory and a request timeout drops stuck requests (finding V4);
   `/healthz` is exempt so the liveness probe is never starved (ADR 0002).
-- **Known gap:** there is no per-DID storage/row **quota** (finding V5). Burst
-  memory is bounded by the concurrency cap and ledger growth by the E4 rollup, but
-  a slow attacker can still grow disk/rows. This is a *design gap* pending a
-  quota-policy decision.
+- **Invariant V4 — bounded distinct storage (finding V5).** Distinct bytes at rest
+  are bounded by an always-enforced whole-store ceiling (`CISS_MAX_STORE_BYTES`)
+  and, when configured, an optional per-DID cap (`CISS_MAX_DID_BYTES`; absent ⇒
+  DIDs fill opportunistically). A *new* store that would exceed a limit is refused
+  before writing with `507`; a **dedup write consumes no quota** and is always
+  allowed. Per-DID accounting is always tracked (for visibility) even when caps
+  are off. *Audit hook: the global usage is `SUM` of the per-DID counters — if a
+  gate ever admits a write past the ceiling other than by bounded concurrent
+  overshoot, that is a bug.*
+- **Visibility.** Usage is exposed as a stable read surface — the SQLite
+  `did_usage` view (queryable read-only while the service runs) — with `ciss usage
+  [--did <did>]` as the first consumer (store ceiling as % of partition; per-DID
+  on-disk + cumulative-transferred bytes).
+- **Ops backstop (tracked):** a *global disk ceiling* on `/var/lib/ciss`
+  (filesystem quota / disk alert) still complements the app-level store ceiling —
+  an ops item, not app code.
 
 ## 11. Boundary input handling
 
@@ -247,6 +259,7 @@ inside the hardened sandbox (§11).
 | K1–K4 | strict verify, domain sep, full DID, zeroize | `crypto` / `identity` / `manifest` |
 | S1/S2 | private key off-store; pubkey durable | `with_provider_from_secret` |
 | V1–V3 | bounded read/concurrency/timeout; no blocking | `blobstore` / `server::router` / `dispatch_blocking` |
+| V4 | distinct storage bounded by the store ceiling; dedup free | `op_put_object` / `persist::store_usage` |
 | I1–I3 | validated ids, escaped logs, no-leak errors | `identifiers` / handlers / `ServerError` |
 
 ## 14. Standing design gaps (not bugs)
@@ -256,10 +269,13 @@ inside the hardened sandbox (§11).
 2. **atproto identity** — `did:plc`/`did:web` OAuth/DPoP + DID resolution (TTL
    cache, fail-closed, pinned-admin break-glass). Interim is `id:`-only and
    replay-limited.
-3. **Per-DID quota (V5)** — no storage/row ceiling.
+3. **Global disk ceiling (ops backstop)** — the app-level store ceiling (V4) is
+   enforced, but a *box-level* disk quota/alert on `/var/lib/ciss` still
+   complements it. An ops item, not app code. (The per-DID quota gap from V5 is
+   now closed by invariant V4.)
 4. **Provider-key at-rest hardening on the box** — the code sources the key from a
-   secret; the systemd-creds provisioning + Litestream-safe posture is the
-   deployment step that completes S1 end-to-end.
+   secret and the croft-stack unit wires the systemd credential; the one-time
+   on-box `.cred` provisioning is the last step that completes S1 end-to-end.
 
 Each gap is a place where "the code is correct per this document, but this
 document's guarantee is incomplete" — i.e. a design item, tracked in the plan and

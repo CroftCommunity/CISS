@@ -98,6 +98,11 @@ regression wall.
 4. **Billing-integrity lifecycle** — declared rent base must equal the recomputed
    leaf sum (I1); duplicate-leaf inflation refused (I2); a replayed older manifest
    refused (I5). The billing story, as a flow.
+5. **Storage quota** (`tests/flow_storage_quota.rs`, V5) — each quota case as a
+   flow: a new store over the store ceiling → `507`; over a configured per-DID cap
+   → `507` (distinct body); a dedup write allowed even when full; opportunistic
+   fill with no per-DID cap; DIDs share the store opportunistically (multi-actor);
+   reads and metering never blocked by a full store.
 
 ## TDD mandate
 

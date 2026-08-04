@@ -57,7 +57,7 @@ release is built and croft-stack is converged.
 | V1, V2, V4 | **closed** | Phase 2 — size cap, non-regular refusal, `spawn_blocking`, tower limits |
 | V3 | **closed** | Phase 5b — O(1) per-DID ledger totals cache |
 | **I8** | **partial** | Phase 5b zeroizes the in-memory seed; the at-rest relocation off the canonical SQLite (KMS / `0600` file outside the backup set) is a **deployment decision** that rotates the live signing identity — documented, not changed inline. |
-| **V5** | **partial / tracked** | The Phase-2 concurrency cap bounds burst memory, and the E4 statement rollup bounds ledger-row growth, but a **per-DID storage/row quota** is not yet enforced. It needs a quota-policy product decision (what the limit means and its value); tracked as the remaining hardening item. |
+| **V5** | **closed** | A storage quota on distinct bytes at rest: an always-enforced whole-store ceiling + an optional per-DID cap (dedup writes never consume quota), with a `did_usage` read surface + `ciss usage` CLI. See [`plans/2026-08-04-storage-quota-and-usage.md`](plans/2026-08-04-storage-quota-and-usage.md). A *box-level* disk backstop on `/var/lib/ciss` remains an ops item. |
 
 ## The criticals, in one paragraph each
 
