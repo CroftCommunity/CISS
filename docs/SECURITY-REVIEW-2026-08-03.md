@@ -36,6 +36,29 @@ was reproduced against the real server via the `tests/common` harness.
 | I12 | LOW | integrity | Manifest leaves never cross-checked against storage; hostile leaf strings stored and reflected | proven |
 | I13 | LOW | integrity | `Content-Type` reflected unvalidated; `x-croft-pubkey` case-insensitive | proven |
 
+## Remediation status (updated 2026-08-04)
+
+All findings are remediated in the codebase (phases in
+[`plans/2026-08-03-hardening-and-auth.md`](plans/2026-08-03-hardening-and-auth.md)),
+except two that are intentionally partial/deferred with rationale below. **Note:**
+these are code fixes on `main`; the running deployment is unchanged until a new
+release is built and croft-stack is converged.
+
+| Finding | Status | Where |
+|---|---|---|
+| A1, A2 | **closed** | Phase 3 — verified sessions + owner authorization |
+| A3 | **closed** | Phase 1 (identifier validation) + Phase 2 (backend path safety) |
+| I1, I2, I5, I11, I12 | **closed** | Phase 4a — bound signed preimage, Merkle fix, seq, leaf validation |
+| I3, I10 | **closed** | Phase 1 — `parse_did`/`parse_cid` newtypes, escaped logging |
+| I4 | **closed** | Phase 5a — generic 5xx bodies |
+| I6 | **closed** | Phase 4b — weak-key rejection + `verify_strict` |
+| I7 | **closed** | Phase 4c — full 64-hex DID |
+| I9, I13 | **closed** | Phase 5a — blob response headers + media-type validation |
+| V1, V2, V4 | **closed** | Phase 2 — size cap, non-regular refusal, `spawn_blocking`, tower limits |
+| V3 | **closed** | Phase 5b — O(1) per-DID ledger totals cache |
+| **I8** | **partial** | Phase 5b zeroizes the in-memory seed; the at-rest relocation off the canonical SQLite (KMS / `0600` file outside the backup set) is a **deployment decision** that rotates the live signing identity — documented, not changed inline. |
+| **V5** | **partial / tracked** | The Phase-2 concurrency cap bounds burst memory, and the E4 statement rollup bounds ledger-row growth, but a **per-DID storage/row quota** is not yet enforced. It needs a quota-policy product decision (what the limit means and its value); tracked as the remaining hardening item. |
+
 ## The criticals, in one paragraph each
 
 **A1 — no auth on the S3 plane.** `PUT`/`GET /{did}/objects`, `/manifest`, and

@@ -2,9 +2,15 @@
 
 - **Date:** 2026-08-03
 - **Companion docs:** [`../SECURITY-REVIEW-2026-08-03.md`](../SECURITY-REVIEW-2026-08-03.md)
-  (findings), [`../adr/0001-auth-and-access-control-model.md`](../adr/0001-auth-and-access-control-model.md)
+  (findings + remediation status), [`../adr/0001-auth-and-access-control-model.md`](../adr/0001-auth-and-access-control-model.md)
   (auth-model decision), [`../TESTING-STRATEGY.md`](../TESTING-STRATEGY.md)
   (the workflow test tier).
+- **Status (2026-08-04):** Phases 0–5 landed on `main` (TDD-first, one commit per
+  phase). All findings closed except I8 (at-rest seed relocation — deployment
+  decision) and V5 (per-DID quota — quota-policy decision), both documented in the
+  security review. Outstanding feature work: the atproto-identity increment
+  (OAuth/DPoP + DID resolution, see the Phase 3 follow-on below). Code only — no
+  redeploy yet.
 
 ## Problem statement
 
