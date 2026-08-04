@@ -30,6 +30,7 @@ pub mod cidv1;
 pub mod clock;
 pub mod crypto;
 pub mod dial;
+pub mod did_resolver;
 pub mod grace;
 pub mod identifiers;
 pub mod identity;
