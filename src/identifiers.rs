@@ -37,6 +37,25 @@ pub enum IdentifierError {
     /// The identifier did not match an accepted identifier shape.
     #[error("identifier is malformed")]
     Malformed,
+    /// The identifier is well-formed but in the wrong identity space for the
+    /// caller (an `id:` where a `did:*` is required, or vice-versa).
+    #[error("identifier is in the wrong identity space")]
+    WrongSpace,
+}
+
+/// The identity space a [`Did`] belongs to. The two spaces are verified by
+/// **disjoint** mechanisms and must never cross: an `id:` is the SHA-256 of a
+/// presented key (native self-signed session, no resolution), while a `did:*` is
+/// an atproto identity resolved to a signing key. Discriminating them at the type
+/// level stops the atproto plane asserting an internal `id:` and the native-session
+/// plane accepting a resolvable `did:*` (finding A2 residual, ADR 0001
+/// §"Forcing-function findings").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitySpace {
+    /// Croft-native `id:<64 hex>` — the DID is the hash of a presented key.
+    Id,
+    /// atproto `did:<method>:<msid>` — resolved to a signing key.
+    Atproto,
 }
 
 /// A validated request identifier for a tenant: either this codebase's own
@@ -78,6 +97,45 @@ impl Did {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Which identity space this identifier belongs to. A parsed [`Did`] is always
+    /// one of the two accepted shapes, so the `id:` prefix alone decides.
+    #[must_use]
+    pub fn space(&self) -> IdentitySpace {
+        if self.0.starts_with("id:") {
+            IdentitySpace::Id
+        } else {
+            IdentitySpace::Atproto
+        }
+    }
+
+    /// Require this identifier be an atproto `did:*` — the service-auth JWT `iss`
+    /// space. An `id:` is refused: the atproto plane must never assert an internal
+    /// identifier (A2 residual).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentifierError::WrongSpace`] for an `id:` identifier.
+    pub fn require_atproto(&self) -> Result<(), IdentifierError> {
+        match self.space() {
+            IdentitySpace::Atproto => Ok(()),
+            IdentitySpace::Id => Err(IdentifierError::WrongSpace),
+        }
+    }
+
+    /// Require this identifier be a native `id:` — the self-signed session space.
+    /// A `did:*` is refused: the native-session plane must never accept a
+    /// resolvable atproto identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentifierError::WrongSpace`] for a `did:*` identifier.
+    pub fn require_id(&self) -> Result<(), IdentifierError> {
+        match self.space() {
+            IdentitySpace::Id => Ok(()),
+            IdentitySpace::Atproto => Err(IdentifierError::WrongSpace),
+        }
     }
 
     /// Consume the newtype, yielding the owned validated string for the
@@ -166,7 +224,45 @@ fn is_msid_byte(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentAddr, Did, IdentifierError, MAX_DID_LEN};
+    use super::{ContentAddr, Did, IdentifierError, IdentitySpace, MAX_DID_LEN};
+
+    /// A well-formed `id:<64 hex>` for space tests.
+    const ID_DID: &str = "id:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn classifies_the_two_identity_spaces() {
+        assert_eq!(Did::parse(ID_DID).unwrap().space(), IdentitySpace::Id);
+        assert_eq!(
+            Did::parse("did:plc:abc123").unwrap().space(),
+            IdentitySpace::Atproto,
+        );
+        assert_eq!(
+            Did::parse("did:web:example.com").unwrap().space(),
+            IdentitySpace::Atproto,
+        );
+    }
+
+    #[test]
+    fn an_id_cannot_act_as_an_atproto_identity() {
+        // A service-auth JWT `iss` must be a resolvable `did:*`, never an internal
+        // `id:` (A2 residual): the atproto plane cannot assert a native identifier.
+        assert_eq!(
+            Did::parse(ID_DID).unwrap().require_atproto(),
+            Err(IdentifierError::WrongSpace),
+        );
+        assert!(Did::parse("did:plc:abc123").unwrap().require_atproto().is_ok());
+    }
+
+    #[test]
+    fn a_did_cannot_act_as_a_native_session_identity() {
+        // The self-signed `id:` session path must never accept a resolvable
+        // `did:*`: the native-session plane cannot accept an atproto identity.
+        assert_eq!(
+            Did::parse("did:plc:abc123").unwrap().require_id(),
+            Err(IdentifierError::WrongSpace),
+        );
+        assert!(Did::parse(ID_DID).unwrap().require_id().is_ok());
+    }
 
     #[test]
     fn accepts_the_two_legitimate_did_shapes() {
