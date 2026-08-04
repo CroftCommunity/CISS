@@ -27,7 +27,7 @@ mod static_resolver;
 mod testutil;
 mod timeout;
 
-pub use cache::{CachingResolver, Clock, SystemClock};
+pub use cache::{CacheStats, CachingResolver, Clock, SystemClock};
 pub use doc::{signing_key_from_doc, DidDocument};
 pub use fetch::{DidDocFetcher, PlcWebResolver};
 pub use pinned::PinnedResolver;

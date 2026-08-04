@@ -7,6 +7,7 @@
 //! TTL is testable without sleeping.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,12 +38,45 @@ impl Clock for SystemClock {
     }
 }
 
+/// A cheap snapshot of resolver-cache operational condition. `hits`/`misses` are
+/// relaxed atomic counters (no allocation, no extra locking); `size` is the live
+/// entry count. Surfaced for operator visibility (logged on each network resolve;
+/// available to a future metrics/`usage` surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Live cached-entry count.
+    pub size: usize,
+    /// Resolutions served from cache.
+    pub hits: u64,
+    /// Resolutions that went to the inner resolver (cache miss or force-refresh).
+    pub misses: u64,
+}
+
+impl CacheStats {
+    /// Cache hit rate in `[0, 1]`; `0.0` with no activity.
+    #[must_use]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            // Precision loss on huge counts is irrelevant for an operational rate.
+            #[allow(clippy::cast_precision_loss)]
+            {
+                self.hits as f64 / total as f64
+            }
+        }
+    }
+}
+
 /// Wraps `inner` with a TTL cache keyed by DID.
 pub struct CachingResolver<R, C> {
     inner: R,
     clock: C,
     ttl_ms: u64,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 struct CacheEntry {
@@ -59,6 +93,24 @@ impl<R, C> CachingResolver<R, C> {
             clock,
             ttl_ms,
             cache: Mutex::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// A cheap operational snapshot of the resolver cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the cache mutex is poisoned (a prior panic while held) —
+    /// unreachable, as no code panics inside the critical section.
+    #[must_use]
+    pub fn stats(&self) -> CacheStats {
+        let size = self.cache.lock().expect("cache mutex not poisoned").len();
+        CacheStats {
+            size,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -78,11 +130,14 @@ impl<R: DidResolver, C: Clock> DidResolver for CachingResolver<R, C> {
                     .map(|entry| entry.keys.clone())
             };
             if let Some(keys) = hit {
+                self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(keys);
             }
         }
-        // Only a success is cached; a failure is returned as-is (fail closed) and
-        // never pins the DID as unresolvable.
+        // A cache miss (or a deliberate force-refresh): resolve via the inner
+        // resolver. Only a success is cached; a failure is returned as-is (fail
+        // closed) and never pins the DID as unresolvable.
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let keys = self.inner.resolve(did, force_refresh).await?;
         {
             let mut cache = self.cache.lock().expect("cache mutex not poisoned");
@@ -94,6 +149,16 @@ impl<R: DidResolver, C: Clock> DidResolver for CachingResolver<R, C> {
                 },
             );
         }
+        // Cheap operational visibility: a compact cache-condition line on each
+        // network resolve (DEBUG — off in production, no cost beyond the atomics).
+        let stats = self.stats();
+        tracing::debug!(
+            cache_size = stats.size,
+            hits = stats.hits,
+            misses = stats.misses,
+            hit_rate = stats.hit_rate(),
+            "DID resolution cache",
+        );
         Ok(keys)
     }
 }
@@ -122,6 +187,27 @@ mod tests {
     }
 
     const DID: &str = "did:plc:cacheme00000000000000000000";
+
+    #[tokio::test]
+    async fn stats_track_hits_misses_and_size_cheaply() {
+        let inner = FakeResolver::returning("did:key:zX");
+        let resolver = CachingResolver::new(inner, TestClock::at(1_000), 5_000);
+        resolver.resolve("did:plc:a", false).await.expect("fill a"); // miss
+        resolver.resolve("did:plc:a", false).await.expect("hit a"); // hit
+        resolver.resolve("did:plc:b", false).await.expect("fill b"); // miss
+        let s = resolver.stats();
+        assert_eq!(s.hits, 1);
+        assert_eq!(s.misses, 2);
+        assert_eq!(s.size, 2);
+        assert!((s.hit_rate() - 1.0 / 3.0).abs() < 1e-9, "hit_rate = hits/(hits+misses)");
+    }
+
+    #[tokio::test]
+    async fn hit_rate_is_zero_with_no_activity() {
+        let inner = FakeResolver::returning("did:key:zX");
+        let resolver = CachingResolver::new(inner, TestClock::at(1_000), 5_000);
+        assert!(resolver.stats().hit_rate() < f64::EPSILON, "no activity => 0.0");
+    }
 
     #[tokio::test]
     async fn a_second_resolve_within_the_ttl_is_served_from_cache() {
