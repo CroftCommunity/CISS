@@ -62,6 +62,30 @@ pub enum AuthError {
     Unverified,
 }
 
+/// The verification material a DID resolves to: the atproto signing key in
+/// `did:key:` form. This is the boundary type between resolution (`ciss-resolve`,
+/// which produces it from a DID document) and verification (this crate, which
+/// consumes it to check a service-auth JWT signature — Phase 3). It lives here, in
+/// the leaf crate, so `ciss-resolve` depends on `ciss-auth` and not the reverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKeys {
+    signing_key: String,
+}
+
+impl ResolvedKeys {
+    /// Wrap a signing key (an atproto `did:key:` string).
+    #[must_use]
+    pub fn new(signing_key: String) -> Self {
+        Self { signing_key }
+    }
+
+    /// The signing key as a `did:key:` string slice.
+    #[must_use]
+    pub fn signing_key(&self) -> &str {
+        &self.signing_key
+    }
+}
+
 /// Who is making a request, after authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {

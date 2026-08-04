@@ -12,7 +12,7 @@ description = "CISS — Croft Item Storage Server: a PDS-like cooperative metere
 # authentication crate (ADR 0001): it holds the verified-session/`Principal`
 # boundary so authentication can evolve (interim signed session -> atproto
 # OAuth/DPoP) without touching the metering core.
-members = ["crates/ciss-auth"]
+members = ["crates/ciss-auth", "crates/ciss-resolve"]
 resolver = "2"
 
 [dependencies]

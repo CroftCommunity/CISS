@@ -1,0 +1,22 @@
+[package]
+name = "ciss-resolve"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "atproto DID resolution for CISS — did:plc/did:web → signing key, behind a fail-closed, TTL-cached, hard-timeout-bounded DidResolver (ADR 0001 §5)."
+
+# The network/cache/timeout half of CISS auth. Kept out of `ciss-auth` (which
+# stays pure crypto) so the signature-verification surface never grows a TLS
+# stack. This crate resolves a DID to `ciss_auth::ResolvedKeys`; `ciss-auth`
+# consumes that key. See docs/plans/2026-08-04-atproto-identity.md (Phase 2).
+
+[dependencies]
+ciss-auth = { path = "../ciss-auth" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1.53.1", features = ["time", "rt", "macros", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["time", "rt", "macros", "sync", "test-util"] }
