@@ -220,11 +220,13 @@ The `aud` anchor: a service-auth JWT must be *addressed* to CISS.
 
 ## Tracked follow-ons
 
-- **Resolver cache observability (not built).** The `CachingResolver` exposes no
-  metrics — no size gauge, no hit/miss counters, no cache logging — and CISS emits
-  no app-level metrics (telemetry is cgroup-only). Add hit/miss/size/eviction
-  counters surfaced via `ciss usage` (the existing operator read surface) or a
-  metrics line, so the `did:plc` lookup cache is observable in production.
+- **Resolver cache observability (built; always-on surface pending).** The
+  `CachingResolver` now tracks relaxed atomic hits/misses + a `CacheStats` snapshot
+  (size, hits, misses, hit_rate) via `stats()`, and logs a compact cache line at
+  **DEBUG** on each network resolve. Auth decisions log too: grants at DEBUG,
+  denials at INFO. **Remaining:** an *always-on* surface (a periodic INFO heartbeat
+  or wiring `stats()` into `ciss usage`) — DEBUG-only means the metric is visible
+  only when debugging; `stats()` is exposed for that future surface.
 - **Populate `CISS_ADMIN_PINS_FILE`** — empty as deployed (no `did:` break-glass yet).
 
 ## Cross-repo follow-ons (not this increment)
