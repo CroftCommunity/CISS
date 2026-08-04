@@ -168,16 +168,18 @@ Verify a service-auth JWT (Model R). No DPoP (that is M2, a parked follow-up).
   from `rsky-crypto` (Apache-2.0, attributed); a TTL `jti` replay-guard (bounded
   seen-set).
 
-### Phase 3.5 — CISS's `did:web:ciss.croft.ing` service identity
+### Phase 3.5 — CISS's `did:web:ciss.croft.ing` service identity · **DONE 2026-08-04**
 
-The `aud` anchor: a service-auth JWT must be *addressed* to CISS. Small but a
-prerequisite for the flow test to be real.
+The `aud` anchor: a service-auth JWT must be *addressed* to CISS.
 
-- **RED:** `/.well-known/did.json` serves a valid did:web doc naming CISS's service
-  key; a JWT with `aud`==`did:web:ciss.croft.ing` is accepted, `aud`==something else
-  refused.
-- **GREEN:** serve the doc (CISS or the Caddy edge); config the service DID. Coordinate
-  the hosting decision with croft-stack.
+- **CISS serves `/.well-known/did.json`** (an axum route, public, beside `/healthz`)
+  — **not Caddy**, which already reverse-proxies `ciss.croft.ing/*` to CISS, so the
+  path reaches the app with no Caddy change. The doc reflects the configured
+  `service_did` (`CISS_SERVICE_DID`, default `did:web:ciss.croft.ing`) and a
+  `serviceEndpoint`. `SEAM:` publishing the provider key here (external receipt
+  verification via the DID) is a tracked follow-on.
+- Guarded by `ciss_serves_its_own_did_web_document` (200, `id`==service DID,
+  service endpoint). No croft-stack change required for Phase 3.5.
 
 ### Phase 4 — Wire the request path (workflow tier)
 

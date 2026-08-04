@@ -319,6 +319,10 @@ impl App {
             // Liveness/readiness probe: fast, side-effect-free, unlimited — never
             // behind the data plane's timeout or concurrency gate.
             .route("/healthz", get(healthz_handler))
+            // CISS's did:web document — public, so external atproto clients can
+            // resolve `did:web:ciss.croft.ing` and address it as a service-auth
+            // `aud`. Cheap + side-effect-free, so it sits beside `/healthz`.
+            .route("/.well-known/did.json", get(well_known_did_handler))
             .merge(data)
             .fallback(unimplemented_s3)
             .with_state(self.state.clone())
@@ -648,6 +652,34 @@ fn now_unix_s() -> u64 {
 /// `CISS_SERVICE_DID`, else the deployed default.
 fn default_service_did() -> String {
     std::env::var("CISS_SERVICE_DID").unwrap_or_else(|_| "did:web:ciss.croft.ing".to_owned())
+}
+
+/// `GET /.well-known/did.json` — CISS's did:web document, so external atproto
+/// clients can resolve the configured service DID and address it as a service-auth
+/// `aud`. Public, cheap, side-effect-free (sits beside `/healthz`); reflects the
+/// configured `service_did`. `SEAM:` publishing CISS's provider key here (so
+/// receipts are externally verifiable via the DID) is a tracked follow-on.
+async fn well_known_did_handler(State(state): State<AppState>) -> Response {
+    let did = state.service_did.as_ref();
+    let service_endpoint = did
+        .strip_prefix("did:web:")
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_default();
+    let doc = serde_json::json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "service": [{
+            "id": "#ciss_storage",
+            "type": "CissItemStorage",
+            "serviceEndpoint": service_endpoint,
+        }],
+    });
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        doc.to_string(),
+    )
+        .into_response()
 }
 
 /// Owner-gated authorization: the principal must be the verified owner of `did`.
