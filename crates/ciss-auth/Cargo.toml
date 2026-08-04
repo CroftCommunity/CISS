@@ -1,0 +1,12 @@
+[package]
+name = "ciss-auth"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Authentication for CISS: verified-session Principals (ADR 0001). Holds the authentication boundary so the mechanism can evolve (interim signed session -> atproto OAuth/DPoP) without touching the metering core."
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"

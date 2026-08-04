@@ -5,9 +5,18 @@ edition = "2021"
 publish = false
 description = "CISS — Croft Item Storage Server: a PDS-like cooperative metered-storage server in Rust (an S3-compatible + atproto blob boundary over the E0–E9 metering ledger). Ports the item-storage protocol; build plan in the discovery repo (2026-07-31-1-plan-coop-metered-storage-service.md)."
 
-# Standalone crate. Run `cargo test` / `cargo run` from the repo root.
+# Run `cargo test` / `cargo run` from the repo root.
+
+[workspace]
+# The root `ciss` package is the workspace root and a member; `ciss-auth` is the
+# authentication crate (ADR 0001): it holds the verified-session/`Principal`
+# boundary so authentication can evolve (interim signed session -> atproto
+# OAuth/DPoP) without touching the metering core.
+members = ["crates/ciss-auth"]
+resolver = "2"
 
 [dependencies]
+ciss-auth = { path = "crates/ciss-auth" }
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 sha2 = "0.10"
 hex = "0.4"
