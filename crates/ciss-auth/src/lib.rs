@@ -25,8 +25,61 @@
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 
+mod did_key;
+mod replay;
+mod service_jwt;
+
+pub use did_key::AtprotoKey;
+pub use replay::ReplayGuard;
+pub use service_jwt::{verify_service_auth_jwt, ServiceAuthParams, Verified};
+
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
+
+/// Why service-auth JWT verification failed (Phase 3). Every variant means "not
+/// authenticated"; the caller maps them to a 401.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum JwtError {
+    /// The `did:key` was malformed (bad multibase, wrong length, bad point).
+    #[error("did:key is malformed")]
+    BadDidKey,
+    /// The `did:key` uses an unsupported curve (not secp256k1 or P-256).
+    #[error("unsupported key type")]
+    UnsupportedKeyType,
+    /// The signature bytes were not a well-formed fixed-length ECDSA signature.
+    #[error("signature is malformed")]
+    BadSignature,
+    /// The signature was high-S (malleable) — rejected (canonical low-S only).
+    #[error("signature is not canonical (high-S)")]
+    MalleableSignature,
+    /// The signature did not verify under the resolved key.
+    #[error("signature did not verify")]
+    SignatureInvalid,
+    /// The JWT was not three base64url segments.
+    #[error("malformed JWT structure")]
+    BadJwtStructure,
+    /// The JWT header was missing, unparseable, or used a non-ECDSA `alg`.
+    #[error("malformed or unsupported JWT header")]
+    BadHeader,
+    /// The JWT claims were missing or unparseable.
+    #[error("malformed JWT claims")]
+    BadClaims,
+    /// The `iss` claim did not match the DID the key was resolved for.
+    #[error("JWT issuer does not match the resolved DID")]
+    WrongIssuer,
+    /// The `aud` claim did not name this service.
+    #[error("JWT audience is not this service")]
+    WrongAudience,
+    /// The `lxm` claim was missing or did not match the called method.
+    #[error("JWT is not bound to the called method")]
+    WrongMethod,
+    /// The token is expired (`exp` in the past).
+    #[error("JWT is expired")]
+    Expired,
+    /// The token's `jti` was already seen within its validity window (replay).
+    #[error("JWT was replayed")]
+    Replayed,
+}
 
 /// The raw length of an Ed25519 public key.
 const PUBLIC_KEY_LEN: usize = 32;
