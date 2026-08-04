@@ -109,7 +109,9 @@ fn parse_public_key(public_key_hex: &str) -> Result<VerifyingKey, AuthError> {
     let array: [u8; PUBLIC_KEY_LEN] =
         bytes.as_slice().try_into().map_err(|_| AuthError::BadKeyLen)?;
     let key = VerifyingKey::from_bytes(&array).map_err(|_| AuthError::BadKey)?;
-    if key.to_bytes() != array {
+    // Reject a non-canonical encoding (I7) and a small-order / weak key (I6): a
+    // weak session key would verify any challenge.
+    if key.to_bytes() != array || key.is_weak() {
         return Err(AuthError::BadKey);
     }
     Ok(key)

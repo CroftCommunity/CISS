@@ -9,7 +9,7 @@
 //! closes this with the in-corpus `serde_ipld_dagcbor` + `ipld-core` + `sha2`
 //! path). The tamper-evidence property is identical; only the encoding differs.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -107,7 +107,14 @@ pub fn public_key_from_hex(public_key_hex: &str) -> Result<VerifyingKey, CryptoE
         .as_slice()
         .try_into()
         .map_err(|_| CryptoError::InvalidKeyLength { got: bytes.len() })?;
-    VerifyingKey::from_bytes(&array).map_err(|_| CryptoError::InvalidPublicKey)
+    let key = VerifyingKey::from_bytes(&array).map_err(|_| CryptoError::InvalidPublicKey)?;
+    // Reject a non-canonical encoding (two encodings decoding to one point would
+    // otherwise yield two DIDs) and a small-order / weak key (which would verify
+    // *any* signature) — finding I6.
+    if key.to_bytes() != array || key.is_weak() {
+        return Err(CryptoError::InvalidPublicKey);
+    }
+    Ok(key)
 }
 
 /// Verify a hex signature over a UTF-8 message against a pinned public key.
@@ -123,7 +130,9 @@ pub fn verify_message(verifying_key: &VerifyingKey, message: &str, signature_hex
     let Ok(signature) = Signature::from_slice(&signature_bytes) else {
         return false;
     };
-    verifying_key.verify(message.as_bytes(), &signature).is_ok()
+    // Strict verification (I6): rejects malleable signatures and small-order R,
+    // closing the signature-malleability gap the permissive `verify` leaves open.
+    verifying_key.verify_strict(message.as_bytes(), &signature).is_ok()
 }
 
 #[cfg(test)]
@@ -149,6 +158,25 @@ mod tests {
         let kp = derive_keypair("master", "customer");
         let reconstructed = public_key_from_hex(&kp.public_key_hex()).expect("valid hex");
         assert_eq!(reconstructed.to_bytes(), kp.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn small_order_and_non_canonical_keys_are_rejected() {
+        // A small-order public key (the identity element and friends) would verify
+        // any signature — it must be refused at the door (I6).
+        let identity = "0100000000000000000000000000000000000000000000000000000000000000";
+        assert!(
+            matches!(public_key_from_hex(identity), Err(CryptoError::InvalidPublicKey)),
+            "the identity element is a weak key",
+        );
+        let zero = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(public_key_from_hex(zero).is_err(), "zero is a weak key");
+        // A non-canonical y-coordinate encoding decodes to a small-order point.
+        let non_canonical = "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f";
+        assert!(
+            public_key_from_hex(non_canonical).is_err(),
+            "a non-canonical encoding is refused",
+        );
     }
 
     #[test]
