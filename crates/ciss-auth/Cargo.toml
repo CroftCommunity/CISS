@@ -10,3 +10,11 @@ ed25519-dalek = { version = "2", features = ["zeroize"] }
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
+# atproto service-auth JWT verification (Phase 3): ES256K/ES256 over the caller's
+# DID-resolved key, pure-Rust curves (no C toolchain). did:key decode via multibase.
+k256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
+multibase = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
