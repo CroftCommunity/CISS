@@ -376,3 +376,68 @@ async fn did_owner_policy_via_service_auth_jwt() {
 
     world.shutdown().await;
 }
+
+/// Phase 7 corpus: a `did:` **reader** reads a gated blob end-to-end over the
+/// atproto surface (a getBlob service-auth JWT), and a grant on one owner's
+/// namespace never admits the grantee to a *different* owner's gated namespace.
+#[tokio::test]
+async fn did_reader_reads_gated_blob_and_grants_do_not_cross_namespaces() {
+    let world = World::spawn_atproto(&["owner_a", "owner_b", "reader", "stranger"]).await;
+    let owner_a = world.atproto_actor("owner_a");
+    let owner_b = world.atproto_actor("owner_b");
+    let reader = world.atproto_actor("reader");
+    let stranger = world.atproto_actor("stranger");
+    let did_a = owner_a.did().to_owned();
+    let did_b = owner_b.did().to_owned();
+
+    // Each owner uploads a blob and gates its namespace to `reader` only on A.
+    let blob_a = b"owner A's gated blob".to_vec();
+    let blob_b = b"owner B's gated blob".to_vec();
+    owner_a.upload_blob(&blob_a).await.ok();
+    owner_b.upload_blob(&blob_b).await.ok();
+    let cidv1_a = ciss::cidv1::blob_cid_string(&blob_a);
+    let cidv1_b = ciss::cidv1::blob_cid_string(&blob_b);
+
+    let grant_reader = serde_json::json!({
+        "read_class": "grantees",
+        "readers": [reader.did()],
+        "seq": 1,
+    })
+    .to_string();
+    // A gates to reader; B gates to nobody (owner-only).
+    owner_a
+        .put_policy_with_token(&did_a, &owner_a.valid_set_policy_token("jti-a"), &grant_reader)
+        .await
+        .ok();
+    let owner_only = serde_json::json!({ "read_class": "owner", "readers": [], "seq": 1 }).to_string();
+    owner_b
+        .put_policy_with_token(&did_b, &owner_b.valid_set_policy_token("jti-b"), &owner_only)
+        .await
+        .ok();
+
+    // The did: reader reads A's blob via a getBlob JWT (end-to-end Phase 6 auth).
+    reader
+        .get_blob_with_token(&did_a, &cidv1_a, &reader.valid_getblob_token("jti-read-a"))
+        .await
+        .returns(&blob_a);
+
+    // A stranger did: with a valid getBlob JWT is still denied (404, not the bytes).
+    stranger
+        .get_blob_with_token(&did_a, &cidv1_a, &stranger.valid_getblob_token("jti-stranger"))
+        .await
+        .refused(404);
+
+    // Cross-namespace: reader is granted on A, but B's gate does not admit it.
+    reader
+        .get_blob_with_token(&did_b, &cidv1_b, &reader.valid_getblob_token("jti-read-b"))
+        .await
+        .refused(404);
+
+    // Even owner_a cannot read owner_b's owner-only blob (grants are per-namespace).
+    owner_a
+        .get_blob_with_token(&did_b, &cidv1_b, &owner_a.valid_getblob_token("jti-a-reads-b"))
+        .await
+        .refused(404);
+
+    world.shutdown().await;
+}

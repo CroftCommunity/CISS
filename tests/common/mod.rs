@@ -469,6 +469,37 @@ impl AtprotoActor {
         self.sign_token(&self.key.did, SERVICE_DID, SET_POLICY_LXM, now_s() + 300, jti)
     }
 
+    /// A valid getBlob read token: `iss`=self, `aud`=service, `lxm`=getBlob.
+    pub fn valid_getblob_token(&self, jti: &str) -> String {
+        self.sign_token(
+            &self.key.did,
+            SERVICE_DID,
+            "com.atproto.sync.getBlob",
+            now_s() + 300,
+            jti,
+        )
+    }
+
+    /// `getBlob` from `owner_did`'s repo, presenting `token` as the bearer — a
+    /// `did:` reader authenticating to read a (possibly gated) blob.
+    pub async fn get_blob_with_token(
+        &self,
+        owner_did: &str,
+        cidv1: &str,
+        token: &str,
+    ) -> Outcome {
+        let url = format!(
+            "{}/xrpc/com.atproto.sync.getBlob?did={owner_did}&cid={cidv1}",
+            self.base
+        );
+        Actor::run(
+            self.client
+                .get(url)
+                .header("authorization", format!("Bearer {token}")),
+        )
+        .await
+    }
+
     /// `PUT /{target_did}/policy` presenting `token` as the bearer and a
     /// [`ciss::policy::PolicyIntent`] JSON body (Model C).
     pub async fn put_policy_with_token(
