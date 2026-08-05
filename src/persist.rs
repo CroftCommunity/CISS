@@ -371,6 +371,39 @@ impl Store {
         Ok(ResolvedPolicy::world())
     }
 
+    /// Resolve **only** a per-object policy for `(did, cid)`, returning `None` when
+    /// the object has no policy of its own (so the caller can fall back to a
+    /// namespace policy it resolved once). An unparseable object row fails closed
+    /// to [`ResolvedPolicy::deny`]. This is the batch primitive for `listBlobs`:
+    /// resolve the namespace once, then one object lookup per cid.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn resolve_object_policy(
+        &self,
+        did: &str,
+        cid: &str,
+    ) -> Result<Option<ResolvedPolicy>, PersistError> {
+        Ok(self
+            .policy_json("object_policy", did, Some(cid))?
+            .map(|json| resolved_from_json(&json)))
+    }
+
+    /// Whether `did` has any per-object policy rows at all — a single `EXISTS`
+    /// query that lets `listBlobs` skip per-cid checks entirely for the common
+    /// fully-ungated DID.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn has_object_policies(&self, did: &str) -> Result<bool, PersistError> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object_policy WHERE did = ?1)",
+            [did],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     /// Fetch a policy row's stored JSON for a target, if present. `table` is a
     /// fixed internal literal (`namespace_policy` / `object_policy`), never
     /// caller-supplied, so its interpolation carries no injection surface.

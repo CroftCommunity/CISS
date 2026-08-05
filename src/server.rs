@@ -19,6 +19,7 @@
 //! per-DID compute-observability wrapper (`ROADMAP_TODO` E83) can scope a heavy
 //! op into a per-DID cgroup without a rewrite.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -804,7 +805,7 @@ pub(crate) fn dispatch(
         } => op_put_manifest(state, &did, &pubkey_hex, &body),
         Op::GetManifest { did } => op_get_manifest(state, &did),
         Op::GetMeter { did } => op_get_meter(state, &did),
-        Op::ListBlobs { did } => op_list_blobs(state, &did),
+        Op::ListBlobs { did } => op_list_blobs(state, principal, &did),
     }
 }
 
@@ -1065,17 +1066,52 @@ fn op_get_meter(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
 /// The distinct content addresses a DID has uploaded, in first-upload order.
 /// The ledger's upload receipts are the source of truth for "which blobs this
 /// DID stored" — no backend enumeration primitive is required.
-fn op_list_blobs(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
-    let receipts = lock_store(&state.store).load_receipts(did)?;
-    let mut cids: Vec<String> = Vec::new();
+fn op_list_blobs(
+    state: &AppState,
+    principal: &Principal,
+    did: &str,
+) -> Result<OpOutcome, ServerError> {
+    let store = lock_store(&state.store);
+    let receipts = store.load_receipts(did)?;
+
+    // The distinct uploaded cids, in first-upload order (the ledger is the source
+    // of truth for "which blobs this DID stored").
+    let mut distinct: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
     for receipt in &receipts {
         if receipt.core().direction == Direction::Upload {
-            let cid = receipt.core().cid.clone();
-            if !cids.contains(&cid) {
-                cids.push(cid);
+            let cid = &receipt.core().cid;
+            if seen.insert(cid.clone()) {
+                distinct.push(cid.clone());
             }
         }
     }
+
+    // Fast path: a fully-ungated DID (no namespace policy, no object policy) needs
+    // no per-cid checks — every uploaded cid is world-readable (PDS-compat).
+    let namespace = store.resolve_policy(did, None)?;
+    if namespace.read_class() == ReadClass::World && !store.has_object_policies(did)? {
+        return Ok(OpOutcome::BlobList { cids: distinct });
+    }
+
+    // Gated DID: resolve the namespace once, then one object lookup per cid, and
+    // keep only the cids this caller may read. A hidden cid is neither listed nor
+    // counted — omission, not a 403, so `listBlobs` is not an enumeration oracle.
+    let caller = principal.did();
+    let mut cids: Vec<String> = Vec::new();
+    let mut hidden = 0usize;
+    for cid in distinct {
+        let resolved = match store.resolve_object_policy(did, &cid)? {
+            Some(object) => object,
+            None => namespace.clone(),
+        };
+        if resolved.allows(caller, did) {
+            cids.push(cid);
+        } else {
+            hidden += 1;
+        }
+    }
+    tracing::debug!(%did, shown = cids.len(), hidden, "listBlobs filtered");
     Ok(OpOutcome::BlobList { cids })
 }
 
@@ -1648,6 +1684,100 @@ mod tests {
                 ),
                 "a stranger denied",
             );
+        }
+
+        fn list(app: &App, p: &Principal, did: &str) -> Vec<String> {
+            match dispatch(
+                &app.state,
+                p,
+                Op::ListBlobs {
+                    did: did.to_owned(),
+                },
+            )
+            .expect("listBlobs")
+            {
+                OpOutcome::BlobList { cids } => cids,
+                _ => panic!("expected a BlobList outcome"),
+            }
+        }
+
+        #[test]
+        fn list_blobs_omits_a_hidden_object_cid() {
+            // A per-object gate on one blob under an (ungated) world namespace: the
+            // hidden cid is neither listed nor counted for a non-grantee, while the
+            // public cid stays visible to everyone.
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let alice = "did:plc:alice".to_owned();
+
+            let public = upload(&app, &owner, &did, b"public blob");
+            let secret = upload(&app, &owner, &did, b"secret blob");
+            let policy = PolicyRecord::sign_owner(
+                &did,
+                Some(&secret),
+                ReadClass::Grantees,
+                std::slice::from_ref(&alice),
+                1,
+                &owner_kp,
+            );
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed object policy");
+
+            assert_eq!(
+                list(&app, &Principal::Anonymous, &did),
+                vec![public.clone()],
+                "anon sees only the public cid; the hidden cid is neither listed nor counted",
+            );
+            assert_eq!(
+                list(&app, &Principal::Authenticated("did:plc:bob".to_owned()), &did),
+                vec![public.clone()],
+                "a non-grantee sees only the public cid",
+            );
+
+            let grantee = list(&app, &Principal::Authenticated(alice), &did);
+            assert_eq!(grantee.len(), 2, "the grantee sees public + granted");
+            assert!(grantee.contains(&public) && grantee.contains(&secret));
+
+            assert_eq!(list(&app, &owner, &did).len(), 2, "the owner sees all");
+        }
+
+        #[test]
+        fn namespace_gate_hides_every_cid_from_anon() {
+            // A namespace-wide grantees policy: an anon caller sees an empty listing
+            // (no world cids), while the owner still sees all uploads.
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let alice = "did:plc:alice".to_owned();
+
+            upload(&app, &owner, &did, b"one");
+            upload(&app, &owner, &did, b"two");
+            let policy = PolicyRecord::sign_owner(
+                &did,
+                None,
+                ReadClass::Grantees,
+                std::slice::from_ref(&alice),
+                1,
+                &owner_kp,
+            );
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed namespace policy");
+
+            assert!(
+                list(&app, &Principal::Anonymous, &did).is_empty(),
+                "anon sees nothing under a namespace gate",
+            );
+            assert_eq!(
+                list(&app, &Principal::Authenticated(alice), &did).len(),
+                2,
+                "the grantee sees both",
+            );
+            assert_eq!(list(&app, &owner, &did).len(), 2, "the owner sees all");
         }
     }
 }
