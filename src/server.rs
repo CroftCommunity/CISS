@@ -43,6 +43,7 @@ use crate::identifiers::{ContentAddr, Did};
 use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
+use crate::policy::ReadClass;
 use crate::pricing::postage_cents;
 use crate::receipts::{
     make_unilateral_receipt, select_mode, Direction, Receipt, ReceiptCore, ReceiptMode,
@@ -738,6 +739,45 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
     }
 }
 
+/// Gate a read op by its target's resolved read policy (gated reads, ADR 0001
+/// §2). Runs after the base [`authorize`] in [`dispatch`], where the `Store` is
+/// reachable (the pure `authorize` cannot resolve policy). A denied read maps to
+/// [`ServerError::NotFound`] — a 404 indistinguishable from "no such object", so a
+/// gated object is never an existence oracle. The `world` default (and any object
+/// with no policy row, which resolves to `world`) is allowed on the fast path
+/// without a log line; only non-`world` decisions are traced.
+///
+/// Reads are **membership-only**: the policy signature was verified once at write
+/// time (Phases 5/6) before the row was stored, and the row is CISS's own SQLite,
+/// so there is no per-read signature check on the hot path. A stored row that
+/// fails to parse resolves fail-closed (owner-only) inside `resolve_policy`.
+///
+/// Only `GetObject` is gated here; `ListBlobs` filters per-cid in its own handler
+/// (Phase 4). Non-read ops return `Ok(())` unchanged.
+fn authorize_read(state: &AppState, principal: &Principal, op: &Op) -> Result<(), ServerError> {
+    let Op::GetObject { did, cid } = op else {
+        return Ok(());
+    };
+    let resolved = lock_store(&state.store).resolve_policy(did, Some(cid))?;
+    if resolved.read_class() == ReadClass::World {
+        return Ok(());
+    }
+    let caller = principal.did();
+    if resolved.allows(caller, did) {
+        tracing::debug!(
+            resource = %did, %cid, read_class = ?resolved.read_class(),
+            "gated-read granted"
+        );
+        Ok(())
+    } else {
+        tracing::info!(
+            resource = %did, %cid, actor = ?caller, reason = "not a grantee",
+            "gated-read denied"
+        );
+        Err(ServerError::NotFound)
+    }
+}
+
 /// The single dispatch boundary. Every handler routes through here so the E83
 /// per-DID scope wrapper has one attach point, and so authorization has a single
 /// choke point (ADR 0001).
@@ -747,6 +787,7 @@ pub(crate) fn dispatch(
     op: Op,
 ) -> Result<OpOutcome, ServerError> {
     authorize(principal, &op)?;
+    authorize_read(state, principal, &op)?;
     // SEAM (E83): a heavy op would enter a per-DID cgroup scope here; v0 ops are
     // all cheap, so dispatch runs in-process. The classification is live so the
     // wrapper slots in without a handler rewrite.
@@ -1469,5 +1510,144 @@ mod tests {
             !inherit_fd_requested(Some("2"), Some("4242"), pid),
             "more than one fd is not the v0 single-socket case",
         );
+    }
+
+    // --- Gated reads (Phase 3): the dispatch-level authorization choke point.
+    // These exercise the real `dispatch` gate (dispatch → resolve_policy → allows
+    // → op_get_object | NotFound) with a policy seeded directly into the store
+    // (the HTTP set-policy route lands in Phase 5). ---
+
+    mod gated_reads {
+        use super::super::{dispatch, lock_store, App, Blobs, Db, Op, OpOutcome, ServerError};
+        use crate::crypto::derive_keypair;
+        use crate::identity::derive_id;
+        use crate::policy::{PolicyRecord, ReadClass};
+        use ciss_auth::Principal;
+
+        fn upload(app: &App, owner: &Principal, did: &str, bytes: &[u8]) -> String {
+            match dispatch(
+                &app.state,
+                owner,
+                Op::PutObject {
+                    did: did.to_owned(),
+                    key: "k".to_owned(),
+                    bytes: bytes.to_vec(),
+                },
+            )
+            .expect("owner uploads a blob")
+            {
+                OpOutcome::Stored { cid, .. } => cid,
+                _ => panic!("expected a Stored outcome from PutObject"),
+            }
+        }
+
+        #[test]
+        fn public_read_is_unbroken_without_a_policy() {
+            // Regression guard: with no policy row, a read stays world-readable
+            // (PDS-compat) — the gate must never over-reach.
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let cid = upload(&app, &owner, &did, b"public bytes");
+
+            let out = dispatch(
+                &app.state,
+                &Principal::Anonymous,
+                Op::GetObject {
+                    did: did.clone(),
+                    cid,
+                },
+            );
+            assert!(out.is_ok(), "anon reads a public (ungated) object");
+        }
+
+        #[test]
+        fn gated_object_denies_non_grantee_with_notfound() {
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let alice = "did:plc:alice".to_owned();
+            let cid = upload(&app, &owner, &did, b"secret bytes");
+
+            // The owner gates the whole namespace to grantees:[alice].
+            let policy = PolicyRecord::sign_owner(
+                &did,
+                None,
+                ReadClass::Grantees,
+                std::slice::from_ref(&alice),
+                1,
+                &owner_kp,
+            );
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed policy");
+
+            let get = |p: &Principal| {
+                dispatch(
+                    &app.state,
+                    p,
+                    Op::GetObject {
+                        did: did.clone(),
+                        cid: cid.clone(),
+                    },
+                )
+            };
+
+            // A denied read is a 404 (oracle-free), never the bytes.
+            assert!(
+                matches!(get(&Principal::Anonymous), Err(ServerError::NotFound)),
+                "anon is denied with 404, not the bytes",
+            );
+            assert!(
+                matches!(
+                    get(&Principal::Authenticated("did:plc:bob".to_owned())),
+                    Err(ServerError::NotFound)
+                ),
+                "a non-grantee is denied with 404",
+            );
+            // The grantee and the owner read.
+            assert!(get(&Principal::Authenticated(alice)).is_ok(), "the grantee reads");
+            assert!(get(&owner).is_ok(), "the owner reads its own gated object");
+        }
+
+        #[test]
+        fn owner_only_policy_admits_only_the_owner() {
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let cid = upload(&app, &owner, &did, b"owner-only bytes");
+
+            let policy =
+                PolicyRecord::sign_owner(&did, None, ReadClass::Owner, &[], 1, &owner_kp);
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed policy");
+
+            let get = |p: &Principal| {
+                dispatch(
+                    &app.state,
+                    p,
+                    Op::GetObject {
+                        did: did.clone(),
+                        cid: cid.clone(),
+                    },
+                )
+            };
+            assert!(get(&owner).is_ok(), "owner reads");
+            assert!(
+                matches!(get(&Principal::Anonymous), Err(ServerError::NotFound)),
+                "anon denied",
+            );
+            assert!(
+                matches!(
+                    get(&Principal::Authenticated("did:plc:alice".to_owned())),
+                    Err(ServerError::NotFound)
+                ),
+                "a stranger denied",
+            );
+        }
     }
 }
