@@ -170,9 +170,11 @@ A record is verified (`verify_policy`) before it is stored; a forged/wrong-signe
 wrong-target/malformed record is refused and access is unchanged.
 
 **Invariant Z7 — anti-rollback.** A policy write applies only if its `seq`
-strictly exceeds the stored policy's `seq` for that target — enforced both at
-verify time (distinct `409`) and in-transaction at `save_policy`. A replayed lower
-`seq` cannot un-revoke a grant.
+strictly exceeds the stored policy's `seq` for that target — enforced by an
+explicit pre-write seq check in `op_put_policy` (a stale/equal `seq` returns a
+distinct `409` before the signature is checked) and again **in-transaction** at
+`Store::save_policy` (a conditional upsert, defence against a racing lower-seq
+write). A replayed lower `seq` cannot un-revoke a grant.
 
 **Invariant Z8 — the attestation key is separate from the billing key.** Model C
 attestations are signed with a **dedicated** `policy-attest` key
@@ -324,7 +326,7 @@ inside the hardened sandbox (§11).
 | Z5 | oracle-free denial (404 + `listBlobs` omission) | `authorize_read` (→ `NotFound`) / `op_list_blobs` |
 | Z6 | owner-authorized policy record (Model A / C) | `policy::verify_policy` / `op_put_policy` |
 | Z7 | policy anti-rollback (monotonic seq) | `op_put_policy` / `Store::save_policy` |
-| Z8 | attestation key ≠ billing key | `Provider::attest_keypair` (`policy-attest`) |
+| Z8 | attestation key ≠ billing key | `Provider` `derive_keypair(seed,"policy-attest")` / `attest_verifying_key()` |
 | C1 | server names content by hash | `op_put_object` |
 | C2 | tamper-at-rest caught on read | `op_get_object` |
 | B1 | manifest binds total_bytes + root | `Manifest::verify` / `signing_preimage` |

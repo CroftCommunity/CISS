@@ -202,6 +202,16 @@ Fail-closed on writes while public reads keep serving is the intended posture.
 
 ## Downstream option — per-object read ACLs (the private-"PDS" read case)
 
+> **BUILT 2026-08-05 (v0.4.0) — this downstream option shipped as "gated reads."**
+> The sketch below is preserved as the origin of the idea, but the design is no
+> longer open: it was built with namespace + per-object grain **composed**
+> (finest-grain-wins), oracle-free `404`, `listBlobs` omission, and a monotonic
+> anti-rollback `seq`, in two owner-authorization forms (`id:` self-signed / `did:`
+> service-auth JWT + provider attestation). The `getBlob` sketch at line 213 is
+> essentially what runs. Authoritative now: `docs/spec/gated-reads.md`, ADR 0001 §2
+> (amended), and `SECURITY-POSTURE.md` Z4–Z8. Read "Tracked, not designed" below as
+> "designed and built."
+
 Verified DIDs make read-gating cheap: the hard part is proving "you are `did:X`"
 (this increment); authorization is then a lookup. So an object can be stored with
 an **allowed-reader DID list**, and a read requires a service-auth JWT proving a

@@ -58,8 +58,10 @@ they meter identically.
 0. **Authorize the read (gated reads).** `dispatch` resolves the target's read
    policy and checks membership: `world` (the default) allows anyone; a gated
    target admits only the owner or a listed grantee, and a denied read is a **404**
-   (oracle-free), never the bytes. Reads authenticate the caller (an `id:` session
-   or a `did:` service-auth JWT) so a grantee is recognized. See
+   (oracle-free), never the bytes. Reads authenticate the caller so a grantee is
+   recognized: the atproto `getBlob` accepts an `id:` session **or** a `did:`
+   service-auth JWT (bound to the read method); the S3 `GET /{did}/objects/{cid}`
+   authenticates an `id:` session only (a `did:` grantee reads via `getBlob`). See
    `SECURITY-POSTURE.md` §5 (Z4–Z8) and `docs/spec/gated-reads.md`.
 1. `blobs.get(did, cid)` returns the raw stored bytes (unverified — dumb backend).
 2. Layer 2 **re-fingerprints** them: if `sha256(stored) != cid`, that is

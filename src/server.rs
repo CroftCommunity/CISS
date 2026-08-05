@@ -1368,7 +1368,9 @@ async fn get_object_handler(
     let addr = ContentAddr::parse(&addr)?;
     // Authenticate the reader (an `id:` session) so a grantee is recognized by the
     // gated-read gate; an unauthenticated read is anonymous and sees only world
-    // objects. (`did:`-reader JWT auth for reads lands in Phase 6.)
+    // objects. This S3-plane path is `id:`-session only by design; a `did:` grantee
+    // reads a gated blob via the atproto `getBlob` surface (which also accepts a
+    // service-auth JWT — see `pds_api::get_blob`).
     let principal = authenticate(&headers);
     tracing::info!(method = "GET", did = %did, cid = %addr, "object boundary");
     dispatch_blocking(

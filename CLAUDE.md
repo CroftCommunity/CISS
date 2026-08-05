@@ -31,6 +31,7 @@ without first reading the posture doc and locating the relevant invariant.
 | `docs/SECURITY-POSTURE.md` | **design intent + invariants** — read first |
 | `docs/SECURITY-REVIEW-2026-08-03.md` | audit findings + remediation status |
 | `docs/adr/0001-auth-and-access-control-model.md` | auth/authz model decision (amended) |
+| `docs/spec/gated-reads.md` | **gated reads (read-authz) integrator contract** — invariants Z4–Z8, shipped v0.4.0 |
 | `docs/notes/atproto-integration-model.md` | **atproto identity design** (Model R: service-auth JWT + DID resolution) |
 | `docs/adr/0002-healthz-exposure-and-limit-exemption.md` | healthz edge-gating |
 | `docs/plans/2026-08-03-hardening-and-auth.md` | phased remediation plan + follow-ons |

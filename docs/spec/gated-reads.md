@@ -1,13 +1,13 @@
 # CISS gated reads — integrator specification (v1, built)
 
-**Status: LIVE — v1 built (8-phase TDD increment, 2026-08-05).** All three design
-questions are resolved (Q1 read model, Q2 dedicated policy record, Q3 range grain
-deferred) and the model is shipped. Sections marked **[LIVE]**/**[SETTLED]** are
-built and covered by tests; **[PLANNED]** marks a tracked future extension (out of
-v1 — do not rely on). This document is the **contract for integrators**; the
-build/TDD plan is `docs/plans/2026-08-05-gated-reads-authorization.md`, the
-enforcement invariants are in `docs/SECURITY-POSTURE.md`, and the decision is
-ADR 0001 §2.
+**Status: LIVE — v1 built (8-phase TDD increment, 2026-08-05), released in
+`ciss` v0.4.0.** All three design questions are resolved (Q1 read model, Q2
+dedicated policy record, Q3 range grain deferred) and the model is shipped.
+Sections marked **[LIVE]** are built and covered by tests — build against them;
+**[PLANNED]** marks a tracked future extension (out of v1 — do not rely on). This
+document is the **contract for integrators**; the build/TDD plan is
+`docs/plans/2026-08-05-gated-reads-authorization.md`, the enforcement invariants
+are `docs/SECURITY-POSTURE.md` Z4–Z8, and the decision is ADR 0001 §2.
 
 ---
 
@@ -43,12 +43,13 @@ to `subscribeRepos`/relays). **[PLANNED — no such surface exists yet.]**
 | Term | Meaning |
 |---|---|
 | **Identity** | a verified DID. Either `id:<64hex>` (CISS-native, key-hash session) or `did:plc`/`did:web` (atproto, service-auth JWT). See `SECURITY-POSTURE.md` §4. |
-| **Namespace** | a DID's repo / data-structure — the default grain for policy (`target = <did>`). |
-| **Object** | one content-addressed blob within a namespace (`target = <did>/<cid>`). Finest grain for policy. |
-| **Policy** | an **owner-signed record** stating who may read a namespace or object. |
-| **Owner** | the DID that owns the namespace (`derive_id(signing key) == did`). Always allowed to read its own resources. |
+| **Namespace** | a DID's repo / data-structure — the default grain for policy. On the wire the record's `cid` is `null`. |
+| **Object** | one content-addressed blob within a namespace (the record's `cid` is the blob's content address). Finest grain for policy. |
+| **Policy** | an **owner-authorized record** stating who may read a namespace or object — owner-signed for `id:` owners, provider-attested for `did:` owners (§4.1). |
+| **Owner** | the DID that owns the namespace. For an `id:` owner, `derive_id(signing key) == did`; a `did:` owner is the JWT `iss`. Always allowed to read its own resources. |
+| **Target** | conceptual shorthand for what a policy governs — a namespace or an object. It is not a wire field; the record carries `did` + `cid` (§4). |
 
-## 3. The read-authorization model  **[SETTLED — Q1]**
+## 3. The read-authorization model  **[LIVE]**
 
 A read is authorized by resolving the applicable policy, finest grain first:
 
@@ -76,16 +77,19 @@ archetypes):
   nested-group grants are a **[PLANNED]** extension (see §8); they are expected to
   be needed for large/churning grantee sets (e.g. history-convergence) but are not
   specified until that surface is concrete.
-- **Writes are unchanged** — owner-only (`SECURITY-POSTURE.md` Z2). `write_class`
-  is reserved in the record but v1 enforces owner-only writes; delegated writes are
-  **[PLANNED]**, not v1.
+- **Writes are unchanged** — owner-only (`SECURITY-POSTURE.md` Z2), enforced
+  independently of the read policy. The v1 record governs **reads only** (it has no
+  `write_class` field); delegated writes are a **[PLANNED]** extension, not v1.
 
-## 4. The signed policy record  **[SETTLED]**
+## 4. The policy record  **[LIVE]**
 
-Policy is a **dedicated, self-authorizing record** — its own signed artifact,
-**separate from the customer manifest**. CISS trusts it because it is signed by the
-key that derives the target's owning DID (the same trust model as the manifest,
-invariant Z3) — not because of who was logged in when it was submitted.
+Policy is a **dedicated, owner-authorized record** — its own signed artifact,
+**separate from the customer manifest**. CISS trusts it because it carries a
+verifiable signature tied to the owner (the owner's own ed25519 signature for an
+`id:` owner; CISS's provider attestation, made only after verifying the owner's
+service-auth JWT, for a `did:` owner — §4.1), the same durable-artifact trust
+model as the manifest (invariant Z3) — not because of who was logged in when it
+was submitted.
 
 **Why a dedicated record, not a field on the manifest (Q2).** The manifest's
 signature is load-bearing for **billing** integrity — the B-tier invariants rest
@@ -98,35 +102,64 @@ a grant/revoke **never re-signs or touches the manifest** (no billing side-effec
 and per-object policy is first-class (a whole-namespace manifest cannot carry
 per-object ACLs without bloat).
 
-Fields (canonical form TBD in Phase 1; illustrative):
+**The serialized record (the shipped wire form).** A `PolicyRecord` has exactly
+these fields (`deny_unknown_fields` — no extra keys, and `cid` is present as
+`null` for a namespace policy). The `authorization` is an **externally-tagged**
+object naming the form (§4.1). A Model-A (`id:` owner) namespace grant:
 
 ```json
 {
-  "target":     "did:plc:alice",              // a namespace; or "did:plc:alice/<cid>" for an object
-  "read_class": "grantees",                    // world | grantees | owner
-  "readers":    ["did:plc:bob", "did:web:carol.example"],   // DIDs; only for grantees
-  "seq":        7,                             // monotonic per target (anti-rollback)
-  "signer":     "<owner pubkey hex>",
-  "sig":        "<signature over the canonical preimage>"
+  "did":        "id:8a1f…<64 hex>",            // the owning DID; id: for OwnerSigned
+  "cid":        null,                           // null = namespace; else the object's 64-hex content address
+  "read_class": "grantees",                     // "world" | "grantees" | "owner"
+  "readers":    ["did:plc:bob", "did:web:carol.example"],   // DIDs; empty for world/owner
+  "seq":        7,                              // monotonic per target (anti-rollback)
+  "authorization": {
+    "OwnerSigned": { "signer": "<owner ed25519 pubkey hex>", "sig": "<hex sig over the preimage>" }
+  }
 }
 ```
 
+A Model-C (`did:` owner) record is identical except `did` is a `did:*` and the
+authorization is `{"ProviderAttested": {"owner_did", "authorizing_jti",
+"provider_sig"}}` — but an integrator **never builds this**: it submits a
+`PolicyIntent` + JWT and CISS constructs and attests the record (§6, §4.1).
+
+**The signing preimage (Model A — reproduce it exactly to sign).** The `sig` is an
+ed25519 signature over this UTF-8 string:
+
+```
+ciss/v1/policy:<target_tag>:<seq>:<read_class>:<len>:<readers_sorted_joined>
+```
+
+- `<target_tag>` = `ns:<did>` for a namespace, or `obj:<did>:<cid>` for an object
+  (binding the cid, so an object policy's signature cannot be lifted to another object).
+- `<read_class>` = the literal `world`/`grantees`/`owner`.
+- `<len>` = the number of readers; `<readers_sorted_joined>` = the `readers`
+  entries **sorted ascending**, joined by `,` (empty string when none).
+
+Example (namespace, `id:alice…`, grantees `[did:plc:bob, did:web:carol.example]`, seq 7):
+`ciss/v1/policy:ns:id:alice…:7:grantees:2:did:plc:bob,did:web:carol.example`
+
+(CISS's provider attestation signs a parallel `ciss/v1/policy-attest:<owner_did>:…`
+preimage with its dedicated attestation key — internal; integrators don't build it.)
+
 **Verification (what CISS checks before honoring a policy):**
 
-1. `signer` derives the target's owning DID (`derive_id(signer) == <did>`).
-2. `sig` verifies over a canonical, versioned preimage
-   (shape: `ciss/v1/policy:<target>:<seq>:<read_class>:<readers…>`, mirroring the
-   manifest preimage) under `signer`.
-3. `seq` is strictly greater than the stored `seq` for that target (a replayed or
-   older policy is refused — no silent rollback of a revocation).
-4. every `readers[]` entry is a well-formed DID.
+1. **Structure** — `did`/`cid` are well-formed; `readers[]` are well-formed DIDs,
+   deduplicated, within the cap; a `world`/`owner` policy carries no readers.
+2. **Authority** — for `OwnerSigned`: the target `did` is an `id:` DID,
+   `derive_id(signer) == did`, and `sig` verifies over the preimage under `signer`.
+   For `ProviderAttested`: `provider_sig` verifies over the attestation preimage
+   under CISS's dedicated `policy-attest` key, and `owner_did == did`.
+3. **Anti-rollback** — `seq` strictly exceeds the stored `seq` for that target (a
+   replayed/older policy is refused — no silent un-revoke).
 
 A record failing any check is **refused and does not change access** (fail-closed).
-
 Because it is a dedicated record, a policy is submitted on its own endpoint (§6),
 independently of the manifest, and carries its own `seq` lifecycle.
 
-### 4.1 Who may set policy — two authorization forms  **[SETTLED]**
+### 4.1 Who may set policy — two authorization forms  **[LIVE]**
 
 The owner authorizes a policy in one of two ways, depending on whether they hold a
 signing key locally. Both produce a record CISS can durably verify on later reads;
@@ -154,7 +187,7 @@ the short `exp` + a single-use `jti`, exactly as `uploadBlob` already works; the
 provider counter-sign is what makes the *result* durable. Model A binds the content
 cryptographically and forever; Model C is no weaker than the existing upload path.
 
-## 5. Denial semantics — the leakage rules  **[SETTLED]**
+## 5. Denial semantics — the leakage rules  **[LIVE]**
 
 A gate that reveals what it hides is not a gate. So:
 
@@ -169,7 +202,7 @@ A gate that reveals what it hides is not a gate. So:
 Integrators: a `404` from a CISS read is **not** proof of non-existence, and a
 `listBlobs` result is a caller-scoped view, not a census.
 
-## 6. Wire API  **[LIVE — built]**
+## 6. Wire API  **[LIVE]**
 
 Policy is written to a **dedicated endpoint**, never as part of a manifest write:
 
@@ -234,7 +267,7 @@ it.
   ([PLANNED]). See §8.1 for the deferred design and why.
 - **Delegated writes** (`write_class: grantees`) — writes stay owner-only
   ([PLANNED]).
-- **Range-scoped policy** — [OPEN — Q3].
+- **Range-scoped policy** — **[PLANNED — deferred, Q3]** (see §7).
 - **Public-replication of gated resources** — gated resources are off
   `subscribeRepos`/relay; there is no such surface yet ([PLANNED]).
 
@@ -287,3 +320,10 @@ extend rather than reshape. Keep `readers[]` an opaque list of principals.
   separate from the receipt/billing key. Reads authenticate the caller
   (`id:` session or `did:` JWT). Enforcement invariants recorded in
   `SECURITY-POSTURE.md`; the §2 grain decision in ADR 0001.
+- 2026-08-05 — **doc-correctness pass.** Flipped all built sections to `[LIVE]`;
+  replaced §4's illustrative JSON with the **exact shipped `PolicyRecord`** wire
+  form (`did`/`cid`/`read_class`/`readers`/`seq`/externally-tagged `authorization`,
+  `deny_unknown_fields`, `cid: null` for namespaces) and specified the **exact
+  signing preimage** an `id:` owner must reproduce; corrected the record to govern
+  reads only (no `write_class` field); marked range-scoped policy `[PLANNED]` (Q3
+  resolved). Verified against `src/policy.rs`.
