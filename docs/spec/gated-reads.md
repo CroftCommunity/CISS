@@ -201,7 +201,9 @@ signer, non-`id:` target for `OwnerSigned`, or a failed/wrong-target JWT), `409`
 **Read-back visibility (owner-only, resolved).** On `GET`, the **owner** receives
 the full signed record (including `readers[]`); a **grantee** receives only
 `{"read_class": …, "may_read": true}` — never the reader set; any other caller
-gets `404`.
+gets `404`. Read-back authenticates the caller by either an `id:` session or a
+`did:` service-auth JWT (`lxm = ing.croft.ciss.getPolicy`), so a `did:` owner —
+which holds no `id:` session — can read its own policy back.
 
 **Read endpoints are unchanged on the wire.** `getBlob`/`getObject`/`listBlobs`
 keep their paths and shapes — only the **authorization outcome** changes (§3, §5):

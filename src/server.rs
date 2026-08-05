@@ -71,6 +71,11 @@ const SESSION_CHALLENGE_PREFIX: &str = "ciss-session/v1/";
 /// be replayed to set policy.
 pub(crate) const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
 
+/// The lexicon method a `did:` caller's **policy read-back** JWT binds to. Lets a
+/// `did:` owner (whose key lives at an external provider, so it holds no `id:`
+/// session) read its own policy back over the `did:` auth path.
+pub(crate) const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
+
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -1485,14 +1490,16 @@ async fn put_object_policy_handler(
 }
 
 /// `GET /{did}/policy` — read back the namespace policy. Authenticated so the
-/// owner sees the full record and a grantee its limited view (Q4).
+/// owner sees the full record and a grantee its limited view (Q4). Accepts either
+/// a `did:` service-auth JWT (`lxm = getPolicy`) or an `id:` session, so a `did:`
+/// owner can read its own policy back.
 async fn get_policy_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
     headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    let principal = authenticate(&headers);
+    let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
     dispatch_blocking(
         &state,
         principal,
@@ -1512,7 +1519,7 @@ async fn get_object_policy_handler(
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     let addr = ContentAddr::parse(&addr)?;
-    let principal = authenticate(&headers);
+    let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
     dispatch_blocking(
         &state,
         principal,

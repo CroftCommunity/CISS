@@ -33,6 +33,10 @@ pub const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
 /// `ciss::server::SET_POLICY_LXM`).
 pub const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
 
+/// The lexicon method a `did:` owner's policy **read-back** JWT binds to (mirrors
+/// `ciss::server::GET_POLICY_LXM`).
+pub const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
+
 /// A running test server bound to an ephemeral port, driven over real HTTP.
 pub struct TestServer {
     /// The bound loopback address (ephemeral port).
@@ -467,6 +471,23 @@ impl AtprotoActor {
     /// `lxm`=setPolicy, unexpired.
     pub fn valid_set_policy_token(&self, jti: &str) -> String {
         self.sign_token(&self.key.did, SERVICE_DID, SET_POLICY_LXM, now_s() + 300, jti)
+    }
+
+    /// A valid policy read-back token (Model C owner): `lxm`=getPolicy.
+    pub fn valid_get_policy_token(&self, jti: &str) -> String {
+        self.sign_token(&self.key.did, SERVICE_DID, GET_POLICY_LXM, now_s() + 300, jti)
+    }
+
+    /// `GET /{target_did}/policy` presenting `token` as the bearer — a `did:` owner
+    /// (or grantee) reading its policy back.
+    pub async fn get_policy_with_token(&self, target_did: &str, token: &str) -> Outcome {
+        let url = format!("{}/{target_did}/policy", self.base);
+        Actor::run(
+            self.client
+                .get(url)
+                .header("authorization", format!("Bearer {token}")),
+        )
+        .await
     }
 
     /// A valid getBlob read token: `iss`=self, `aud`=service, `lxm`=getBlob.

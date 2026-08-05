@@ -441,3 +441,59 @@ async fn did_reader_reads_gated_blob_and_grants_do_not_cross_namespaces() {
 
     world.shutdown().await;
 }
+
+/// A `did:` owner reads its own policy back over HTTP via a getPolicy service-auth
+/// JWT — and sees the full record (including `readers[]`), exactly like an `id:`
+/// owner. A `did:` **grantee** sees only its own access; a stranger 404s (Q4
+/// owner-only visibility, over the `did:` auth path).
+#[tokio::test]
+async fn did_owner_reads_back_own_policy() {
+    let world = World::spawn_atproto(&["owner", "grantee", "stranger"]).await;
+    let owner = world.atproto_actor("owner");
+    let grantee = world.atproto_actor("grantee");
+    let stranger = world.atproto_actor("stranger");
+    let owner_did = owner.did().to_owned();
+
+    // The did: owner gates its namespace to the grantee (Model C).
+    let intent = serde_json::json!({
+        "read_class": "grantees",
+        "readers": [grantee.did()],
+        "seq": 1,
+    })
+    .to_string();
+    owner
+        .put_policy_with_token(&owner_did, &owner.valid_set_policy_token("jti-set"), &intent)
+        .await
+        .ok();
+
+    // The did: owner reads its policy back and sees the full record.
+    let owner_view = owner
+        .get_policy_with_token(&owner_did, &owner.valid_get_policy_token("jti-owner-read"))
+        .await;
+    owner_view.ok();
+    let owner_json = owner_view.json();
+    assert!(
+        owner_json.get("readers").is_some(),
+        "the did: owner sees the full reader set",
+    );
+
+    // A did: grantee sees only its own access, never the reader set.
+    let grantee_view = grantee
+        .get_policy_with_token(&owner_did, &grantee.valid_get_policy_token("jti-grantee-read"))
+        .await;
+    grantee_view.ok();
+    let grantee_json = grantee_view.json();
+    assert!(
+        grantee_json.get("readers").is_none(),
+        "a grantee never sees the reader set",
+    );
+    assert_eq!(grantee_json["may_read"], true, "a grantee learns only its own access");
+
+    // A did: stranger cannot read the policy back (oracle-free 404).
+    stranger
+        .get_policy_with_token(&owner_did, &stranger.valid_get_policy_token("jti-stranger-read"))
+        .await
+        .refused(404);
+
+    world.shutdown().await;
+}
