@@ -39,6 +39,7 @@ pub mod ledger;
 pub mod manifest;
 pub mod pds_api;
 pub mod persist;
+pub mod policy;
 pub mod pricing;
 pub mod receipts;
 pub mod rng;
