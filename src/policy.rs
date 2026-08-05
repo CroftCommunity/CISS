@@ -275,6 +275,76 @@ impl PolicyRecord {
     }
 }
 
+/// The effective read policy for a target after resolution — the minimal data the
+/// dispatch gate needs to decide a single read. Derived from a stored record (or a
+/// default); it carries no signature, as it is CISS's own resolved view of a row
+/// it already verified at write time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPolicy {
+    read_class: ReadClass,
+    readers: Vec<String>,
+}
+
+impl ResolvedPolicy {
+    /// The PDS-compatible default when no policy row exists: world-readable
+    /// (invariant Z1).
+    #[must_use]
+    pub fn world() -> Self {
+        Self {
+            read_class: ReadClass::World,
+            readers: Vec::new(),
+        }
+    }
+
+    /// The fail-closed value: owner-only, no grantees. Used when a policy row is
+    /// present but unreadable — the owner set *something* (so not the world
+    /// default), but we cannot tell what, so we deny everyone but the owner.
+    #[must_use]
+    pub fn deny() -> Self {
+        Self {
+            read_class: ReadClass::Owner,
+            readers: Vec::new(),
+        }
+    }
+
+    /// The resolved view of a verified record.
+    #[must_use]
+    pub fn from_record(record: &PolicyRecord) -> Self {
+        Self {
+            read_class: record.read_class,
+            readers: record.readers.clone(),
+        }
+    }
+
+    /// The read class.
+    #[must_use]
+    pub fn read_class(&self) -> ReadClass {
+        self.read_class
+    }
+
+    /// The grantee DID list.
+    #[must_use]
+    pub fn readers(&self) -> &[String] {
+        &self.readers
+    }
+
+    /// Whether `caller` (a principal's DID; `None` = anonymous) may read a target
+    /// owned by `owner_did`. The owner always reads its own target; otherwise
+    /// `World` admits anyone, `Owner` admits no one else, and `Grantees` admits a
+    /// caller whose DID is in the reader set.
+    #[must_use]
+    pub fn allows(&self, caller: Option<&str>, owner_did: &str) -> bool {
+        if caller == Some(owner_did) {
+            return true;
+        }
+        match self.read_class {
+            ReadClass::World => true,
+            ReadClass::Owner => false,
+            ReadClass::Grantees => caller.is_some_and(|c| self.readers.iter().any(|r| r == c)),
+        }
+    }
+}
+
 /// Whether the reader set is well-formed for `read_class`: for `Grantees`, every
 /// entry is a valid DID, there are no duplicates, and the list is within the
 /// ceiling; for `World`/`Owner`, the reader list must be empty (readers are
@@ -673,5 +743,43 @@ mod tests {
             attested.authorization(),
             Authorization::ProviderAttested(_)
         ));
+    }
+
+    // --- ResolvedPolicy membership (the pure gate logic Phase 3 wires in) ---
+
+    use super::ResolvedPolicy;
+
+    const OWNER: &str = "id:owner";
+
+    #[test]
+    fn world_allows_anonymous_and_any_caller() {
+        let p = ResolvedPolicy::world();
+        assert!(p.allows(None, OWNER), "anon reads world");
+        assert!(p.allows(Some("did:plc:stranger"), OWNER), "any DID reads world");
+    }
+
+    #[test]
+    fn owner_class_allows_only_the_owner() {
+        let p = ResolvedPolicy::deny(); // owner-only, no readers
+        assert!(p.allows(Some(OWNER), OWNER), "owner reads own target");
+        assert!(!p.allows(None, OWNER), "anon denied");
+        assert!(!p.allows(Some("did:plc:stranger"), OWNER), "stranger denied");
+    }
+
+    #[test]
+    fn grantees_class_allows_owner_and_listed_readers_only() {
+        let rec = PolicyRecord::sign_owner(
+            &owner_did(),
+            None,
+            ReadClass::Grantees,
+            &[grantee("alice")],
+            1,
+            &owner(),
+        );
+        let p = ResolvedPolicy::from_record(&rec);
+        assert!(p.allows(Some(&owner_did()), &owner_did()), "owner always reads");
+        assert!(p.allows(Some(&grantee("alice")), &owner_did()), "listed reader reads");
+        assert!(!p.allows(Some(&grantee("bob")), &owner_did()), "unlisted denied");
+        assert!(!p.allows(None, &owner_did()), "anon denied");
     }
 }
