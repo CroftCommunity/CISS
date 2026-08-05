@@ -55,10 +55,21 @@ they meter identically.
    the DID's ledger, carrying the running total.
 
 **GET / getBlob (download):**
+0. **Authorize the read (gated reads).** `dispatch` resolves the target's read
+   policy and checks membership: `world` (the default) allows anyone; a gated
+   target admits only the owner or a listed grantee, and a denied read is a **404**
+   (oracle-free), never the bytes. Reads authenticate the caller (an `id:` session
+   or a `did:` service-auth JWT) so a grantee is recognized. See
+   `SECURITY-POSTURE.md` §5 (Z4–Z8) and `docs/spec/gated-reads.md`.
 1. `blobs.get(did, cid)` returns the raw stored bytes (unverified — dumb backend).
 2. Layer 2 **re-fingerprints** them: if `sha256(stored) != cid`, that is
    tamper-at-rest → a loud `500` naming the object, *not* a served bad blob.
 3. A provider-signed **Download** receipt is appended.
+
+Policy is set on a dedicated surface (`PUT/GET /{did}/policy` and
+`/{did}/objects/{cid}/policy`) by submitting an owner-authorized policy record
+(`id:` owner self-signs; `did:` owner authorizes via a service-auth JWT that CISS
+provider-attests). `listBlobs` filters the same way — hidden cids are omitted.
 
 `GET /{did}/meter` sums the ledger (upload/download bytes, running total,
 postage cents). The running total is recomputed from the ledger, not cached — the

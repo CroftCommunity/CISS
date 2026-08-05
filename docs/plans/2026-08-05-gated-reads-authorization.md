@@ -1,6 +1,6 @@
 # Plan — gated reads (the authorization layer)
 
-- **Date:** 2026-08-05 · **Status:** Pass 3 complete — ready for execution (phase-plan skill) · **TDD-first**
+- **Date:** 2026-08-05 · **Status:** ✅ **EXECUTED — all 8 phases shipped, green** (phase-plan skill) · **TDD-first**
 - **Owns:** ADR 0001 §2 (namespace mode bits) + its grain reopening; closes the
   standing gap `SECURITY-POSTURE.md` §14.1. **Contract:** `docs/spec/gated-reads.md`.
 
@@ -646,3 +646,34 @@ billing-only — wired into Reasoning, Verified Assumptions, Phase 1 & 6); Q4 ow
 
 **Confirmed ready:** **yes.** No open questions remain; the plan is ready for execution
 (Phase 1 first, TDD RED-first).
+
+### Execution — 2026-08-05 (all 8 phases shipped, green)
+
+Built TDD RED-first, one commit per phase, `cargo test --workspace` + `cargo clippy
+--all-targets --workspace` clean at every phase (264 tests at completion).
+
+- **P1** `src/policy.rs` — `PolicyRecord` + `verify_policy` (both forms, form-vs-target,
+  cid-binding, monotonic seq, malformed-readers refusal, tamper refusal, key separation).
+- **P2** `src/persist.rs` — `namespace_policy`/`object_policy` tables, `save_policy`
+  (in-txn anti-rollback), `resolve_policy` (finest-grain-wins, fail-closed);
+  `ResolvedPolicy` + `allows` in `policy.rs`. Wiring: `tests/wiring_policy.rs`.
+- **P3** `authorize_read` at `dispatch` — 404-on-deny, membership-only, world fast-path.
+- **P4** `op_list_blobs` omission (batch per DID + fast path). `resolve_object_policy` /
+  `has_object_policies`.
+- **P5** Model A HTTP: `PUT/GET /{did}/policy` + object route, distinct 400/403/409,
+  Q4 owner-only read-back, `Provider::attest_keypair` (Q3), reader-auth on `get_object`.
+  Flow: `tests/flow_gated_reads.rs` (`id:` lifecycle).
+- **P6** Model C: JWT (`SET_POLICY_LXM`) → provider-attest → save; `verify_service_auth_full`
+  (exposes `jti`); `did:`/`id:` reader auth on getBlob/listBlobs. Flow: Model C lifecycle
+  + 5 JWT-defect refusals.
+- **P7** Corpus round-out: `did:` reader end-to-end (getBlob JWT) + cross-namespace isolation.
+- **P8** Docs: `SECURITY-POSTURE.md` Z4–Z8 + §14.1 closed + checklist; ADR 0001 §2
+  amendment; `docs/spec/gated-reads.md` §6 finalized + change log; README + ARCHITECTURE
+  capability lines.
+
+**Note (process):** did not run workspace `cargo fmt` — this repo's committed code is
+formatted by a different rustfmt than the local toolchain (would rewrite 100+ untouched
+hunks); new code hand-matched to the surrounding style, feature diffs kept pure-additions.
+Gate was clippy + test (both clean), not `fmt --check`.
+
+**Confirmed shipped:** yes.

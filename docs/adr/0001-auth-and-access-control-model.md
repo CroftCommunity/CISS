@@ -106,6 +106,25 @@ per-repo read ACL): a gated read to an unauthenticated caller returns **404**
 not read (otherwise the gate leaks CIDs). Gated namespaces are not on the
 public-replication (`subscribeRepos`/relay) surface.
 
+**Amendment (2026-08-05 — gated reads built).** The grain resolved to **both
+namespace and per-object, composed** (finest-grain-wins: an object policy
+overrides its namespace policy, which overrides the `world` default) — the minimal
+composition that serves whole-repo gating *and* single-blob sharing without
+bloating every object or the namespace. And the mode bits are not carried on the
+manifest but as a **dedicated, owner-authorized `PolicyRecord`** per target — kept
+distinct from the billing (manifest) signature so a grant/revoke never re-signs
+the rent base. Two authorization forms, because who may *set* policy depends on
+where the owner's key lives: **Model A** — an `id:` owner self-signs the record
+(ed25519, domain `ciss/v1/policy`, valid only for a target its key derives);
+**Model C** — a `did:` owner (key at an external identity provider) authorizes via
+a service-auth JWT (`lxm = ing.croft.ciss.setPolicy`) and CISS counter-signs with
+a dedicated `policy-attest` key (domain `ciss/v1/policy-attest`) for durability.
+The record binds target (cid included), `read_class`, reader set, and a monotonic
+`seq` (anti-rollback). Read classes are `world | grantees | owner`; readers are an
+explicit DID list (groups deferred). Reader-set visibility on read-back is
+owner-only. Full enforcement invariants: `SECURITY-POSTURE.md` Z4–Z8; integrator
+contract: `docs/spec/gated-reads.md`.
+
 ### 3. CISS is a resource server, not an authorization server
 
 CISS **verifies** atproto sessions; it **issues** nothing. The stack already runs

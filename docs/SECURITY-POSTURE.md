@@ -143,10 +143,42 @@ The provider therefore never signs a receipt naming a DID that did not consent.
 key-possession via the manifest signature + `derive_id(key) == did`, independent
 of the session layer.
 
-**Design-failure watch:** v0 has only the flat default (world read / owner
-write). Gated reads for the history-convergence tier (`read: grantees` + signed
-grants) are specified but **not built** — content that must not be public has no
-enforcement yet. That is a *known design gap*, not a bug.
+**Gated reads (built).** The flat default (Z1) is now overridable per target by an
+owner-authorized **read policy**. Design + contract: `docs/spec/gated-reads.md`;
+grain decision + record shape: ADR 0001 §2.
+
+**Invariant Z4 — reads are authorized at the dispatch choke point.** A read op
+(`GetObject`) resolves the target's policy (`Store::resolve_policy`) and checks
+membership (`ResolvedPolicy::allows`) in `dispatch`, after the pure `authorize`.
+`world` (the Z1 default, and any target with no policy row) is allowed on a fast
+path. The check is **membership-only** — the policy signature is verified once at
+write, and the stored row is CISS's own SQLite, so there is no per-read crypto.
+
+**Invariant Z5 — denial is oracle-free.** A denied read returns **404**
+(`NotFound`), indistinguishable from "no such object"; `listBlobs` **omits** every
+cid the caller may not read (neither listed nor counted). A gate never returns 403
+or a distinguishable status that would confirm a hidden object exists.
+
+**Invariant Z6 — a policy is an owner-authorized, monotonic record.** A
+`PolicyRecord` binds its target (namespace or `(did,cid)` object, cid included),
+`read_class`, reader set, and a monotonic `seq`, under one of two forms: **Model A
+(`OwnerSigned`)** — an `id:` owner's ed25519 signature over `ciss/v1/policy:…`,
+valid only for an `id:` target the signer key derives; **Model C
+(`ProviderAttested`)** — CISS's signature over `ciss/v1/policy-attest:…` after it
+verified the owning `did:`'s service-auth JWT (`lxm = ing.croft.ciss.setPolicy`).
+A record is verified (`verify_policy`) before it is stored; a forged/wrong-signer/
+wrong-target/malformed record is refused and access is unchanged.
+
+**Invariant Z7 — anti-rollback.** A policy write applies only if its `seq`
+strictly exceeds the stored policy's `seq` for that target — enforced both at
+verify time (distinct `409`) and in-transaction at `save_policy`. A replayed lower
+`seq` cannot un-revoke a grant.
+
+**Invariant Z8 — the attestation key is separate from the billing key.** Model C
+attestations are signed with a **dedicated** `policy-attest` key
+(`derive_keypair(seed, "policy-attest")`), disjoint from the receipt/billing key
+by both key and signing domain, so metering crypto and authorization crypto never
+overlap.
 
 ## 6. Content integrity
 
@@ -285,9 +317,14 @@ inside the hardened sandbox (§11).
 | A5 | canonical low-S signatures only | `ciss-auth::did_key` (ported rsky-crypto) |
 | A6 | `jti` single-use in its window | `ciss-auth::ReplayGuard` |
 | A7 | resolution fails closed; admins pinned local | `ciss-resolve` (`Pinned`/`Caching`/`Timeout`) |
-| Z1 | reads are world-readable (PDS-compat) | `authorize` (read ops → Ok) |
+| Z1 | reads are world-readable **by default** (PDS-compat) | `authorize` (read ops → Ok) |
 | Z2 | writes + meter are owner-only | `require_owner` |
 | Z3 | manifest self-authorizes | `op_put_manifest` |
+| Z4 | reads authorized at dispatch (membership-only) | `authorize_read` / `Store::resolve_policy` |
+| Z5 | oracle-free denial (404 + `listBlobs` omission) | `authorize_read` (→ `NotFound`) / `op_list_blobs` |
+| Z6 | owner-authorized policy record (Model A / C) | `policy::verify_policy` / `op_put_policy` |
+| Z7 | policy anti-rollback (monotonic seq) | `op_put_policy` / `Store::save_policy` |
+| Z8 | attestation key ≠ billing key | `Provider::attest_keypair` (`policy-attest`) |
 | C1 | server names content by hash | `op_put_object` |
 | C2 | tamper-at-rest caught on read | `op_get_object` |
 | B1 | manifest binds total_bytes + root | `Manifest::verify` / `signing_preimage` |
@@ -302,9 +339,11 @@ inside the hardened sandbox (§11).
 
 ## 14. Standing design gaps (not bugs)
 
-1. **Gated-read namespaces** (Z-tier beyond the flat default) — specified,
-   unbuilt. Content that must not be public has no enforcement yet. (Authentication
-   for both identity spaces is built; this is the *authorization*-layer gap.)
+1. ~~**Gated-read namespaces** (Z-tier beyond the flat default)~~ — **CLOSED
+   2026-08-05.** Built as invariants Z4–Z8 (authorize-at-dispatch, oracle-free
+   404 + `listBlobs` omission, owner-authorized monotonic policy record in both
+   Model A and Model C, anti-rollback, separate attestation key). Contract:
+   `docs/spec/gated-reads.md`; decision: ADR 0001 §2.
 2. **atproto identity residuals** — the `did:plc`/`did:web` service-auth path is
    built (§4, A3–A7). Remaining follow-ons: `did:plc` signed-oplog verification (so
    a poisoned directory cannot forge current key state), DPoP access tokens

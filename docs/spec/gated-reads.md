@@ -1,12 +1,13 @@
-# CISS gated reads — integrator specification (v1, in progress)
+# CISS gated reads — integrator specification (v1, built)
 
-**Status: DRAFT — v1 scope settled, ready to build.** All three design questions
-are resolved (Q1 read model, Q2 dedicated policy record, Q3 range grain deferred).
-Sections are marked **[SETTLED]** (build against this) or **[PLANNED]** (a tracked
-future extension, out of v1 — do not rely on). This document is the **contract for
-integrators**; the build/TDD plan is
-`docs/plans/2026-08-05-gated-reads-authorization.md`, and the decision is ADR 0001
-§2.
+**Status: LIVE — v1 built (8-phase TDD increment, 2026-08-05).** All three design
+questions are resolved (Q1 read model, Q2 dedicated policy record, Q3 range grain
+deferred) and the model is shipped. Sections marked **[LIVE]**/**[SETTLED]** are
+built and covered by tests; **[PLANNED]** marks a tracked future extension (out of
+v1 — do not rely on). This document is the **contract for integrators**; the
+build/TDD plan is `docs/plans/2026-08-05-gated-reads-authorization.md`, the
+enforcement invariants are in `docs/SECURITY-POSTURE.md`, and the decision is
+ADR 0001 §2.
 
 ---
 
@@ -168,31 +169,46 @@ A gate that reveals what it hides is not a gate. So:
 Integrators: a `404` from a CISS read is **not** proof of non-existence, and a
 `listBlobs` result is a caller-scoped view, not a census.
 
-## 6. Wire API  **[SETTLED model; exact paths finalized in build Phase 5]**
+## 6. Wire API  **[LIVE — built]**
 
-Policy is written by submitting a **signed policy record** (§4) to a dedicated
-endpoint — never as part of a manifest write. The model:
+Policy is written to a **dedicated endpoint**, never as part of a manifest write:
 
-- **Set/replace a namespace policy** — submit a record with `target = <did>`.
-- **Set/replace an object policy** — submit a record with `target = <did>/<cid>`.
-- CISS runs the §4 verification (owner signature, monotonic `seq`, valid DIDs)
-  before persisting; a failing record is rejected and access is unchanged.
-- **Revoke / re-grant** is just a new record with a higher `seq` and the new
-  `readers[]` / `read_class` (there is no separate delete verb; a policy is
-  superseded, never rolled back).
-- **Read back** — the owner may fetch the current effective policy for a target
-  (to confirm state). Whether a *grantee* can see the full `readers[]` is a minor
-  disclosure choice finalized in Phase 5 (leaning: owner-only visibility of the
-  full reader list; a grantee learns only that it may read).
+- `PUT /{did}/policy` — set/replace the **namespace** policy.
+- `PUT /{did}/objects/{cid}/policy` — set/replace a **per-object** policy.
+- `GET` on either path — **read back** the current policy.
 
-Proposed concrete paths (to finalize in Phase 5): `PUT /{did}/policy` (namespace)
-and `PUT /{did}/objects/{cid}/policy` (object), with `GET` for read-back. The
-signed record is the request body.
+The request body depends on the owner's authorization form (§4.1):
+
+- **Model A (`id:` owner).** The body is a full **signed `PolicyRecord`** (JSON,
+  §4) carrying `authorization: {OwnerSigned: {signer, sig}}`. No auth header — the
+  record's own signature is the authorization. The record's `did`/`cid` must match
+  the route.
+- **Model C (`did:` owner).** The request carries `Authorization: Bearer <service-
+  auth JWT>` (`lxm = ing.croft.ciss.setPolicy`, `aud =` the CISS service DID,
+  `iss =` the owning DID) and the body is a **`PolicyIntent`**: `{"read_class":
+  "world|grantees|owner", "readers": ["did:…", …], "seq": <n>}`. CISS verifies the
+  JWT, asserts the authenticated DID equals the target DID, then builds and
+  provider-attests the record. A present-but-invalid JWT is a hard `403`.
+
+On success both return `{"seq": <n>}`. Failures are distinct: `400` (malformed
+body / target-route mismatch), `403` (unauthorized — bad/forged signature, wrong
+signer, non-`id:` target for `OwnerSigned`, or a failed/wrong-target JWT), `409`
+(the `seq` does not supersede the stored policy — anti-rollback).
+
+**Revoke / re-grant** is just a higher-`seq` policy with the new `readers[]` /
+`read_class`; there is no delete verb — a policy is superseded, never rolled back.
+
+**Read-back visibility (owner-only, resolved).** On `GET`, the **owner** receives
+the full signed record (including `readers[]`); a **grantee** receives only
+`{"read_class": …, "may_read": true}` — never the reader set; any other caller
+gets `404`.
 
 **Read endpoints are unchanged on the wire.** `getBlob`/`getObject`/`listBlobs`
-have the same paths and shapes as today — only their **authorization outcome**
-changes per §3 and §5 (a gated resource 404s to an unauthorized caller;
-`listBlobs` omits it).
+keep their paths and shapes — only the **authorization outcome** changes (§3, §5):
+a gated resource `404`s an unauthorized caller and `listBlobs` omits it. Reads now
+**authenticate the caller** (an `id:` session, or a `did:` service-auth JWT bound
+to the read method on the atproto surface) so a grantee is recognized; no
+credential is anonymous (world-readable objects only).
 
 ## 7. Range-scoped policy (history-convergence)  **[PLANNED — deferred, Q3]**
 
@@ -260,3 +276,12 @@ extend rather than reshape. Keep `readers[]` an opaque list of principals.
 - 2026-08-05 — Q3 settled: **range grain deferred** (kept as a design constraint so
   v1 leaves room, §7); the **group model is deferred** with the static-vs-dynamic
   tension recorded (§8.1). All v1 design questions resolved — scope frozen.
+- 2026-08-05 — **built (8-phase TDD increment).** §6 wire finalized to the shipped
+  form: `PUT/GET /{did}/policy` and `/{did}/objects/{cid}/policy`; Model A body =
+  signed `PolicyRecord`, Model C body = `PolicyIntent` + `Bearer` service-auth JWT
+  (`lxm = ing.croft.ciss.setPolicy`); distinct `400`/`403`/`409` failures.
+  Read-back visibility resolved **owner-only** (a grantee sees only `may_read`).
+  Model C provider attestation uses a **dedicated** `policy-attest` key (Q3),
+  separate from the receipt/billing key. Reads authenticate the caller
+  (`id:` session or `did:` JWT). Enforcement invariants recorded in
+  `SECURITY-POSTURE.md`; the §2 grain decision in ADR 0001.

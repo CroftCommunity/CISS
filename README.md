@@ -85,9 +85,11 @@ cargo run -- --data-dir ./data --listen 127.0.0.1:8080
 # or CISS_PROVIDER_SEED), never the database. See docs/SECURITY-POSTURE.md §9.
 ```
 
-A metered round-trip over the S3 surface. **Reads of world-readable namespaces are
-public; writes and the billing meter are authenticated (owner-only, ADR 0001)** —
-so the write and meter calls need `$AUTH`: either an `id:` signed session
+A metered round-trip over the S3 surface. **Reads are world-readable by default;
+an owner can gate a namespace or a single object with a read policy (a denied read
+404s, `listBlobs` omits it); writes and the billing meter are authenticated
+(owner-only, ADR 0001)** — see `docs/spec/gated-reads.md`. The write and meter
+calls need `$AUTH`: either an `id:` signed session
 (`x-croft-pubkey` + `x-croft-session` over the session challenge) or a `did:`
 service-auth JWT bearer. Anonymous writes/meter are `401` by design.
 
@@ -147,8 +149,9 @@ speaks CIDv1 (`ref.$link`); the backend is keyed by the same digest in hex, and
 | Method | Path | Meaning |
 |---|---|---|
 | `POST` | `/xrpc/com.atproto.repo.uploadBlob` | **Auth required.** Store the raw-body blob in the authed repo; metered. Returns `{"blob":{"$type":"blob","ref":{"$link":"<CIDv1>"},"mimeType":"<ct>","size":<int>}}`. |
-| `GET` | `/xrpc/com.atproto.sync.getBlob?did=&cid=` | **Public.** Return the raw bytes addressed by the CIDv1; metered. |
-| `GET` | `/xrpc/com.atproto.sync.listBlobs?did=` | **Public.** The CIDv1 addresses a DID has uploaded: `{"cids":[...]}`. |
+| `GET` | `/xrpc/com.atproto.sync.getBlob?did=&cid=` | **Public by default; gateable.** Return the raw bytes addressed by the CIDv1; metered. A gated blob 404s an unauthorized caller (authenticates an `id:` session or `did:` JWT reader). |
+| `GET` | `/xrpc/com.atproto.sync.listBlobs?did=` | **Public by default; gateable.** The CIDv1 addresses a DID has uploaded: `{"cids":[...]}` — omits any the caller may not read. |
+| `PUT`/`GET` | `/{did}/policy`, `/{did}/objects/{cid}/policy` | Set/read the read policy for a namespace or object (gated reads). `id:` owner submits a signed record; `did:` owner authorizes via a `Bearer` service-auth JWT. See `docs/spec/gated-reads.md`. |
 
 ### Operational endpoints
 
