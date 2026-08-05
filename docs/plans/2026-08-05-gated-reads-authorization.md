@@ -1,300 +1,342 @@
 # Plan — gated reads (the authorization layer)
 
-- **Date:** 2026-08-05
-- **Status:** Proposed (TDD-first)
-- **Owns:** ADR 0001 §2 (namespace mode bits) + its deferred **grain** reopening;
-  closes the standing design gap in `docs/SECURITY-POSTURE.md` §14.1 (gated-read
-  namespaces).
-- **Decisions (2026-08-05):** design **both grains together** — namespace mode
-  bits with per-object reader overrides — set by an **owner-signed policy record**.
+- **Date:** 2026-08-05 · **Status:** Pass 1 complete (phase-plan skill) · **TDD-first**
+- **Owns:** ADR 0001 §2 (namespace mode bits) + its grain reopening; closes the
+  standing gap `SECURITY-POSTURE.md` §14.1. **Contract:** `docs/spec/gated-reads.md`.
 
 ---
 
-## Problem statement
+## Problem Statement
 
-Authentication is complete: a caller is proven to be a DID (`id:` session or
-`did:` service-auth JWT). But **authorization for reads is still flat**: every
-object/blob read and `listBlobs` is world-readable (invariant Z1). That is exact
-PDS-compatibility and correct for public repos — but CISS has two use cases that
-need *private* reads and have no enforcement today (posture §14.1):
-
-- **history-convergence backend** — a "range-based crypto-chain query server"
-  whose ranges/repos must be readable only by grantees;
-- **private-PDS per-object sharing** — an object shared with a specific list of
-  reader DIDs ("share this blob with alice + bob").
-
-These pull toward two grains (a *namespace/range* and a *single object*), so the
-model must serve both. ADR 0001 §2 chose namespace-grain and explicitly deferred
-per-object ACLs ("the complexity and leakage surface"); this plan reopens that as
-decided — **both**, composed — and builds it.
-
-The load-bearing risk is **leakage**: a gate that leaks what it hides is no gate.
-A denied read must not become an existence oracle, and `listBlobs` must not
-enumerate objects the caller may not read.
-
-## Approach
-
-Authorization is a **lookup against an owner-signed policy**, evaluated at the
-single `dispatch` choke point after authentication. Two composing grains:
-
-```
-  read(did, object)  ─▶  resolve policy:
-      1. per-object ACL for `object`?      → use it            (finest grain wins)
-      2. else namespace mode bits for `did`→ use read_class
-      3. else default                      → world  (PDS-compat, unchanged)
-  ─▶  authorize(principal, policy):
-        world            → allow
-        grantees/owner   → allow iff principal.did ∈ {owner} ∪ readers
-      deny → 404 (no existence oracle);  listBlobs omits denied objects
-```
-
-**Policy is an owner-signed record** (self-authorizing, exactly like the manifest,
-invariant Z3): the owner signs `{namespace|object, read_class, readers[], seq}`
-with the key that derives its DID (`derive_id(key) == did`), so CISS trusts the
-policy without a session — and a stale/forged policy fails the signature check.
-`seq` is monotonic (replay/rollback defense, like the manifest `seq`).
-
-- **Namespace mode bits** `{read_class ∈ {world, grantees, owner}, write_class}`
-  set the default for a DID's whole namespace/range.
-- **Per-object override** — an object may carry its own `{read_class, readers[]}`
-  that wins over the namespace default (finest grain wins). Absent → inherit the
-  namespace.
-- **Write** stays owner-only (invariant Z2, unchanged) — this increment is about
-  *reads*. `write_class` is stored for completeness but v1 enforces owner-only
-  writes as today; delegated writes are a tracked follow-on.
-
-**Denial semantics (the leakage rules), from ADR 0001 §2:**
-
-- a gated read to an unauthorized/anonymous caller → **404**, never 403 (no
-  existence oracle);
-- `listBlobs` **omits** objects the caller may not read (never leaks a hidden CID);
-- gated namespaces are **off the public-replication surface** (not on
-  `subscribeRepos`/relay) — a SEAM to enforce when that surface exists.
+Authentication is complete (`id:` session + `did:` service-auth JWT). Read
+**authorization** is still flat: every object/blob read and `listBlobs` is
+world-readable (invariant Z1) — exact PDS-compat, but CISS needs *private* reads
+for two use cases with no enforcement today (posture §14.1): the
+**history-convergence** backend (range/repo readable only by grantees) and
+**private-PDS per-object sharing** (a blob shared with a named DID list). The
+load-bearing risk is **leakage**: a denied read must not become an existence
+oracle, and `listBlobs` must not enumerate hidden objects.
 
 ## Reasoning
 
-- **Why both grains, composed.** The two use cases genuinely differ in grain;
-  forcing one would either bloat namespace policy with per-object exceptions or
-  bloat every object with a full ACL. Namespace default + per-object override is
-  the standard, minimal composition (like Unix dir mode + per-file ACL).
-- **Why an owner-signed policy record, not a session-set flag.** CISS already
-  trusts owner-signed artifacts (the manifest, Z3) and nothing else for durable
-  authority. A signed record means policy provenance is a durable, verifiable
-  artifact — not "whoever held a session at write time" — and it is checkable
-  offline, survives backup/restore, and carries its own anti-rollback `seq`.
-- **Why 404 + omit.** A gate that returns 403 or lists hidden CIDs leaks the very
-  thing it protects. 404-on-deny and list-omission are the atproto-shaped,
-  oracle-free denial (ADR 0001 §2).
-- **Why reads only in v1.** Writes are already owner-only and safe; read-gating is
-  the missing capability. Delegated writes (write_class: grantees) add a consent
-  model and are deferred to keep this increment focused.
+- **Both grains, composed** (namespace default + per-object override). The two use
+  cases differ in grain; one grain forces either bloated namespace exceptions or a
+  full ACL per object. Namespace + object override is the minimal composition (Unix
+  dir-mode + per-file ACL). *Rejected:* namespace-only (can't share one blob),
+  object-only (bloats every object for a whole-repo gate).
+- **Owner-signed policy record, dedicated (not on the manifest).** CISS trusts
+  owner-signed artifacts (the manifest, Z3) for durable authority. A dedicated
+  record keeps the **billing** signature (manifest, B-tier) and the **authz**
+  signature distinct — a grant/revoke never re-signs the rent base — and makes
+  per-object policy first-class. *Rejected:* a manifest field (couples billing +
+  authz; per-object bloats a whole-namespace doc). *Rejected:* a session-set flag
+  (provenance is "whoever held a session," not a durable verifiable artifact).
+- **404-on-deny + `listBlobs` omission.** A gate that 403s or lists hidden CIDs
+  leaks what it protects. Oracle-free denial (ADR 0001 §2).
+- **Reads only in v1.** Writes are already owner-only (Z2) and safe; read-gating is
+  the missing capability. Delegated writes add a consent model — deferred.
 
-## Phases (TDD-first — every phase RED before GREEN)
+## Verified Assumptions
 
-Each phase is independently green, leaves the tree working, and is the smallest
-increment that carries value. Sequencing: **1 → 2 → 3 → 4 → 5 → 6**; the pure core
-(1) grounds storage (2), which grounds enforcement (3, 4), which the wire (5)
-exercises, which the corpus (6) proves end-to-end. The whole increment is
-**reads-only and additive** — no existing behavior changes until an owner writes a
-non-`world` policy, so it can land dark and be exercised before any namespace is
-gated.
+Confirmed firsthand against the code (2026-08-05):
+
+- **The authz choke point is `server::authorize(principal, op)`** (`src/server.rs:731`),
+  called by `dispatch(state, principal, op)`. Today `GetObject | ListBlobs => Ok(())`.
+  **`authorize` is pure — it has no `Store`/state access.** Policy resolution needs
+  the `Store`, so the policy gate lands in **`dispatch`** (which holds `state`) after
+  the base `authorize`, or `authorize` gains `&AppState`. Chosen: gate in `dispatch`
+  (keeps the single choke point; `authorize` stays a pure policy function fed the
+  resolved policy). *Evidence:* `src/server.rs:731-745`, `dispatch` sig.
+- **`ServerError::NotFound → 404`** (`src/server.rs:1230,1302`); `Forbidden → 403`,
+  `Unauthorized → 401`. Deny maps to `NotFound`. *Evidence:* `src/server.rs:1299-1308`.
+- **`Op::GetObject { did, cid }`** carries the cid; `Op::ListBlobs { did }`. Handlers
+  `op_get_object(state, did, cid)` (`:878`), `op_list_blobs(state, did)` (`:1027`).
+  *Evidence:* `src/server.rs:463-492,878,1027`.
+- **Owner-signed record pattern = the manifest**, and it is **`id:`-space / ed25519**:
+  domain `"ciss/v1/manifest"`, `signing_preimage(signer_id, seq, leaf_count,
+  total_bytes, root)` (`src/manifest.rs:115`), `Manifest::verify(customer_key:
+  &VerifyingKey)` (`:168`, ed25519-dalek), `Manifest::seq()` (`:152`). The policy
+  record mirrors this shape with domain `"ciss/v1/policy"`. *Evidence:*
+  `src/manifest.rs:32,115,152,168`.
+- **A `did:` owner does not hold a repo signing key client-side** (their atproto key
+  lives at their PDS; they authenticate to CISS via a service-auth JWT, not by
+  signing arbitrary records). So the owner-**signed**-record model verifies cleanly
+  only for **`id:` owners** (ed25519, like the manifest). This drives Open Question 1.
+- **Persistence pattern:** `CREATE TABLE IF NOT EXISTS` in the init block
+  (`src/persist.rs:160+`), defensive `ALTER TABLE … ADD COLUMN` (`:199`), upsert
+  `save_manifest` (`:245`) / `load_manifest` (`:259`). Policy tables mirror this.
+  *Evidence:* `src/persist.rs:160-262`.
+- **Flow harness** supports owner-signed writes and the assertions we need: the
+  forged/replayed manifest is guarded in `tests/flow_billing_integrity.rs`, and
+  `Outcome` has `.ok/.refused/.returns/.omits/.discloses` (`tests/common/mod.rs`).
+  Gated-read flows + a policy `PUT` mirror the manifest flow. *Evidence:*
+  `tests/flow_billing_integrity.rs`, `tests/common/mod.rs` `Outcome`.
+
+## Documentation Impact
+
+- `docs/spec/gated-reads.md` — flip `[PLANNED build]` sections to live as they land:
+  §3/§5 in **Phase 3–4**, §6 wire in **Phase 5**; change log each time.
+- `docs/SECURITY-POSTURE.md` — new invariants + close §14.1 gap in **Phase 7**.
+- `docs/adr/0001-auth-and-access-control-model.md` — record the resolved §2 grain
+  decision + policy-record shape in **Phase 7**.
+- `README.md` / `docs/ARCHITECTURE.md` — grepped: describe reads as "world-readable"
+  (README security summary, ARCH §5). Add the gated-read capability line in
+  **Phase 7** (search terms: `world-readable`, `listBlobs`, `Z1`).
+- No croft-stack doc impact (additive, in-repo schema; no deploy/unit change).
+
+## Concurrency Map
+
+**All phases sequential.** Each phase reads what the prior wrote (record → storage →
+dispatch gate → listBlobs → wire → corpus → docs), and Phases 2–5 all write
+`src/server.rs`/`src/persist.rs`, so their write-sets overlap. No parallelism.
+
+## Phases (TDD-first — RED before GREEN, commit per phase)
+
+**Testing doctrine (cross-cutting):** every phase tests the **should-NOT** path, not
+just the happy path — a gate is only as trustworthy as its denials. Each phase's
+`Done when` pairs an *allow* case with its *deny* case (Phase 1: verify vs
+refuse-forgery/replay; Phase 3: grantee-reads vs non-grantee-404; Phase 4:
+grantee-sees vs non-grantee-omitted; Phase 5: grant-works vs wrong-signer-refused),
+and Phase 6 is the comprehensive matrix. A regression that opens the gate must break
+a test, by construction.
 
 ### Phase 1 — The signed policy record (pure)
 
-**Problem.** There is no representation of "who may read this," and no way to trust
-one without a session. We need a self-authorizing artifact (like the manifest, Z3)
-so policy provenance is a durable signature, not a session side-effect.
-
-**Done means (RED).** Unit tests over a new `policy` module (core/`ciss-auth`-side,
-pure — no I/O):
-- a record signed by the key that derives the target's DID, with a `read_class ∈
-  {world, grantees, owner}` and DID-validated `readers[]`, **verifies**;
-- a record signed by a **different key** (forged), or one whose signer derives a
-  **different DID** than the target, is **refused** (`derive_id(signer) != did`);
-- a record whose `seq` is **not strictly greater** than a supplied prior `seq` is
-  refused (rollback/replay);
-- a `readers[]` entry that is not a well-formed `Did` is refused;
-- a tampered field (readers/class/seq changed after signing) fails the signature;
-- `owner`/`world` records need no `readers[]`; a `grantees` record with empty
-  `readers[]` is accepted and means owner-only (equivalent to `owner`).
-
-**Build (GREEN).** `PolicyRecord { target, read_class, readers[], seq, signer, sig }`
-+ `verify_policy(record, prior_seq) -> Result<VerifiedPolicy, PolicyError>`, over a
-canonical versioned preimage `ciss/v1/policy:<target>:<seq>:<read_class>:<readers…>`
-— mirroring `manifest::signing_preimage` byte-discipline (`canonical.rs`). Reuse
-`ciss-auth` verify primitives; `read_class` is a small enum; `target` is an opaque
-string (`<did>` | `<did>/<cid>`) so range targets slot in later (spec §7).
-
-**Validation.** `cargo test` for the `policy` module green; property test on the
-preimage round-trip if cheap. No wiring yet.
-
-**Depends on.** Nothing (pure).
+- **Goal:** a self-authorizing `PolicyRecord` that verifies iff owner-signed with a
+  monotonic `seq`.
+- **Changes:**
+  - [ ] `src/policy.rs` — `PolicyRecord { target, read_class, readers, seq, signer,
+    sig }`, `ReadClass{World,Grantees,Owner}`, `verify_policy(record, prior_seq)`,
+    domain `"ciss/v1/policy"`, canonical preimage via `canonical.rs`.
+  - [ ] `src/lib.rs` — `pub mod policy;`.
+- **Call chain:** (none yet — pure module; wired at Phase 2 `put_policy` / Phase 3
+  `dispatch`). Named here so it is not left dangling: `dispatch → resolve_policy →
+  {policy record}` and `PUT /policy handler → verify_policy → save_policy`.
+- **Wiring test:** deferred to Phase 2 (first consumer); Phase 1 is unit-only by
+  nature (a pure verifier), noted so it is not mistaken for dead code.
+- **Depends on:** none.
+- **Read-set:** `src/manifest.rs` (preimage pattern), `src/canonical.rs`, `src/crypto.rs`.
+- **Write-set:** `src/policy.rs`, `src/lib.rs`.
+- **Shared-state contract:** none beyond the file write-set (pure).
+- **Risks:** ed25519-only signer (Open Q1) — v1 verifies `id:`/ed25519 owners.
+- **Done when:**
+  1. *Behavioral:* a policy record signed by the owner ed25519 key that derives the
+     target DID verifies; a forged signer, wrong-DID signer, replayed/lower `seq`,
+     malformed `readers[]`, or post-sign tamper is refused.
+  2. *Verification:* `cargo test -p ciss --lib policy::`.
+- **Validation:** narrow — unit tests sufficient; add a preimage round-trip prop test.
 
 ### Phase 2 — Policy storage + resolution (`persist::Store`)
 
-**Problem.** A verified policy must persist per target and resolve at read time with
-the finest-grain-wins order, monotonic-`seq` supersede, and fail-closed on any
-malformed state.
-
-**Done means (RED).** Unit tests over `Store`:
-- `put_policy` persists a namespace policy (`target=<did>`) and an object policy
-  (`target=<did>/<cid>`); a later `seq` **supersedes**, an equal/lower `seq` is
-  rejected (and the stored policy is unchanged);
-- `resolve_policy(did, cid)` returns the **object** policy if present, else the
-  **namespace** policy, else the `world` default;
-- a stored row that fails to parse **never widens access** — resolution fails
-  closed to the tighter of {stored-or-default} (an unreadable object policy does
-  not fall through to a permissive namespace default);
-- policies are per-`did`, isolated (one DID's policy never affects another's).
-
-**Build (GREEN).** Two tables — `namespace_policy(did PK, seq, read_class, readers,
-sig, signer)` and `object_policy((did,cid) PK, …)`. `put_policy(verified)` writes
-after `verify_policy` (Phase 1) + a `seq`-monotonic guard in the same transaction;
-`resolve_policy(did, cid) -> ResolvedPolicy`. Defensive `ALTER`/migration as the
-existing store does. Readers stored as a canonical joined string (parsed on read).
-
-**Validation.** `Store` unit suite green; the existing `persist`/`wiring_persist`
-suites still green (additive schema).
-
-**Depends on.** Phase 1 (`verify_policy`, `PolicyRecord`).
+- **Goal:** persist verified policy per target; `resolve_policy` with finest-grain-wins,
+  monotonic supersede, fail-closed.
+- **Changes:**
+  - [ ] `src/persist.rs` — `namespace_policy(did PK,…)` + `object_policy((did,cid) PK,…)`
+    tables (in the init block); `save_policy(verified)` (seq-monotonic guard in-txn);
+    `resolve_policy(did, cid) -> ResolvedPolicy`.
+- **Call chain:** `server::dispatch → Store::resolve_policy` (Phase 3);
+  `PUT /policy handler → Store::save_policy` (Phase 5).
+- **Wiring test:** `tests/wiring_persist.rs` (or a new `wiring_policy`) proves
+  `save_policy`→`resolve_policy` round-trips through a real `Store`.
+- **Depends on:** Phase 1 (`verify_policy`, `PolicyRecord`).
+- **Read-set:** `src/policy.rs`.
+- **Write-set:** `src/persist.rs`.
+- **Shared-state contract:** the SQLite `Store` (in-process, `Arc<Mutex>`); additive
+  schema, no migration of existing rows.
+- **Risks:** a malformed stored row must fail closed (never widen); test explicitly.
+- **Done when:**
+  1. *Behavioral:* an object policy overrides a namespace policy which overrides the
+     `world` default; a higher `seq` supersedes, equal/lower is rejected; an
+     unparseable row resolves to the tighter of {stored, default}, never permissive.
+  2. *Verification:* `cargo test -p ciss --lib persist::` + the wiring test.
+- **Validation:** moderate — unit + wiring; confirm the existing `persist`/quota
+  suites stay green (additive schema).
 
 ### Phase 3 — Authorize reads at `dispatch` (the choke point)
 
-**Problem.** Reads are flat-allow today (`authorize` returns `Ok` for `GetObject`/
-`ListBlobs`). Enforcement must live at the single `server::dispatch`→`authorize`
-choke point so there is one place to reason about, and a denied read must not leak
-existence.
-
-**Done means (RED).** Unit + `wiring_*` tests on `authorize` for `GetObject`:
-- `world` (default, no policy) → allow — **PDS-compat unbroken** (regression guard);
-- `grantees`/`owner` → allow **iff** `principal.did == owner OR principal.did ∈
-  readers`;
-- a denied `GetObject` → **`404` (NotFound)**, never `403`/`401` (no existence
-  oracle, no auth-required hint);
-- an **anonymous** caller to a gated object → `404`;
-- the **owner** always reads its own gated object.
-
-**Build (GREEN).** `authorize` (and/or the `GetObject` handler) calls
-`state.store.resolve_policy(did, cid)` and evaluates membership against the
-`Principal`; deny maps to `ServerError::NotFound`. `GetObject` gains the `cid` it
-already has; keep the world default a fast path (no policy row → allow) so the
-common case adds one indexed lookup.
-
-**Validation.** All existing read flows (public read, atproto getBlob) still green;
-new gated-read unit/wiring green; `cargo clippy` clean.
-
-**Depends on.** Phase 2 (`resolve_policy`).
+- **Goal:** gate `getBlob`/object GET by policy; deny → 404; `world` unchanged.
+- **Changes:**
+  - [ ] `src/server.rs` — in `dispatch`, for read ops resolve
+    `state.store.resolve_policy(did, cid)` and evaluate membership against the
+    `Principal`; deny → `ServerError::NotFound`. Keep `authorize` a pure fn fed the
+    resolved policy (world → allow fast path when no row).
+- **Call chain:** `get_object_handler / pds getBlob → dispatch → resolve_policy →
+  authorize(policy, principal) → op_get_object | NotFound`.
+- **Wiring test:** `tests/wiring_s3_metered.rs` / `wiring_pds_blob.rs` extended (or a
+  new gated case) — a gated object GET through the real handler returns 404 to a
+  non-grantee and bytes to a grantee.
+- **Depends on:** Phase 2.
+- **Read-set:** `src/policy.rs`, `src/persist.rs`.
+- **Write-set:** `src/server.rs`.
+- **Shared-state contract:** none beyond the `Store` read; no route changes.
+- **Risks:** the world fast-path must add ≤1 indexed lookup on the hot path; a
+  regression that 404s a public read is a PDS-compat break — guarded explicitly.
+- **Done when:**
+  1. *Behavioral:* `world`/default → allow (public read unbroken); `grantees`/`owner`
+     → allow iff caller is owner or in `readers`; a non-grantee/anon gated GET → 404;
+     the owner always reads its own gated object.
+  2. *Verification:* `cargo test --test wiring_pds_blob --test wiring_s3_metered` +
+     `--lib server::` gated cases.
+- **Validation:** moderate — wiring + the pre-existing read flows still green.
 
 ### Phase 4 — `listBlobs` omission (no CID leak)
 
-**Problem.** `listBlobs` currently returns every CID for a DID — a gated namespace
-would leak the existence of hidden objects through the listing even if `getBlob`
-404s.
-
-**Done means (RED).** Unit + wiring for `ListBlobs` over a DID with mixed
-`world`/gated objects:
-- an **anonymous** caller sees only `world` objects;
-- a **grantee** sees `world` objects plus the ones granted to it;
-- the **owner** sees all;
-- a non-grantee sees none of the gated CIDs (the response neither lists nor counts
-  them).
-
-**Build (GREEN).** After building the CID list, filter each through
-`resolve_policy` + the Phase-3 membership check for the requesting `Principal`;
-emit only allowed CIDs. (Namespace-level `world` short-circuits the per-object
-check for the public case.)
-
-**Validation.** `listBlobs` public behavior unchanged for ungated DIDs; omission
-proven; no N+1 surprise (batch the policy lookups per DID).
-
-**Depends on.** Phase 3 (membership evaluation), Phase 2 (`resolve_policy`).
+- **Goal:** `listBlobs` returns only objects the caller may read.
+- **Changes:**
+  - [ ] `src/server.rs` — `op_list_blobs` filters each cid through `resolve_policy` +
+    the Phase-3 membership check for the requesting `Principal`; batch per DID.
+- **Call chain:** `pds listBlobs → dispatch → op_list_blobs → per-cid resolve_policy
+  + membership → filtered cids`.
+- **Wiring test:** `tests/wiring_pds_blob.rs` — listBlobs over a DID with mixed
+  public/gated objects returns only the caller-visible cids through the real handler.
+- **Depends on:** Phase 3 (membership), Phase 2.
+- **Read-set:** `src/policy.rs`, `src/persist.rs`.
+- **Write-set:** `src/server.rs`.
+- **Shared-state contract:** `Store` reads only.
+- **Risks:** N+1 policy lookups on large namespaces — batch the lookups per DID
+  (validate).
+- **Done when:**
+  1. *Behavioral:* anon sees only `world` cids; a grantee sees `world` + granted; the
+     owner sees all; hidden cids are neither listed nor counted.
+  2. *Verification:* `cargo test --test wiring_pds_blob -k listBlobs`.
+- **Validation:** moderate — wiring; ungated DIDs' listBlobs unchanged.
 
 ### Phase 5 — Set/change policy over HTTP (owner-signed)
 
-**Problem.** An owner needs to set and change policy over the wire, and the change
-must take effect on subsequent reads — with the same owner-signature discipline as
-the manifest.
+- **Goal:** an owner sets/changes policy over the wire; reads honor it live.
+- **Changes:**
+  - [ ] `src/server.rs` — `put_policy_handler` (namespace) + object variant: verify
+    (Phase 1) → `save_policy` (Phase 2); read-back `GET`; error mappings
+    (bad-sig/lower-seq → distinct 4xx).
+  - [ ] `src/server.rs` router — `PUT/GET /{did}/policy` and
+    `/{did}/objects/{cid}/policy` (mirror the manifest handler shape).
+- **Call chain:** `PUT /{did}/policy → put_policy_handler → verify_policy →
+  Store::save_policy`; subsequent `getBlob/listBlobs` reflect it via Phase 3–4.
+- **Wiring test:** the first `flow_gated_reads` step — set `grantees:[alice]` over
+  HTTP, then alice reads / bob 404s (proves the wire path reaches storage + gate).
+- **Depends on:** Phases 1–4.
+- **Read-set:** `src/policy.rs`, `src/persist.rs`, `src/pds_api.rs` (handler shape).
+- **Write-set:** `src/server.rs`.
+- **Shared-state contract:** `Store` writes (policy tables); no other unit/route.
+- **Risks:** owner-auth for the write (Open Q1) — v1 requires an `id:`-owner signed
+  record; a `did:` owner path is gated on Q1.
+- **Done when:**
+  1. *Behavioral:* over HTTP — set grantees→alice reads/bob 404; grant bob (higher
+     seq)→bob reads; revoke (higher seq)→bob 404; per-object `world` override makes
+     one blob public; wrong-signer/lower-seq refused; owner read-back works.
+  2. *Verification:* `cargo test --test flow_gated_reads` (the lifecycle steps).
+- **Validation:** broad — run the lifecycle over real HTTP in the harness; manifest/
+  quota handlers unaffected.
 
-**Done means (RED).** Wiring + the first flow steps:
-- `PUT /{did}/policy` with a valid owner-signed namespace record → stored; a
-  wrong-signer or lower-`seq` record → refused (4xx), access unchanged;
-- `PUT /{did}/objects/{cid}/policy` with a valid object record → stored;
-- after setting `grantees:[alice]`, `alice` reads and `bob`/anon `404`; after a
-  higher-`seq` grant of `bob`, `bob` reads; after a higher-`seq` revoke, `bob`
-  `404`s again;
-- a per-object `world` override in a gated namespace makes just that object public;
-- the owner can `GET` its current effective policy (read-back); a grantee's
-  read-back does not disclose the full `readers[]` (spec §6 disclosure choice).
+### Phase 6 — Flow corpus (permanent regression guards)
 
-**Build (GREEN).** The two policy routes (verify → `put_policy`) + read-back `GET`;
-`ServerError` mappings (bad signature/lower-seq → a distinct 4xx). Reuse the
-manifest handler shape (owner-signed body, `x-croft-pubkey`/service-auth identity).
+- **Goal:** the relational stories as permanent guards — **comprehensive on both
+  sides**: every *should-work* and every *should-NOT-work* is its own flow, so the
+  gate can never silently regress open. The should-NOT cases are the point.
+- **Changes:**
+  - [ ] `tests/flow_gated_reads.rs` — the full matrix:
+    - **Positive (should work):** owner reads own gated object; a grantee reads a
+      granted object; grant→read; revoke→re-grant→read; a per-object `world` override
+      exposes just that blob; a `world`/ungated object stays publicly readable
+      (PDS-compat regression guard — the gate never over-reaches).
+    - **Negative (should NOT — access denied):** anon → gated object = 404 (not the
+      bytes); a non-grantee `did:` → 404; a **revoked** grantee → 404 (revocation
+      actually bites); a gated object under a `world` namespace is still gated (the
+      default does not leak an object); cross-DID — alice's grant on *her* namespace
+      does not admit her to bob's gated namespace.
+    - **Negative (should NOT — leakage):** `listBlobs` omits every hidden cid for
+      anon/non-grantee (neither listed **nor** counted); a 404 is indistinguishable
+      from not-found (no existence oracle); a grantee's policy read-back does not
+      disclose the full `readers[]` (Open Q2).
+    - **Adversarial (should NOT — forgery/rollback):** a **forged** policy (attacker
+      signs a policy naming a victim's target) → refused, access unchanged; a
+      **replayed lower-`seq`** policy (an old permissive policy re-submitted to
+      un-revoke) → refused; a **tampered** policy (fields changed after signing) →
+      refused; a policy signed by a key that does not derive the target DID →
+      refused; **setting policy without owner authority** (anon/another DID) →
+      refused, no policy change.
+  - Each flow uses the intent-named `Outcome` asserts (`.refused(404)`, `.omits(cid)`,
+    `.returns(bytes)`); a should-NOT flow that *passes as allowed* fails loudly.
+- **Call chain:** the harness drives the real server end-to-end (World/Actor +
+  AtprotoActor as readers).
+- **Wiring test:** the file *is* the wiring corpus.
+- **Depends on:** Phases 1–5.
+- **Read-set:** `tests/common/mod.rs`.
+- **Write-set:** `tests/flow_gated_reads.rs` (+ small `tests/common/mod.rs` helpers
+  for a policy-PUT/Actor if needed).
+- **Shared-state contract:** ephemeral test servers (loopback), `Drop` cleanup.
+- **Risks:** none beyond harness flakiness; keep each flow hermetic.
+- **Done when:**
+  1. *Behavioral:* every listed story passes; a forged/replayed policy cannot widen
+     access.
+  2. *Verification:* `cargo test --test flow_gated_reads` (all green) + the 26
+     pre-existing flow tests still green.
+- **Validation:** broad — the corpus is the end-to-end proof.
 
-**Validation.** The lifecycle is live over real HTTP; existing manifest/quota
-handlers unaffected.
+### Phase 7 — Posture + ADR + spec/README (docs finalization)
 
-**Depends on.** Phases 1–4.
-
-### Phase 6 — Flow corpus + posture + ADR
-
-**Problem.** The relational stories (grant/revoke lifecycle, override, omission,
-adversarial policy) must be permanent regression guards, and the design intent must
-be recorded as invariants and a closed ADR question.
-
-**Done means (RED→GREEN, then docs).** `tests/flow_gated_reads.rs` over the
-World/Actor + AtprotoActor harness:
-- grant → read; revoke → `404`; per-object `world` override; `listBlobs` omission;
-  anon → `404`; owner-always; cross-DID denial (alice's grant does not admit her to
-  bob's namespace); a **forged** policy (attacker signs, names victim target) →
-  refused; a **replayed lower-`seq`** policy → refused (no silent un-revoke).
-
-**Build/docs.**
-- `SECURITY-POSTURE.md`: new invariants — owner-signed policy (Z-tier), authorize-
-  read-at-dispatch, `404`-on-deny (no existence oracle), `listBlobs` omission,
-  monotonic-`seq` anti-rollback; **close the §14.1 gated-read design gap**.
-- `ADR 0001 §2`: record the resolved grain decision (both, composed) + the
-  policy-record shape; link the spec.
-- `docs/spec/gated-reads.md`: flip settled sections from "planned build" to "live";
-  update the change log.
-
-**Validation.** `cargo test --workspace` + `cargo clippy --all-targets` clean; the
-26 pre-existing flow tests still green; the spec/posture/ADR agree.
-
-**Depends on.** Phases 1–5.
+- **Goal:** record the design intent as invariants and close the tracked gap.
+- **Changes:**
+  - [ ] `docs/SECURITY-POSTURE.md` — invariants: owner-signed policy, authorize-read-
+    at-dispatch, 404-on-deny, listBlobs omission, monotonic-seq anti-rollback; close
+    §14.1.
+  - [ ] `docs/adr/0001-…md` — resolved §2 grain decision + policy-record shape.
+  - [ ] `docs/spec/gated-reads.md` — flip settled sections to live; change log.
+  - [ ] `README.md` / `docs/ARCHITECTURE.md` — add the gated-read capability line.
+- **Call chain:** n/a (docs).
+- **Wiring test:** n/a.
+- **Depends on:** Phases 1–6 (documents what is now true + green).
+- **Read-set:** the built code (to describe it accurately).
+- **Write-set:** the four doc files.
+- **Shared-state contract:** none.
+- **Risks:** doc/code drift — write after green so claims are true.
+- **Done when:**
+  1. *Behavioral:* posture/ADR/spec/README agree with the shipped behavior; §14.1
+     gated-read gap is closed.
+  2. *Verification:* manual review; `cargo test --workspace` + `clippy` clean.
+- **Validation:** narrow — prose accuracy against the green suite.
 
 ## Rollout / risk
 
-- **Additive + reads-only.** No write path or existing read changes until a
-  non-`world` policy exists, so the increment can merge and deploy **dark**; gating
-  a namespace is then a data operation (an owner writes a policy), reversible by a
-  higher-`seq` `world` policy. Low blast radius.
-- **Perf.** The hot path adds one indexed policy lookup per read (short-circuited
-  for the `world` default). `listBlobs` batches lookups per DID. Watch the
-  `listBlobs` fan-out on large namespaces (Phase 4 validation).
-- **Deploy.** Ships in a normal CISS release (schema migration is additive; the
-  policy tables are created on open). No croft-stack change required.
+- **Additive + reads-only.** No write path or existing read changes until an owner
+  writes a non-`world` policy, so the increment merges and deploys **dark**; gating a
+  namespace is then a reversible data op (a higher-`seq` `world` policy un-gates).
+  Low blast radius.
+- **Perf.** One indexed policy lookup per read (short-circuited for the `world`
+  default); `listBlobs` batches per DID (Phase 4 validation watches fan-out).
+- **Deploy.** Normal CISS release; additive schema created on `Store` open. No
+  croft-stack change.
 
-## Design questions — resolved (2026-08-05)
+## Open Questions
 
-All settled; the integrator contract is `docs/spec/gated-reads.md`.
+- **[RECOMMENDED: PHASE-GATED (Phase 1)] Who may *set* policy in v1?** The
+  owner-signed-record model (Q2) verifies cleanly for `id:` owners (ed25519, they
+  hold the key, like the manifest). A `did:` owner authenticates via service-auth
+  JWT but does **not** hold a repo signing key client-side, so it cannot self-sign a
+  policy record. *Recommendation:* v1 **policy-setters are `id:` owners** (they hold
+  the key); **readers/grantees may be any DID** (`id:`/`did:plc`/`did:web`). A
+  `did:`-owner policy path (JWT-authorized, softening Q2 for that case) is a tracked
+  follow-on. This fits the likely v1 use case (history-convergence owned by a Croft
+  `id:`). *Rationale: surfaced by grounding — building owner-signed policy for `did:`
+  owners would hit a wall (no client-side repo key). Must be settled before Phase 1
+  fixes the signer type.*
+- **[RECOMMENDED: PHASE-GATED (Phase 5)] Grantee visibility of `readers[]`.** On
+  policy read-back, does a grantee see the full reader list, or only that it may
+  read? *Recommendation:* owner-only full visibility (a grantee learns only its own
+  access), to avoid leaking the grantee set. *Rationale: a disclosure choice, safe to
+  fix at the wire phase; spec §6 flagged it.*
 
-- **Read model (Q1):** three explicit classes `{world, grantees, owner}` +
-  `readers[]` of **explicit DIDs** (no groups/handles/nesting in v1). Owner always
-  allowed; authorization is a pure set-membership check.
-- **Policy transport (Q2):** a **dedicated owner-signed policy record**, separate
-  from the manifest (keeps the billing signature and the authz signature distinct;
-  makes per-object policy first-class). Submitted on its own endpoint.
-- **Range grain (Q3):** **deferred.** v1 covers namespace + object; range-scoped
-  policy is a tracked extension for when the history-convergence query surface is
-  concrete. The `target` is an opaque extensible string so a `<did>/range/<lo>-<hi>`
-  target slots in later without reshaping the record.
-- **Group model:** deferred; the static-DID-list (v1) vs dynamic-group-pointer
-  tension is recorded in the spec §8.1 so a later design starts from the tradeoff.
+## Review Log
 
-## Non-goals (tracked, not this increment)
-
-- Delegated **writes** (`write_class: grantees` enforcement) — a consent model.
-- Group/handle-based grants (vs explicit DID lists).
-- Gated namespaces on the public-replication surface (there is no
-  `subscribeRepos`/relay surface yet — SEAM).
-- `did:plc` signed-oplog verification (separate atproto follow-on).
+- **2026-08-05 — Pass 1 (phase-plan skill).** Built the base: problem, reasoning
+  (+rejected alternatives), Verified Assumptions (grounded firsthand in
+  `server.rs`/`manifest.rs`/`persist.rs`), Documentation Impact, Concurrency Map
+  (all sequential), seven phases with Call-chain/Wiring-test/Read-Write-sets/Done-when,
+  Rollout/risk. **Grounding surfaced two open questions** (id:-vs-did: policy-setting
+  authority; grantee readers[] visibility) and one design fact (the policy gate lands
+  in `dispatch`, not the pure `authorize`). Split the docs finalization into its own
+  Phase 7 (4-file rule). Pending: Pass 2 (gap analysis), Pass 3 (quality gates).
+- **2026-08-05 — Pass 1 addendum (user).** Made comprehensive **should-NOT**
+  coverage a first-class, cross-cutting requirement (regression protection): added a
+  Testing-doctrine note (every phase pairs allow+deny) and expanded Phase 6 into the
+  full positive/negative/leakage/adversarial matrix.
