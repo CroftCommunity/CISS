@@ -10,12 +10,21 @@
 
 mod common;
 
-use common::TestServer;
+use common::{TestServer, World, SERVICE_DID, SET_POLICY_LXM};
 
 use ciss::crypto::{derive_keypair, sha256_hex, Keypair};
 use ciss::identity::derive_id;
 use ciss::policy::{PolicyRecord, ReadClass};
 use ciss::server::{App, Blobs, Db};
+
+/// Unix seconds now (for minting custom-`exp` tokens in the Model-C flow).
+fn now_s() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 const MASTER: &str = "flow-gated-reads-master";
 
@@ -245,4 +254,125 @@ async fn id_owner_policy_lifecycle_over_http() {
     );
 
     server.shutdown().await;
+}
+
+/// Model C: a `did:` owner (external identity provider) sets a read policy by
+/// presenting a service-auth JWT — CISS verifies it and provider-attests the
+/// record. The gate then behaves identically to a Model-A (owner-signed) policy,
+/// and every JWT defect (wrong `lxm`/`aud`, expired, replayed, wrong target DID)
+/// is refused with no policy change.
+#[tokio::test]
+async fn did_owner_policy_via_service_auth_jwt() {
+    let world = World::spawn_atproto(&["owner"]).await;
+    let owner = world.atproto_actor("owner");
+    let owner_did = owner.did().to_owned(); // did:web:owner.test
+
+    // The `did:` owner uploads a blob to its namespace (atproto uploadBlob, JWT).
+    let secret = b"a model-c gated blob".to_vec();
+    owner.upload_blob(&secret).await.ok();
+    let hex = sha256_hex(&secret);
+
+    // Readers are `id:` personas (grantees may be any DID); they read via the S3
+    // surface with their session.
+    let alice = world.actor("alice");
+    let bob = world.actor("bob");
+    let anon = world.anonymous();
+
+    // The `did:` owner grants alice via a valid set-policy JWT (Model C).
+    let intent = serde_json::json!({
+        "read_class": "grantees",
+        "readers": [alice.did()],
+        "seq": 1,
+    })
+    .to_string();
+    owner
+        .put_policy_with_token(&owner_did, &owner.valid_set_policy_token("jti-set-1"), &intent)
+        .await
+        .ok();
+
+    // The gate behaves identically to Model A: alice reads, bob and anon 404.
+    alice.get_object(&owner_did, &hex).await.returns(&secret);
+    bob.get_object(&owner_did, &hex).await.refused(404);
+    anon.get_object(&owner_did, &hex).await.refused(404);
+
+    // --- Every JWT defect is refused, and access is unchanged (bob stays 404). ---
+    let assert_bob_still_denied = |w: &World| {
+        let owner_did = owner_did.clone();
+        let hex = hex.clone();
+        let bob = w.actor("bob");
+        async move { bob.get_object(&owner_did, &hex).await.refused(404) }
+    };
+
+    // Wrong lxm: a token minted for uploadBlob cannot set policy.
+    let wrong_lxm = owner.sign_token(
+        &owner_did,
+        SERVICE_DID,
+        "com.atproto.repo.uploadBlob",
+        now_s() + 300,
+        "jti-wrong-lxm",
+    );
+    owner
+        .put_policy_with_token(&owner_did, &wrong_lxm, &intent)
+        .await
+        .refused(403);
+    assert_bob_still_denied(&world).await;
+
+    // Wrong aud: a token minted for another service.
+    let wrong_aud = owner.sign_token(
+        &owner_did,
+        "did:web:evil.test",
+        SET_POLICY_LXM,
+        now_s() + 300,
+        "jti-wrong-aud",
+    );
+    owner
+        .put_policy_with_token(&owner_did, &wrong_aud, &intent)
+        .await
+        .refused(403);
+
+    // Expired token.
+    let expired = owner.sign_token(
+        &owner_did,
+        SERVICE_DID,
+        SET_POLICY_LXM,
+        now_s() - 10,
+        "jti-expired",
+    );
+    owner
+        .put_policy_with_token(&owner_did, &expired, &intent)
+        .await
+        .refused(403);
+
+    // Replayed jti: the same token used twice — the second use is refused.
+    let replay_tok = owner.valid_set_policy_token("jti-replay");
+    let higher = serde_json::json!({
+        "read_class": "grantees",
+        "readers": [alice.did(), bob.did()],
+        "seq": 2,
+    })
+    .to_string();
+    owner
+        .put_policy_with_token(&owner_did, &replay_tok, &higher)
+        .await
+        .ok();
+    // First use granted bob (seq 2); the replay (same jti) must be refused.
+    owner
+        .put_policy_with_token(&owner_did, &replay_tok, &higher)
+        .await
+        .refused(403);
+
+    // Wrong target: a valid token for owner cannot set policy on another DID's
+    // namespace (auth.did != target).
+    let victim = world.atproto_actor("owner"); // reuse the key; target a foreign DID
+    let foreign_did = "did:web:victim.test";
+    victim
+        .put_policy_with_token(
+            foreign_did,
+            &victim.valid_set_policy_token("jti-foreign"),
+            &intent,
+        )
+        .await
+        .refused(403);
+
+    world.shutdown().await;
 }

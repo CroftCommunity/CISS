@@ -65,6 +65,12 @@ const SESSION_HEADER: &str = "x-croft-session";
 /// a server-issued nonce; the [`Principal`] boundary does not change.
 const SESSION_CHALLENGE_PREFIX: &str = "ciss-session/v1/";
 
+/// The lexicon method id a Model-C set-policy service-auth JWT must be bound to
+/// (`lxm`). A CISS-defined method (Q2): the `did:` owner's provider signs a token
+/// authorizing exactly this action, so a token minted for another method cannot
+/// be replayed to set policy.
+pub(crate) const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -486,6 +492,16 @@ fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A verified Model-C set-policy authorization: the `did:` owner authenticated by
+/// a service-auth JWT (the JWT `iss`), plus the single-use `jti` that authorized
+/// the action (recorded on the attested record for audit). Produced by the async
+/// handler *before* dispatch, since JWT verification resolves the DID over the
+/// network and dispatch runs on the blocking pool.
+pub(crate) struct AuthedWrite {
+    did: String,
+    jti: Option<String>,
+}
+
 /// A request routed through the dispatch boundary.
 pub(crate) enum Op {
     PutObject {
@@ -515,12 +531,15 @@ pub(crate) enum Op {
         did: String,
     },
     /// Set/replace the read policy for a target (namespace when `cid` is `None`,
-    /// else a single object). The `body` is a serialized, owner-authorized
-    /// [`crate::policy::PolicyRecord`] (gated reads, Phase 5/6).
+    /// else a single object). Model A (`authed = None`): `body` is a serialized,
+    /// owner-signed [`crate::policy::PolicyRecord`]. Model C (`authed = Some`):
+    /// `body` is a [`crate::policy::PolicyIntent`] and CISS builds + provider-
+    /// attests the record for the JWT-authenticated `did:` owner.
     PutPolicy {
         did: String,
         cid: Option<String>,
         body: Vec<u8>,
+        authed: Option<AuthedWrite>,
     },
     /// Read back a target's policy record (owner-only reader-set visibility, Q4).
     GetPolicy {
@@ -648,19 +667,31 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// attempt failed. Tokens and keys are never logged — only DIDs (public), the
 /// method, and the reason.
 async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principal {
+    verify_service_auth_full(state, jwt, lxm).await.0
+}
+
+/// As [`verify_service_auth`], but also returns the verified token's `jti` on
+/// success — for callers that record which single-use token authorized an action
+/// (Model C provider attestation). Returns `(Principal::Anonymous, None)` on any
+/// failure.
+async fn verify_service_auth_full(
+    state: &AppState,
+    jwt: &str,
+    lxm: &str,
+) -> (Principal, Option<String>) {
     let Ok(iss) = ciss_auth::peek_iss(jwt) else {
         tracing::info!(lxm, reason = "malformed token", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     };
     // The `iss` must be an atproto `did:*`, never an internal `id:` (Phase 1
     // space typing): the atproto plane cannot assert a native identifier.
     let Ok(did) = Did::parse(&iss) else {
         tracing::info!(%iss, lxm, reason = "malformed iss", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     };
     if did.require_atproto().is_err() {
         tracing::info!(%iss, lxm, reason = "iss not an atproto did", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     }
     let now = now_unix_s();
     let params = ServiceAuthParams {
@@ -673,26 +704,26 @@ async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principa
     // key (survives a key rotation between cache-fill and now).
     let Ok(keys) = state.resolver.resolve(&iss, false).await else {
         tracing::info!(%iss, lxm, reason = "did resolution failed", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     };
     let verified = match ciss_auth::verify_service_auth_jwt(jwt, &keys, &params) {
         Ok(v) => v,
         Err(ciss_auth::JwtError::SignatureInvalid) => {
             let Ok(fresh) = state.resolver.resolve(&iss, true).await else {
                 tracing::info!(%iss, lxm, reason = "did resolution failed", "service-auth denied");
-                return Principal::Anonymous;
+                return (Principal::Anonymous, None);
             };
             match ciss_auth::verify_service_auth_jwt(jwt, &fresh, &params) {
                 Ok(v) => v,
                 Err(reason) => {
                     tracing::info!(%iss, lxm, %reason, "service-auth denied");
-                    return Principal::Anonymous;
+                    return (Principal::Anonymous, None);
                 }
             }
         }
         Err(reason) => {
             tracing::info!(%iss, lxm, %reason, "service-auth denied");
-            return Principal::Anonymous;
+            return (Principal::Anonymous, None);
         }
     };
     // Replay defense: a token carrying a `jti` is single-use within its window.
@@ -703,12 +734,13 @@ async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principa
             .is_err()
         {
             tracing::info!(%iss, lxm, reason = "replayed jti", "service-auth denied");
-            return Principal::Anonymous;
+            return (Principal::Anonymous, None);
         }
     }
     // Grant: this DID is authorized for this method (the auth-impacting decision).
     tracing::debug!(did = %verified.did, lxm, aud = %state.service_did, "service-auth granted");
-    verified.principal()
+    let jti = verified.jti.clone();
+    (verified.principal(), jti)
 }
 
 /// The current time in unix seconds (for JWT `exp`).
@@ -860,7 +892,12 @@ pub(crate) fn dispatch(
         Op::GetManifest { did } => op_get_manifest(state, &did),
         Op::GetMeter { did } => op_get_meter(state, &did),
         Op::ListBlobs { did } => op_list_blobs(state, principal, &did),
-        Op::PutPolicy { did, cid, body } => op_put_policy(state, &did, cid.as_deref(), &body),
+        Op::PutPolicy {
+            did,
+            cid,
+            body,
+            authed,
+        } => op_put_policy(state, &did, cid.as_deref(), &body, authed.as_ref()),
         Op::GetPolicy { did, cid } => op_get_policy(state, principal, &did, cid.as_deref()),
     }
 }
@@ -1181,15 +1218,42 @@ fn op_put_policy(
     did: &str,
     cid: Option<&str>,
     body: &[u8],
+    authed: Option<&AuthedWrite>,
 ) -> Result<OpOutcome, ServerError> {
-    let record: PolicyRecord = serde_json::from_slice(body)
-        .map_err(|_| ServerError::BadPolicy("body is not a valid policy record"))?;
-
-    // The record's target must match the route — a caller cannot set a policy for
-    // a DID/object other than the one the URL names.
-    if record.did() != did || record.cid() != cid {
-        return Err(ServerError::BadPolicy("policy target does not match the route"));
-    }
+    let record = if let Some(auth) = authed {
+        // Model C: a `did:` owner authorized the action via a service-auth JWT
+        // (verified in the async handler). CISS builds the record from the intent
+        // and counter-signs it with its dedicated attestation key, so the stored
+        // record is durably verifiable without re-checking the JWT.
+        //
+        // The JWT must have authenticated the DID that owns the target.
+        if auth.did != did {
+            tracing::info!(
+                actor = %auth.did, resource = %did, reason = "did != target",
+                "policy-set denied"
+            );
+            return Err(ServerError::PolicyUnauthorized);
+        }
+        let intent: crate::policy::PolicyIntent = serde_json::from_slice(body)
+            .map_err(|_| ServerError::BadPolicy("body is not a valid policy intent"))?;
+        PolicyRecord::attest_provider(
+            did,
+            cid,
+            intent.read_class,
+            &intent.readers,
+            intent.seq,
+            auth.jti.as_deref().unwrap_or(""),
+            &state.provider.attest_keypair,
+        )
+    } else {
+        // Model A: an `id:` owner submitted a full self-signed record.
+        let record: PolicyRecord = serde_json::from_slice(body)
+            .map_err(|_| ServerError::BadPolicy("body is not a valid policy record"))?;
+        if record.did() != did || record.cid() != cid {
+            return Err(ServerError::BadPolicy("policy target does not match the route"));
+        }
+        record
+    };
 
     let store = lock_store(&state.store);
     let prior_seq = store.policy_seq(did, cid)?;
@@ -1206,9 +1270,10 @@ fn op_put_policy(
         }
     }
 
-    // Authorization: the record's own signature must verify (OwnerSigned derives
-    // the id: target; a ProviderAttested record verifies under the provider's
-    // dedicated attestation key). seq was already checked above, so pass None.
+    // Authorization + structural validation: the record must verify (OwnerSigned
+    // derives the id: target; ProviderAttested verifies under the provider's
+    // dedicated attestation key). This also enforces readers-well-formed, so a
+    // malformed Model-C intent is refused here. seq was checked above, so None.
     if !verify_policy(&record, None, &state.provider.attest_verifying_key()) {
         tracing::info!(
             resource = %did, cid = ?cid, reason = "unauthorized policy",
@@ -1348,15 +1413,41 @@ async fn get_manifest_handler(
     dispatch_blocking(&state, Principal::Anonymous, Op::GetManifest { did: did.into_string() }).await
 }
 
-/// `PUT /{did}/policy` — set the namespace read policy. The body is a
-/// self-authorizing [`PolicyRecord`] (`op_put_policy` verifies it); no session
-/// header is needed, exactly like `put_manifest_handler`.
+/// Resolve the set-policy authorization from the request headers. A `Bearer`
+/// service-auth JWT selects **Model C** (a `did:` owner): it is verified here
+/// (async — DID resolution) against the `SET_POLICY_LXM` method, yielding the
+/// authenticated DID + `jti`. A present-but-invalid JWT is a hard 403. No bearer
+/// selects **Model A** (the body carries a self-signed record instead).
+async fn policy_write_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<AuthedWrite>, ServerError> {
+    match bearer_token(headers) {
+        Some(jwt) => {
+            let (principal, jti) = verify_service_auth_full(state, jwt, SET_POLICY_LXM).await;
+            match principal.did() {
+                Some(did) => Ok(Some(AuthedWrite {
+                    did: did.to_owned(),
+                    jti,
+                })),
+                None => Err(ServerError::PolicyUnauthorized),
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// `PUT /{did}/policy` — set the namespace read policy. Model A: the body is a
+/// self-signed [`PolicyRecord`]. Model C: a `Bearer` service-auth JWT authorizes
+/// a `did:` owner and the body is a [`crate::policy::PolicyIntent`].
 async fn put_policy_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
+    let authed = policy_write_auth(&state, &headers).await?;
     dispatch_blocking(
         &state,
         Principal::Anonymous,
@@ -1364,19 +1455,22 @@ async fn put_policy_handler(
             did: did.into_string(),
             cid: None,
             body: body.to_vec(),
+            authed,
         },
     )
     .await
 }
 
-/// `PUT /{did}/objects/{addr}/policy` — set a per-object read policy.
+/// `PUT /{did}/objects/{addr}/policy` — set a per-object read policy (Model A or C).
 async fn put_object_policy_handler(
     State(state): State<AppState>,
     Path((did, addr)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     let addr = ContentAddr::parse(&addr)?;
+    let authed = policy_write_auth(&state, &headers).await?;
     dispatch_blocking(
         &state,
         Principal::Anonymous,
@@ -1384,6 +1478,7 @@ async fn put_object_policy_handler(
             did: did.into_string(),
             cid: Some(addr.into_string()),
             body: body.to_vec(),
+            authed,
         },
     )
     .await

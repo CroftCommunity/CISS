@@ -109,6 +109,22 @@ pub enum Authorization {
     ProviderAttested(ProviderAttested),
 }
 
+/// A Model-C policy **intent**: the wire body a `did:` owner submits alongside its
+/// service-auth JWT. It carries no authorization of its own — the JWT authorizes
+/// the *action*, and CISS builds and provider-attests the [`PolicyRecord`] from
+/// these fields. (An `id:` owner submits a full signed `PolicyRecord` instead.)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyIntent {
+    /// The requested read class.
+    pub read_class: ReadClass,
+    /// The requested reader DID list (empty for `World`/`Owner`).
+    #[serde(default)]
+    pub readers: Vec<String>,
+    /// The monotonic sequence number the owner intends this policy to take.
+    pub seq: u64,
+}
+
 /// A signed read-policy record for a namespace or a single object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

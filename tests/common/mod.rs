@@ -29,6 +29,10 @@ pub const SERVICE_DID: &str = "did:web:ciss.test";
 /// The XRPC method the atproto upload path binds `lxm` to.
 pub const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
 
+/// The lexicon method a Model-C set-policy service-auth JWT binds to (mirrors
+/// `ciss::server::SET_POLICY_LXM`).
+pub const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+
 /// A running test server bound to an ephemeral port, driven over real HTTP.
 pub struct TestServer {
     /// The bound loopback address (ephemeral port).
@@ -457,6 +461,30 @@ impl AtprotoActor {
     pub async fn upload_blob(&self, bytes: &[u8]) -> Outcome {
         let token = self.valid_upload_token(&jti_for(bytes));
         self.upload_blob_with_token(&token, bytes).await
+    }
+
+    /// A valid set-policy token (Model C): `iss`=self, `aud`=service,
+    /// `lxm`=setPolicy, unexpired.
+    pub fn valid_set_policy_token(&self, jti: &str) -> String {
+        self.sign_token(&self.key.did, SERVICE_DID, SET_POLICY_LXM, now_s() + 300, jti)
+    }
+
+    /// `PUT /{target_did}/policy` presenting `token` as the bearer and a
+    /// [`ciss::policy::PolicyIntent`] JSON body (Model C).
+    pub async fn put_policy_with_token(
+        &self,
+        target_did: &str,
+        token: &str,
+        intent_json: &str,
+    ) -> Outcome {
+        let url = format!("{}/{target_did}/policy", self.base);
+        Actor::run(
+            self.client
+                .put(url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(intent_json.to_owned()),
+        )
+        .await
     }
 }
 
