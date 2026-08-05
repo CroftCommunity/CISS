@@ -41,7 +41,7 @@ the core value proposition *is* a set of cryptographic integrity guarantees.
 | The customer (a DID) | signing their own manifest | byte counts; owning another DID; a manifest's byte total | provider-measured receipts; owner authz; signed+bound preimage |
 | The provider | signing receipts (own-side measurement) | the rent base (the customer's manifest is authoritative) | customer recomputes rent from their own signed doc |
 | The network / any caller | delivering requests | identity, authorization, honesty of any field | signatures, content addressing, boundary validation |
-| plc.directory / DNS (future) | resolving non-admin DIDs | resolving admin DIDs; being available/untampered | pinned admin keys + fail-closed cache (ADR 0001 §5, not yet built) |
+| plc.directory / DNS | resolving non-admin DIDs | resolving admin DIDs; being available/untampered | pinned admin keys + fail-closed TTL cache (`ciss-resolve`; the admin-pin file is provisioned-but-empty, DEPLOYMENT §2 TODO) |
 
 The two load-bearing ideas: **meter the boundary, not the machine** (a blind
 backend can't forge a bill or slip a bad blob past Layer 2), and **provenance
@@ -303,10 +303,13 @@ inside the hardened sandbox (§11).
 ## 14. Standing design gaps (not bugs)
 
 1. **Gated-read namespaces** (Z-tier beyond the flat default) — specified,
-   unbuilt. Content that must not be public has no enforcement yet.
-2. **atproto identity** — `did:plc`/`did:web` OAuth/DPoP + DID resolution (TTL
-   cache, fail-closed, pinned-admin break-glass). Interim is `id:`-only and
-   replay-limited.
+   unbuilt. Content that must not be public has no enforcement yet. (Authentication
+   for both identity spaces is built; this is the *authorization*-layer gap.)
+2. **atproto identity residuals** — the `did:plc`/`did:web` service-auth path is
+   built (§4, A3–A7). Remaining follow-ons: `did:plc` signed-oplog verification (so
+   a poisoned directory cannot forge current key state), DPoP access tokens
+   (Model M2), and populating the admin-pin break-glass file. The `id:` session is
+   still nonce-unbound (replay-limited).
 3. **Global disk ceiling (ops backstop)** — the app-level store ceiling (V4) is
    enforced, but a *box-level* disk quota/alert on `/var/lib/ciss` still
    complements it. An ops item, not app code. (The per-DID quota gap from V5 is

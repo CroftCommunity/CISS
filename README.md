@@ -85,13 +85,17 @@ cargo run -- --data-dir ./data --listen 127.0.0.1:8080
 # or CISS_PROVIDER_SEED), never the database. See docs/SECURITY-POSTURE.md §9.
 ```
 
-A metered round-trip over the S3 surface:
+A metered round-trip over the S3 surface. **Reads of world-readable namespaces are
+public; writes and the billing meter are authenticated (owner-only, ADR 0001)** —
+so the write and meter calls need `$AUTH`: either an `id:` signed session
+(`x-croft-pubkey` + `x-croft-session` over the session challenge) or a `did:`
+service-auth JWT bearer. Anonymous writes/meter are `401` by design.
 
 ```sh
 CID=$(printf 'hello' | shasum -a 256 | cut -d' ' -f1)
-curl -X PUT --data-binary 'hello' http://127.0.0.1:8080/id:me/objects/greeting
-curl http://127.0.0.1:8080/id:me/objects/$CID      # -> hello
-curl http://127.0.0.1:8080/id:me/meter             # -> receipt tally
+curl -X PUT $AUTH --data-binary 'hello' http://127.0.0.1:8080/id:me/objects/greeting  # owner-only
+curl http://127.0.0.1:8080/id:me/objects/$CID      # -> hello  (public read)
+curl $AUTH http://127.0.0.1:8080/id:me/meter       # -> receipt tally (owner-only)
 ```
 
 Operator storage usage (a read-only report over the `did_usage` surface — store
@@ -102,13 +106,19 @@ cargo run -- usage --data-dir ./data            # all DIDs
 cargo run -- usage --data-dir ./data --did id:me # one DID
 ```
 
-The same round-trip over the atproto surface (a real CIDv1 comes back):
+The same over the atproto surface. `uploadBlob` is authenticated: the bearer is a
+**service-auth JWT** (Model R — `iss`=caller DID, `aud`=`did:web:ciss.croft.ing`,
+`lxm`=`com.atproto.repo.uploadBlob`, signed by the caller's repo key), verified
+against the DID-resolved key. A bare `Bearer did:plc:me` authenticates as nobody
+(`401`). `getBlob`/`listBlobs` are public reads.
 
 ```sh
-LINK=$(curl -s -X POST -H 'Authorization: Bearer did:plc:me' \
+# uploadBlob (authenticated) — $JWT is a service-auth JWT for aud=did:web:ciss.croft.ing:
+LINK=$(curl -s -X POST -H "Authorization: Bearer $JWT" \
   --data-binary 'hello' \
   http://127.0.0.1:8080/xrpc/com.atproto.repo.uploadBlob \
   | sed -E 's/.*"\$link":"([^"]+)".*/\1/')
+# public reads (no auth):
 curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.getBlob?did=did:plc:me&cid=$LINK"  # -> hello
 curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.listBlobs?did=did:plc:me"          # -> {"cids":[...]}
 ```
@@ -156,9 +166,16 @@ everything else itself:
 | `--data-dir <path>` | `./data` | Root of all state. `meter.sqlite`, `blocks/`, `tmp/` live here. Created on start. |
 | `--listen <host:port>` | `127.0.0.1:8080` | Bind address. Always a port ≥ 1024 (TLS is Caddy's job). |
 
-- The **provider key seed** is generated on first start and persisted in
-  `meter.sqlite`, so the signing identity survives a backup/restore with no
-  external secret wiring. `SEAM:` a real deployment loads it from a KMS.
+- The **provider signing seed** is supplied by the unit as a secret — a systemd
+  credential (`$CREDENTIALS_DIRECTORY/provider-seed`) or `CISS_PROVIDER_SEED` — and
+  is **never stored in the database** (finding I8); under systemd the service
+  **fails closed** if neither is present. Only the **public** key is persisted to
+  `meter.sqlite`, as a durable verification anchor. See `docs/SECURITY-POSTURE.md`
+  §9 and `docs/DEPLOYMENT.md` §3.
+- Atproto-identity config (Model R) is env-driven with safe defaults:
+  `CISS_SERVICE_DID` (default `did:web:ciss.croft.ing`), `CISS_PLC_DIRECTORY_URL`,
+  `CISS_DID_RESOLVE_TIMEOUT_MS`, `CISS_DID_CACHE_TTL_S`, and the pinned-admin
+  break-glass file `CISS_ADMIN_PINS_FILE`. See `docs/DEPLOYMENT.md`.
 - A systemd **socket-activation** fd is inherited when offered
   (`LISTEN_FDS`/`LISTEN_PID`); **SIGTERM** triggers a graceful drain + a WAL
   checkpoint before exit.
@@ -191,11 +208,17 @@ src/
   clock.rs         a deterministic day clock (time advances only when told)
   rng.rs           a seeded deterministic PRNG (mulberry32; bit-exact parity)
   persist.rs       per-DID SQLite (manifests, receipts, statements, meta kv)
+  did_resolver.rs  production DID-resolver composition (reqwest fetcher + wiring)
+crates/            # the authentication surface, split from the metering core
+  ciss-auth/       pure crypto: id: session + did: service-auth JWT verify, replay
+  ciss-resolve/    DID resolution (did:plc/did:web) behind a fail-closed DidResolver
 tests/
   e0..e9_*.rs      per-tier behavioral suites (the E0–E9 oracle parity)
   e86_abuse.rs     end-to-end abuse suite (forge/replay/tamper/walkaway/…)
   wiring_*.rs      anti-dead-code gates: s3_metered, pds_blob, contract, persist, checkpoint
-docs/              ARCHITECTURE.md, DEPLOYMENT.md
+  flow_*.rs        the workflow tier (World/Actor personas; incl. flow_atproto_identity)
+docs/              ARCHITECTURE.md, DEPLOYMENT.md, SECURITY-POSTURE.md,
+                   TESTING-STRATEGY.md, adr/, notes/
 ```
 
 ## Testing & quality gates
@@ -228,6 +251,12 @@ the incident runbook (list / disable / enable a fronted backend).
 
 ## Security posture (summary)
 
+- **Verified identity, not asserted.** A caller acts only as a DID it can prove:
+  an `id:` signed session, or a `did:plc`/`did:web` **service-auth JWT** (Model R)
+  verified against the caller's DID-resolved key. CISS is an atproto resource
+  server (it serves its own `did:web:ciss.croft.ing`) — it issues nothing. Writes
+  and the meter are owner-only; public reads stay public (PDS-compat). See
+  `docs/SECURITY-POSTURE.md` §4 (A1–A7).
 - **Untrusted backend.** Layer 1 is never trusted; Layer 2 re-verifies content
   addresses on read, so tamper-at-rest is caught and named.
 - **No key leakage.** Signing keys are `Zeroize`d and never `Debug`-printed or
