@@ -1,6 +1,6 @@
 # Plan — gated reads (the authorization layer)
 
-- **Date:** 2026-08-05 · **Status:** Pass 1 complete (phase-plan skill) · **TDD-first**
+- **Date:** 2026-08-05 · **Status:** Pass 3 complete — ready for execution (phase-plan skill) · **TDD-first**
 - **Owns:** ADR 0001 §2 (namespace mode bits) + its grain reopening; closes the
   standing gap `SECURITY-POSTURE.md` §14.1. **Contract:** `docs/spec/gated-reads.md`.
 
@@ -48,8 +48,10 @@ oracle, and `listBlobs` must not enumerate hidden objects.
     (`iss`=owner DID, `aud`=CISS, `lxm`=the set-policy method, ~60s) — the provider
     vouches, via the owner's repo key, that the owner authorized a set-policy *action*.
     CISS verifies that JWT (reusing the Model-R path already built), then
-    **counter-signs the resulting policy record with the provider key** (domain-
-    separated preimage) so the stored record is durably verifiable on later reads.
+    **counter-signs the resulting policy record with a dedicated provider *attestation*
+    key** (`derive_keypair(seed, "policy-attest")` — same master seed, distinct label,
+    so the receipt/billing key stays single-purpose; see Open Q3) over a
+    domain-separated preimage so the stored record is durably verifiable on later reads.
   - *Why both, now (vs deferring C):* the two use cases split across the two owner
     populations — history-convergence is `id:`-owned (A), private-PDS per-object
     sharing is external-provider-owned (C) — so shipping only A would leave the
@@ -101,27 +103,33 @@ Confirmed firsthand against the code (2026-08-05):
     accepts an **arbitrary `lxm`** and runs the full peek→resolve→`verify_service_auth_jwt`
     →`ReplayGuard` path; `ServiceAuthParams::expected_lxm` is matched at
     `crates/ciss-auth/src/service_jwt.rs:113`. Phase 6 reuses it with `SET_POLICY_LXM`.
-  - The **provider signing key is reachable**: `Provider` holds a `keypair`
+  - The **provider signing primitive is reachable**: `Provider` holds a `keypair`
     (`src/server.rs:88`, `derive_keypair(seed,"provider")`), and `crypto::Keypair`
     exposes `sign_message(&str) -> hex` (`src/crypto.rs:75`), already used to sign
-    receipts (`src/receipts.rs:282`). Phase 6 adds a `Provider::attest_policy` method
-    over that primitive.
+    receipts (`src/receipts.rs:282`). **[Q3 resolved]** Phase 6 adds a **second derived
+    key** `attest_keypair = derive_keypair(seed, "policy-attest")` (same seed, distinct
+    label — no new secret at rest, no croft-stack change) and a `Provider::attest_policy`
+    method over *that* key, leaving the receipt `keypair` single-purpose (billing/metering
+    only).
   - `AppState` already carries the `resolver` and `ReplayGuard` (from the deployed
     atproto increment), so Phase 6 needs no new wiring for JWT verification.
-  - **Signature domains stay disjoint:** receipts sign a bare content-hash, manifests
-    sign `ciss/v1/manifest:…`, policy (A) `ciss/v1/policy:…`, attestation (C)
-    `ciss/v1/policy-attest:…` — no cross-context confusion.
+  - **Signatures stay disjoint by *both* key and domain:** receipts (receipt key,
+    bare content-hash), manifests (customer key, `ciss/v1/manifest:…`), policy A (owner
+    ed25519 key, `ciss/v1/policy:…`), attestation C (**dedicated `policy-attest` key**,
+    `ciss/v1/policy-attest:…`) — no cross-context confusion at either the key or the
+    preimage level.
 
 ## Documentation Impact
 
-- `docs/spec/gated-reads.md` — flip `[PLANNED build]` sections to live as they land:
-  §3/§5 in **Phase 3–4**, §4.1 + §6 wire across **Phase 5–6** (A then C); change log each time.
-- `docs/SECURITY-POSTURE.md` — new invariants + close §14.1 gap in **Phase 7**.
+- `docs/spec/gated-reads.md` — flip `[PLANNED build]` sections to live **same-phase as
+  they land** (Pass 3): §3/§5 in **Phase 3–4**, §4/§4.1(A)/§6 across **Phase 5–6**
+  (A then C); each phase change-logs its own flip; **Phase 8** is the finalization sweep.
+- `docs/SECURITY-POSTURE.md` — new invariants + close §14.1 gap in **Phase 8**.
 - `docs/adr/0001-auth-and-access-control-model.md` — record the resolved §2 grain
-  decision + policy-record shape in **Phase 7**.
+  decision + policy-record shape in **Phase 8**.
 - `README.md` / `docs/ARCHITECTURE.md` — grepped: describe reads as "world-readable"
   (README security summary, ARCH §5). Add the gated-read capability line in
-  **Phase 7** (search terms: `world-readable`, `listBlobs`, `Z1`).
+  **Phase 8** (search terms: `world-readable`, `listBlobs`, `Z1`).
 - No croft-stack doc impact (additive, in-repo schema; no deploy/unit change).
 
 ## Concurrency Map
@@ -141,6 +149,39 @@ grantee-sees vs non-grantee-omitted; Phase 5: grant-works vs wrong-signer-refuse
 and Phase 6 is the comprehensive matrix. A regression that opens the gate must break
 a test, by construction.
 
+**[Pass 3] Order within a phase (RED first):** the `Done when` behavioral cases are
+written **first, as failing tests** — they must be RED against the pre-phase code —
+*then* the `Changes` checkboxes make them GREEN. The `Changes` list is the GREEN
+target, not the starting point; do not read the phase top-to-bottom as
+"code-then-test." Where a `Done when` names boundary edges (Phase 1/2/5 `seq`
+monotonicity: equal and lower rejected, higher supersedes), the test asserts **both
+failing edges and the passing one** so a one-line mutation to the comparator breaks it.
+
+**[Pass 3] Observability (cross-cutting) — the gate must log its decisions.** A gated
+read denies by returning **404**, which is *by design indistinguishable on the wire*
+from "object does not exist" (Reasoning: oracle-free denial). That opacity is correct
+for the caller and a debugging blind spot for the operator: after deploy, the **log is
+the only way to tell "denied by policy" from "genuinely absent."** So every
+authorization decision this increment adds emits a structured `tracing` event, matching
+the atproto increment's established pattern (`src/server.rs:601-720`):
+
+- **Denials at `INFO`** with a `reason`: `tracing::info!(resource = %did, %cid, actor
+  = %principal, reason = "not a grantee" | "unparseable policy row" | "wrong signer" |
+  "lower seq" | "did != target", "gated-read denied" | "policy-set denied")`.
+- **Grants/writes at `DEBUG`**: `tracing::debug!(resource = %did, %cid, read_class,
+  "gated-read granted")` and `tracing::debug!(resource = %did, seq, form = "OwnerSigned"
+  | "ProviderAttested", "policy stored")`.
+- **`listBlobs` omission at `DEBUG`** with a count only: `tracing::debug!(%did, shown,
+  hidden, "listBlobs filtered")` — the *count* of hidden cids, never the cids.
+- **Never log** the `readers[]` set (leaks the grantee list — the very thing the
+  owner-only visibility rule guards) or any signing/provider key material. Log the
+  target DID, cid, the requesting
+  principal, the decision, and the reason — nothing that widens disclosure.
+
+Log levels ride journald (INFO default in prod, DEBUG opt-in) — no new sink, no new
+config; denials are visible at the normal running level, grant-tracing is available
+when a level is turned up to debug a false-deny.
+
 ### Phase 1 — The signed policy record (pure)
 
 - **Goal:** a `PolicyRecord` that verifies under **either** authorization form
@@ -150,11 +191,12 @@ a test, by construction.
     authorization }` where `authorization = OwnerSigned{signer, sig} |
     ProviderAttested{owner_did, authorizing_jti, provider_sig}`;
     `ReadClass{World,Grantees,Owner}`; `verify_policy(record, prior_seq,
-    provider_pubkey)`:
+    provider_attest_pubkey)`:
     - `OwnerSigned` → verify ed25519 `sig` over `ciss/v1/policy:<target>:<seq>:…`
       and `derive_id(signer) == target-DID` (Model A, `id:` owner);
-    - `ProviderAttested` → verify the **provider** `sig` over
-      `ciss/v1/policy-attest:<owner_did>:<target>:<seq>:…` under `provider_pubkey`
+    - `ProviderAttested` → verify the `provider_sig` over
+      `ciss/v1/policy-attest:<owner_did>:<target>:<seq>:…` under the **dedicated
+      `policy-attest` pubkey** (`provider_attest_pubkey`, not the receipt key — Q3)
       (Model C — CISS's durable attestation that it checked a valid owner JWT).
   - [ ] `src/lib.rs` — `pub mod policy;`.
 - **Call chain:** (none yet — pure module; wired at Phase 2 `put_policy` / Phase 3
@@ -216,6 +258,14 @@ a test, by construction.
     `save_policy`; the stored row is trusted (CISS's own SQLite). Reads do a single
     indexed lookup + set-membership — no per-read crypto on the hot path. An
     unparseable stored row fails **closed** (deny), never widens (Phase 2 guarantee).
+  - **[Pass 3] Logging:** on the deny branch emit `tracing::info!(resource = %did,
+    %cid, actor = %principal, reason = "not a grantee" | "unparseable policy row",
+    "gated-read denied")`; on the gated-allow branch `tracing::debug!(resource = %did,
+    %cid, read_class, "gated-read granted")`. The `world` fast-path stays silent (no
+    per-public-read log). This is the trace that distinguishes a policy-404 from a
+    genuine not-found after deploy.
+- **[Pass 3] Docs (same-phase):** flip `docs/spec/gated-reads.md` §3 (read model) and
+  §5 (denial → 404) from `[PLANNED build]` to live; change-log the flip.
 - **Call chain:** `get_object_handler / pds getBlob → dispatch → resolve_policy →
   authorize(policy, principal) → op_get_object | NotFound`.
 - **Wiring test:** `tests/wiring_s3_metered.rs` / `wiring_pds_blob.rs` extended (or a
@@ -241,6 +291,12 @@ a test, by construction.
 - **Changes:**
   - [ ] `src/server.rs` — `op_list_blobs` filters each cid through `resolve_policy` +
     the Phase-3 membership check for the requesting `Principal`; batch per DID.
+  - **[Pass 3] Logging:** after filtering, `tracing::debug!(%did, shown, hidden,
+    "listBlobs filtered")` — the *counts* only, never the omitted cids (logging a
+    hidden cid would re-create the leak the omission exists to prevent). `hidden == 0`
+    still logs at debug so a "why did nothing get filtered" question is answerable.
+- **[Pass 3] Docs (same-phase):** flip `docs/spec/gated-reads.md` §5's `listBlobs`
+  omission paragraph to live; change-log the flip.
 - **Call chain:** `pds listBlobs → dispatch → op_list_blobs → per-cid resolve_policy
   + membership → filtered cids`.
 - **Wiring test:** `tests/wiring_pds_blob.rs` — listBlobs over a DID with mixed
@@ -263,10 +319,21 @@ a test, by construction.
   reads honor it live.
 - **Changes:**
   - [ ] `src/server.rs` — `put_policy_handler` (namespace) + object variant:
-    `verify_policy` (`OwnerSigned`) → `save_policy`; read-back `GET`; error mappings
-    (bad-sig/lower-seq → distinct 4xx).
+    `verify_policy` (`OwnerSigned`) → `save_policy`; error mappings (bad-sig/lower-seq
+    → distinct 4xx).
+  - [ ] `src/server.rs` — read-back `GET` with **[Q4] owner-only `readers[]`
+    visibility**: the owner (authenticated set/modify authority) sees the full record
+    incl. `readers[]`; a grantee sees only `{read_class, may_read: true}` — never the
+    reader set; an anon/non-grantee gets 404 (same oracle-free denial as a blob read).
   - [ ] router — `PUT/GET /{did}/policy` and `/{did}/objects/{cid}/policy` (mirror the
     manifest handler shape).
+  - **[Pass 3] Logging:** on accept, `tracing::debug!(resource = %did, seq, form =
+    "OwnerSigned", read_class, "policy stored")`; on refusal, `tracing::info!(resource
+    = %did, reason = "wrong signer" | "lower seq" | "did != target", "policy-set
+    denied")`. A revoke is a normal higher-`seq` store — it logs as "policy stored"
+    with the new (tighter) `read_class`, so revocations are traceable.
+- **[Pass 3] Docs (same-phase):** flip `docs/spec/gated-reads.md` §4 (dedicated
+  record) and §4.1's **Model A / owner-signed** paragraph to live; change-log the flip.
 - **Call chain:** `PUT /{did}/policy → put_policy_handler → verify_policy(OwnerSigned)
   → Store::save_policy`; subsequent `getBlob/listBlobs` reflect it via Phase 3–4.
 - **Wiring test:** the first `flow_gated_reads` step — an `id:` owner sets
@@ -279,7 +346,9 @@ a test, by construction.
 - **Done when:**
   1. *Behavioral:* over HTTP — `id:` owner sets grantees→alice reads/bob 404; grant
      bob (higher seq)→bob reads; revoke (higher seq)→bob 404; per-object `world`
-     override makes one blob public; wrong-signer/lower-seq refused; owner read-back.
+     override makes one blob public; wrong-signer/lower-seq refused; owner read-back
+     shows full `readers[]`, **a grantee's read-back shows only its own access (never
+     the set), a non-grantee read-back 404s** (Q4 owner-only visibility).
   2. *Verification:* `cargo test --test flow_gated_reads` (the id:-owner lifecycle).
 - **Validation:** broad — the lifecycle over real HTTP; manifest/quota unaffected.
 
@@ -299,11 +368,25 @@ a test, by construction.
     authenticated DID equals the target-owning DID** (the policy is for the caller's
     own namespace) — else `Forbidden`. On success, construct the `PolicyRecord`,
     **provider-attest** it, and `save_policy`.
-  - [ ] `src/server.rs` — add **`Provider::attest_policy(preimage) -> String`**
-    (`self.keypair.sign_message("ciss/v1/policy-attest:…")`) — the provider `keypair`
-    exists (`server.rs:88`, `crypto::Keypair::sign_message`); the domain prefix keeps
-    the attestation sig distinct from receipt sigs (bare content-hash) and manifest
-    sigs (`ciss/v1/manifest`). The stored record is `ProviderAttested`.
+  - [ ] `src/server.rs` — **[Q3 resolved]** add a **dedicated attestation key** to
+    `Provider`: `attest_keypair = derive_keypair(seed, "policy-attest")` (same seed as
+    the receipt `keypair`, distinct label — no new at-rest secret, no croft-stack
+    change), plus `attest_public_key_hex()` so `verify_policy` can be fed the
+    attestation pubkey. Add **`Provider::attest_policy(preimage) -> String`** signing
+    with **`self.attest_keypair`** (not the receipt `keypair`, which stays
+    billing-only). The `ciss/v1/policy-attest` domain **and** the separate key keep the
+    attestation distinct from receipt sigs (bare content-hash) and manifest sigs
+    (`ciss/v1/manifest`). The stored record is `ProviderAttested`.
+  - **[Pass 3] Logging:** `authenticate_atproto` already logs the JWT verify decision
+    (grant DEBUG `server.rs:659`, denials INFO `:601-654`) — do **not** duplicate it.
+    Add only the policy-specific decisions layered on top: the DID-match failure
+    `tracing::info!(actor = %authed_did, resource = %did, reason = "did != target",
+    "policy-set denied")`, and the successful store `tracing::debug!(resource = %did,
+    seq, form = "ProviderAttested", "policy stored")`. Never log the JWT, the `jti`
+    beyond what the replay path already does, or the provider key.
+- **[Pass 3] Docs (same-phase):** flip `docs/spec/gated-reads.md` §4.1's **Model C /
+  provider-attested** paragraph and §6 (wire format for the JWT-authorized PUT) to
+  live; change-log the flip.
 - **Call chain:** `PUT /{did}/policy (Bearer jwt + body) → put_policy_handler →
   verify_service_auth_jwt(lxm=setPolicy, aud=CISS) → provider.attest_policy →
   Store::save_policy`; reads verify the provider attestation (Phase 3).
@@ -346,8 +429,9 @@ a test, by construction.
       does not admit her to bob's gated namespace.
     - **Negative (should NOT — leakage):** `listBlobs` omits every hidden cid for
       anon/non-grantee (neither listed **nor** counted); a 404 is indistinguishable
-      from not-found (no existence oracle); a grantee's policy read-back does not
-      disclose the full `readers[]` (Open Q2).
+      from not-found (no existence oracle); a grantee's policy read-back returns
+      **only its own access**, never the full `readers[]` — only the owner sees the
+      reader set (Q4 resolved: owner-only visibility).
     - **Adversarial (should NOT — forgery/rollback):** a **forged** policy (attacker
       signs a policy naming a victim's target) → refused, access unchanged; a
       **replayed lower-`seq`** policy (an old permissive policy re-submitted to
@@ -386,7 +470,10 @@ a test, by construction.
     at-dispatch, 404-on-deny, listBlobs omission, monotonic-seq anti-rollback; close
     §14.1.
   - [ ] `docs/adr/0001-…md` — resolved §2 grain decision + policy-record shape.
-  - [ ] `docs/spec/gated-reads.md` — flip settled sections to live; change log.
+  - [ ] `docs/spec/gated-reads.md` — **[Pass 3]** §3/§4/§4.1/§5/§6 are already flipped
+    live incrementally (Phases 3–6); Phase 8 is the **finalization sweep only** —
+    reconcile the change log, confirm no section still reads `[PLANNED build]`, and
+    settle §7 (range, deferred) / §8.1 (groups, deferred) status lines.
   - [ ] `README.md` / `docs/ARCHITECTURE.md` — add the gated-read capability line.
 - **Call chain:** n/a (docs).
 - **Wiring test:** n/a.
@@ -418,20 +505,23 @@ a test, by construction.
   (Model A, self-signed) **and** external-provider `did:` owners (Model C, service-
   auth JWT + CISS provider counter-sign). Readers/grantees may be any DID. See the
   Reasoning "Two owner-authorization forms" note; the phases below build both.
-- **[RECOMMENDED: ADVISORY] The set-policy lexicon method name.** Model C's JWT must
-  be `lxm`-bound to a CISS-defined method (proposed `ing.croft.ciss.setPolicy`).
-  *Recommendation:* pick the name in Phase 6; any non-atproto-protected string works
-  (the provider signs an arbitrary `lxm`). *Rationale: a naming detail, not a blocker.*
-- **[RECOMMENDED: ADVISORY] Provider attestation key: domain-separation vs a sub-key.**
-  Model C counter-signs with the provider key over a domain-separated preimage
-  (`ciss/v1/policy-attest`), safe to share the receipt-signing key. *Recommendation:*
-  domain-separation in v1; a dedicated attestation sub-key (independent rotation) is
-  the upgrade. *Rationale: blast-radius nicety, not a v1 blocker.*
-- **[RECOMMENDED: PHASE-GATED (Phase 5)] Grantee visibility of `readers[]`.** On
-  policy read-back, does a grantee see the full reader list, or only that it may
-  read? *Recommendation:* owner-only full visibility (a grantee learns only its own
-  access), to avoid leaking the grantee set. *Rationale: a disclosure choice, safe to
-  fix at the wire phase; spec §6 flagged it.*
+- **[RESOLVED 2026-08-05 (user)] The set-policy lexicon method name.** Model C's JWT is
+  `lxm`-bound to **`ing.croft.ciss.setPolicy`** (defined as a constant in Phase 6). Any
+  non-atproto-reserved string works; this one is confirmed.
+- **[RESOLVED 2026-08-05 (user)] Provider attestation key — separate now.** Model C
+  counter-signs with a **dedicated derived key** `derive_keypair(seed, "policy-attest")`,
+  **not** the receipt key. Rationale (per user): keeping the receipt/billing key
+  single-purpose separates metering crypto from authN/authZ crypto at the *key* level,
+  gives independent rotation, and avoids a future record-migration — all at near-zero
+  cost (same master seed, distinct label; no new secret at rest, no croft-stack change).
+  It does not add at-rest blast-radius isolation (one seed), which the box can't provide
+  anyway (no TPM/FDE). Wired into Phase 1 (`verify_policy` takes the attestation pubkey),
+  Phase 6 (`Provider::attest_keypair` + `attest_policy`), and the disjointness note.
+- **[RESOLVED 2026-08-05 (user)] Grantee visibility of `readers[]`.** **Owner-only.** On
+  policy read-back, a grantee learns **only that it may read** — never the reader set;
+  only the policy set/modify **owner** sees the full `readers[]`. (User: "users know they
+  can see it, they don't know who else can, except the policy set/modify owner.") Enforced
+  at the read-back wire (Phase 5), asserted in the Phase 7 leakage corpus, spec §6.
 
 ## Review Log
 
@@ -493,3 +583,66 @@ Documentation Impact (§4.1/§6 flips across Phase 5–6).
 the manifest signing pattern, the `persist` table/ALTER pattern, `AppState` already
 carrying `resolver`+`ReplayGuard`, and the flow-harness assertions all hold as Pass 1
 stated. **No new open questions surfaced** — the gaps were fixes, not decisions.
+
+### Pass 3: Quality Gates — 2026-08-05
+
+**Spot-check:** re-verified the Pass 2 touch points firsthand — `authorize`/`dispatch`
+(`server.rs:731/744`), `authenticate_atproto` (`:575`), provider `keypair` (`:83/88`),
+`Keypair::sign_message` (`crypto.rs:75`), `expected_lxm` (`service_jwt.rs:113`), the
+manifest preimage (`manifest.rs:115`), the `persist` table/ALTER block. Nothing drifted.
+
+**TDD ordering:**
+- Added an explicit **within-phase RED-first ordering** note to the Testing doctrine:
+  the `Done when` behavioral cases are written failing *first*, then the `Changes`
+  checkboxes make them GREEN — the phase is not read code-then-test.
+- Confirmed mutation resistance: the `seq`-monotonicity phases (1/2/5) name **both**
+  failing edges (equal, lower) and the passing one (higher), so a comparator mutation
+  breaks a test. Phase 1 is unit-only **by design** (a pure verifier); its wiring test
+  is deferred to Phase 2, its first consumer — flagged in-phase, not a defect.
+- Every other phase (2–7) has a wiring/flow test through the real entry point, and its
+  Verification command runs that entry point (not an isolated module) — checked.
+
+**Observability:** the plan had **no logging plan** — the largest Pass 3 gap. A gated
+deny returns 404, *by design* indistinguishable on the wire from not-found, so the log
+is the only post-deploy trace that separates "denied by policy" from "absent." Added a
+cross-cutting Observability note (deny→INFO with `reason`, grant/store→DEBUG,
+`listBlobs` omission→DEBUG counts-only, never log `readers[]` or key material) matching
+the atproto increment's pattern (`server.rs:601-720`), plus per-phase logging bullets in
+Phases 3/4/5/6. Rides journald; no new sink or config.
+
+**Debugging readiness:** commit-per-phase with a per-phase Verification command is the
+checkpoint spine; the **dark-launch** rollout (no behavior change until an owner writes
+a non-`world` policy) means a mid-execution break cannot affect live reads. Adequate as-is.
+
+**Validation calibration:** each phase declares narrow/moderate/broad, calibrated to
+scope (Phase 1 narrow-unit → Phase 6 broad real-HTTP+JWT). No Phase 0 — all discovery
+was resolvable at plan time and lives in Verified Assumptions (grounded firsthand across
+Pass 1/2/3). Nothing deferred that could be answered now.
+
+**Concurrency honesty:** Concurrency Map re-confirmed — all 8 phases sequential; Phases
+3–6 share the `src/server.rs` write-set (disqualifies parallel) and the chain
+record→storage→gate→listBlobs→writeA→writeC→corpus→docs is a strict dependency spine.
+The Pass 3 doc-distribution change (spec flips moved into 3–6) does **not** add
+cross-phase file conflict — each still writes only its own phase's spec section, in
+sequence. No missed parallelism. Map confirmed; sequential plan.
+
+**Documentation impact:** fixed a stale-reference defect — Documentation Impact pointed
+posture/ADR/README doc updates at **Phase 7**, but the Q1-resolution renumber moved docs
+finalization to **Phase 8** (Phase 7 is the flow corpus). Corrected all three. Removed
+the "docs phase at the end" anti-pattern for the **integrator-facing spec**: its section
+flips are now **same-phase** in Phases 3–6 (each change-logs its own), and Phase 8 is a
+finalization sweep + the posture/ADR/README updates that legitimately must land
+after-green (so they describe what is true).
+
+**Coherence:** the plan still solves the original problem (private reads without a
+leakage oracle); scope is the confirmed Model A + C, no creep. Reasoning holds; no
+rewrite needed — Pass 3 layered quality additively.
+
+**Open questions:** **all resolved by the user 2026-08-05** during Pass 3 close-out —
+Q1 Model A+C (prior); Q2 lexicon = `ing.croft.ciss.setPolicy`; **Q3 separate the
+attestation key now** (`derive_keypair(seed, "policy-attest")`, receipt key stays
+billing-only — wired into Reasoning, Verified Assumptions, Phase 1 & 6); Q4 owner-only
+`readers[]` visibility (wired into Phase 5/6/7). No BLOCKING items; nothing outstanding.
+
+**Confirmed ready:** **yes.** No open questions remain; the plan is ready for execution
+(Phase 1 first, TDD RED-first).
