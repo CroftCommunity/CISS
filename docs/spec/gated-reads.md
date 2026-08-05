@@ -125,6 +125,34 @@ A record failing any check is **refused and does not change access** (fail-close
 Because it is a dedicated record, a policy is submitted on its own endpoint (§6),
 independently of the manifest, and carries its own `seq` lifecycle.
 
+### 4.1 Who may set policy — two authorization forms  **[SETTLED]**
+
+The owner authorizes a policy in one of two ways, depending on whether they hold a
+signing key locally. Both produce a record CISS can durably verify on later reads;
+readers/grantees may be **any** DID either way.
+
+- **`id:` owner → owner-signed (Model A).** A Croft-native owner holds its ed25519
+  key (the DID is its hash), so it signs the policy record itself. The signature is
+  the proof — self-contained, content-binding, and durable. No external provider,
+  works offline.
+- **External-provider (`did:`) owner → provider-attested (Model C).** An owner whose
+  key lives at an **external identity provider** — CISS has *offloaded authentication*
+  to one (today Bluesky via `account.croft.ing`, but the mechanism is the atproto
+  **service-auth** path, not Bluesky-specific) — cannot self-sign. It instead presents
+  a **service-auth JWT** (`iss`=owner DID, `aud`=CISS, `lxm`=the set-policy method,
+  short `exp`). The provider vouches, via the owner's repo key, that the owner
+  authorized a *set-policy action*. CISS verifies the JWT (the same DID-resolution
+  path it uses for `uploadBlob`), then **counter-signs the resulting policy with its
+  provider key** (a domain-separated attestation) so the stored record stays durably
+  verifiable after the short-lived JWT expires.
+
+**Property to understand (Model C):** the JWT authorizes the *action*, not the
+*bytes* — it proves "this DID said set-policy now," and the policy body rides the
+same authenticated request. Content integrity in transit therefore rests on TLS +
+the short `exp` + a single-use `jti`, exactly as `uploadBlob` already works; the
+provider counter-sign is what makes the *result* durable. Model A binds the content
+cryptographically and forever; Model C is no weaker than the existing upload path.
+
 ## 5. Denial semantics — the leakage rules  **[SETTLED]**
 
 A gate that reveals what it hides is not a gate. So:
@@ -225,6 +253,10 @@ extend rather than reshape. Keep `readers[]` an opaque list of principals.
   §4 record shape settled, transport open (Q2); §7 range grain open (Q3).
 - 2026-08-05 — Q2 settled: policy is a **dedicated record** (not a manifest field),
   submitted on its own endpoint; §4 rationale + §6 wire model filled in.
+- 2026-08-05 — policy authority settled (§4.1): **two forms in v1** — `id:` owners
+  self-sign (Model A), external-provider (`did:`) owners authorize via service-auth
+  JWT + CISS provider counter-sign (Model C). Reframed as "offloaded auth to an
+  external identity provider (today bsky, not bsky-bound)."
 - 2026-08-05 — Q3 settled: **range grain deferred** (kept as a design constraint so
   v1 leaves room, §7); the **group model is deferred** with the static-vs-dynamic
   tension recorded (§8.1). All v1 design questions resolved — scope frozen.

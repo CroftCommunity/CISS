@@ -35,6 +35,31 @@ oracle, and `listBlobs` must not enumerate hidden objects.
   leaks what it protects. Oracle-free denial (ADR 0001 §2).
 - **Reads only in v1.** Writes are already owner-only (Z2) and safe; read-gating is
   the missing capability. Delegated writes add a consent model — deferred.
+- **Two owner-authorization forms in v1 (Model A + Model C).** Who may *set* policy
+  depends on whether the owner holds a signing key locally:
+  - **Model A — owner-signed (`id:` owners).** A Croft-native owner holds its
+    ed25519 key (the DID is its hash), so it signs the policy record itself — a
+    durable, self-contained, content-binding proof (like the manifest, Z3). Serves
+    provider/native owners (e.g. the history-convergence backend).
+  - **Model C — provider-attested (external-provider / `did:` owners).** An owner
+    whose key lives at an **external identity provider** (offloaded auth — today
+    bsky via `account.croft.ing`, but the mechanism is the atproto service-auth path,
+    not bsky-specific) cannot self-sign. It instead presents a **service-auth JWT**
+    (`iss`=owner DID, `aud`=CISS, `lxm`=the set-policy method, ~60s) — the provider
+    vouches, via the owner's repo key, that the owner authorized a set-policy *action*.
+    CISS verifies that JWT (reusing the Model-R path already built), then
+    **counter-signs the resulting policy record with the provider key** (domain-
+    separated preimage) so the stored record is durably verifiable on later reads.
+  - *Why both, now (vs deferring C):* the two use cases split across the two owner
+    populations — history-convergence is `id:`-owned (A), private-PDS per-object
+    sharing is external-provider-owned (C) — so shipping only A would leave the
+    second use case unbuilt. C reuses the service-auth verification we already have;
+    the only new crypto is the provider counter-sign. *Rejected:* Model B (JWT-
+    authorized but **not** re-signed) — the record would then have only transient
+    (session) provenance; C's counter-sign restores durable provenance at write time.
+    The residual property (the JWT authorizes the *action*, not the *bytes*; content
+    integrity in transit rests on TLS + short `exp` + single-use `jti`) is **identical
+    to how `uploadBlob` already works**, so C is no weaker than what CISS ships today.
 
 ## Verified Assumptions
 
@@ -86,9 +111,10 @@ Confirmed firsthand against the code (2026-08-05):
 
 ## Concurrency Map
 
-**All phases sequential.** Each phase reads what the prior wrote (record → storage →
-dispatch gate → listBlobs → wire → corpus → docs), and Phases 2–5 all write
-`src/server.rs`/`src/persist.rs`, so their write-sets overlap. No parallelism.
+**All phases sequential** (8 phases): record(1) → storage(2) → dispatch gate(3) →
+listBlobs(4) → id:-owner write(5) → did:-owner write + attestation(6) → corpus(7) →
+docs(8). Each reads what the prior wrote, and Phases 3–6 all write `src/server.rs`,
+so their write-sets overlap. No parallelism.
 
 ## Phases (TDD-first — RED before GREEN, commit per phase)
 
@@ -102,12 +128,19 @@ a test, by construction.
 
 ### Phase 1 — The signed policy record (pure)
 
-- **Goal:** a self-authorizing `PolicyRecord` that verifies iff owner-signed with a
-  monotonic `seq`.
+- **Goal:** a `PolicyRecord` that verifies under **either** authorization form
+  (owner-signed A, or provider-attested C) with a monotonic `seq`.
 - **Changes:**
-  - [ ] `src/policy.rs` — `PolicyRecord { target, read_class, readers, seq, signer,
-    sig }`, `ReadClass{World,Grantees,Owner}`, `verify_policy(record, prior_seq)`,
-    domain `"ciss/v1/policy"`, canonical preimage via `canonical.rs`.
+  - [ ] `src/policy.rs` — `PolicyRecord { target, read_class, readers, seq,
+    authorization }` where `authorization = OwnerSigned{signer, sig} |
+    ProviderAttested{owner_did, authorizing_jti, provider_sig}`;
+    `ReadClass{World,Grantees,Owner}`; `verify_policy(record, prior_seq,
+    provider_pubkey)`:
+    - `OwnerSigned` → verify ed25519 `sig` over `ciss/v1/policy:<target>:<seq>:…`
+      and `derive_id(signer) == target-DID` (Model A, `id:` owner);
+    - `ProviderAttested` → verify the **provider** `sig` over
+      `ciss/v1/policy-attest:<owner_did>:<target>:<seq>:…` under `provider_pubkey`
+      (Model C — CISS's durable attestation that it checked a valid owner JWT).
   - [ ] `src/lib.rs` — `pub mod policy;`.
 - **Call chain:** (none yet — pure module; wired at Phase 2 `put_policy` / Phase 3
   `dispatch`). Named here so it is not left dangling: `dispatch → resolve_policy →
@@ -201,34 +234,72 @@ a test, by construction.
   2. *Verification:* `cargo test --test wiring_pds_blob -k listBlobs`.
 - **Validation:** moderate — wiring; ungated DIDs' listBlobs unchanged.
 
-### Phase 5 — Set/change policy over HTTP (owner-signed)
+### Phase 5 — `id:`-owner policy write over HTTP (Model A)
 
-- **Goal:** an owner sets/changes policy over the wire; reads honor it live.
+- **Goal:** an `id:` owner sets/changes policy by submitting a self-signed record;
+  reads honor it live.
 - **Changes:**
-  - [ ] `src/server.rs` — `put_policy_handler` (namespace) + object variant: verify
-    (Phase 1) → `save_policy` (Phase 2); read-back `GET`; error mappings
+  - [ ] `src/server.rs` — `put_policy_handler` (namespace) + object variant:
+    `verify_policy` (`OwnerSigned`) → `save_policy`; read-back `GET`; error mappings
     (bad-sig/lower-seq → distinct 4xx).
-  - [ ] `src/server.rs` router — `PUT/GET /{did}/policy` and
-    `/{did}/objects/{cid}/policy` (mirror the manifest handler shape).
-- **Call chain:** `PUT /{did}/policy → put_policy_handler → verify_policy →
-  Store::save_policy`; subsequent `getBlob/listBlobs` reflect it via Phase 3–4.
-- **Wiring test:** the first `flow_gated_reads` step — set `grantees:[alice]` over
-  HTTP, then alice reads / bob 404s (proves the wire path reaches storage + gate).
+  - [ ] router — `PUT/GET /{did}/policy` and `/{did}/objects/{cid}/policy` (mirror the
+    manifest handler shape).
+- **Call chain:** `PUT /{did}/policy → put_policy_handler → verify_policy(OwnerSigned)
+  → Store::save_policy`; subsequent `getBlob/listBlobs` reflect it via Phase 3–4.
+- **Wiring test:** the first `flow_gated_reads` step — an `id:` owner sets
+  `grantees:[alice]` over HTTP, then alice reads / bob 404s.
 - **Depends on:** Phases 1–4.
 - **Read-set:** `src/policy.rs`, `src/persist.rs`, `src/pds_api.rs` (handler shape).
 - **Write-set:** `src/server.rs`.
 - **Shared-state contract:** `Store` writes (policy tables); no other unit/route.
-- **Risks:** owner-auth for the write (Open Q1) — v1 requires an `id:`-owner signed
-  record; a `did:` owner path is gated on Q1.
+- **Risks:** wrong-signer / lower-seq must be refused (no un-revoke) — tested.
 - **Done when:**
-  1. *Behavioral:* over HTTP — set grantees→alice reads/bob 404; grant bob (higher
-     seq)→bob reads; revoke (higher seq)→bob 404; per-object `world` override makes
-     one blob public; wrong-signer/lower-seq refused; owner read-back works.
-  2. *Verification:* `cargo test --test flow_gated_reads` (the lifecycle steps).
-- **Validation:** broad — run the lifecycle over real HTTP in the harness; manifest/
-  quota handlers unaffected.
+  1. *Behavioral:* over HTTP — `id:` owner sets grantees→alice reads/bob 404; grant
+     bob (higher seq)→bob reads; revoke (higher seq)→bob 404; per-object `world`
+     override makes one blob public; wrong-signer/lower-seq refused; owner read-back.
+  2. *Verification:* `cargo test --test flow_gated_reads` (the id:-owner lifecycle).
+- **Validation:** broad — the lifecycle over real HTTP; manifest/quota unaffected.
 
-### Phase 6 — Flow corpus (permanent regression guards)
+### Phase 6 — `did:`-owner policy write via service-auth JWT + provider attestation (Model C)
+
+- **Goal:** an external-provider (`did:`) owner sets policy by presenting a service-
+  auth JWT; CISS verifies it and counter-signs the resulting record for durability.
+- **Changes:**
+  - [ ] Define the set-policy lexicon method id (proposed `ing.croft.ciss.setPolicy`)
+    as a constant; the JWT's `lxm` must equal it, `aud` == CISS service DID, `iss` ==
+    the target-owning DID.
+  - [ ] `src/server.rs` — the policy handlers accept an alternate authorization: a
+    `Bearer` service-auth JWT + a **policy body** (readers/read_class/seq). Verify the
+    JWT via `ciss_auth::verify_service_auth_jwt` (reused, with `lxm`=set-policy); on
+    success, construct the `PolicyRecord`, **provider-attest** it (sign
+    `ciss/v1/policy-attest:…` with the provider key), and `save_policy`.
+  - [ ] `src/server.rs` / provider — a `provider.attest_policy(record)` signing helper
+    (domain-separated preimage; provider key). The stored record is `ProviderAttested`.
+- **Call chain:** `PUT /{did}/policy (Bearer jwt + body) → put_policy_handler →
+  verify_service_auth_jwt(lxm=setPolicy, aud=CISS) → provider.attest_policy →
+  Store::save_policy`; reads verify the provider attestation (Phase 3).
+- **Wiring test:** a `did:` (AtprotoActor) owner sets `grantees:[alice]` with a
+  service-auth JWT; the stored record is `ProviderAttested`; alice reads / bob 404s;
+  a JWT with the wrong `lxm`/`aud`, expired, or a replayed `jti` → refused, no write.
+- **Depends on:** Phases 1–5, and the built atproto-identity path (`ciss-auth`).
+- **Read-set:** `src/policy.rs`, `src/persist.rs`, `crates/ciss-auth` (verify),
+  `src/receipts.rs`/`src/crypto.rs` (provider signing).
+- **Write-set:** `src/server.rs` (+ a small provider signing helper).
+- **Shared-state contract:** `Store` writes; the provider key (read for attestation —
+  never logged). Reuses the `ReplayGuard` for the set-policy `jti`.
+- **Risks:** the JWT authorizes the *action*, not the *bytes* — content integrity in
+  transit rests on TLS + short `exp` + single-use `jti` (identical to `uploadBlob`);
+  the provider attestation makes the *result* durable. Do not reuse a bare provider
+  key without domain separation (Open Q: attestation key).
+- **Done when:**
+  1. *Behavioral:* a `did:` owner sets policy over HTTP via a valid service-auth JWT;
+     the record persists as `ProviderAttested` and gates reads exactly as Model A; a
+     wrong-`lxm`/`aud`/expired/replayed JWT is refused with no policy change.
+  2. *Verification:* `cargo test --test flow_gated_reads` (the did:-owner lifecycle).
+- **Validation:** broad — real HTTP with a minted service-auth JWT (harness
+  `AtprotoActor`); confirm the attestation verifies on read and the JWT is single-use.
+
+### Phase 7 — Flow corpus (permanent regression guards)
 
 - **Goal:** the relational stories as permanent guards — **comprehensive on both
   sides**: every *should-work* and every *should-NOT-work* is its own flow, so the
@@ -255,12 +326,17 @@ a test, by construction.
       refused; a policy signed by a key that does not derive the target DID →
       refused; **setting policy without owner authority** (anon/another DID) →
       refused, no policy change.
+    - **Both owner forms (Model A + C):** repeat the grant/revoke/override + the
+      adversarial cases for an **`id:` owner** (self-signed) *and* a **`did:` owner**
+      (service-auth JWT + provider attestation) — the gate behaves identically on
+      read regardless of how the policy was authored; a `did:`-owner set with a
+      wrong-`lxm`/`aud`/expired/replayed JWT is refused with no write.
   - Each flow uses the intent-named `Outcome` asserts (`.refused(404)`, `.omits(cid)`,
     `.returns(bytes)`); a should-NOT flow that *passes as allowed* fails loudly.
 - **Call chain:** the harness drives the real server end-to-end (World/Actor +
   AtprotoActor as readers).
 - **Wiring test:** the file *is* the wiring corpus.
-- **Depends on:** Phases 1–5.
+- **Depends on:** Phases 1–6.
 - **Read-set:** `tests/common/mod.rs`.
 - **Write-set:** `tests/flow_gated_reads.rs` (+ small `tests/common/mod.rs` helpers
   for a policy-PUT/Actor if needed).
@@ -273,7 +349,7 @@ a test, by construction.
      pre-existing flow tests still green.
 - **Validation:** broad — the corpus is the end-to-end proof.
 
-### Phase 7 — Posture + ADR + spec/README (docs finalization)
+### Phase 8 — Posture + ADR + spec/README (docs finalization)
 
 - **Goal:** record the design intent as invariants and close the tracked gap.
 - **Changes:**
@@ -285,7 +361,7 @@ a test, by construction.
   - [ ] `README.md` / `docs/ARCHITECTURE.md` — add the gated-read capability line.
 - **Call chain:** n/a (docs).
 - **Wiring test:** n/a.
-- **Depends on:** Phases 1–6 (documents what is now true + green).
+- **Depends on:** Phases 1–7 (documents what is now true + green).
 - **Read-set:** the built code (to describe it accurately).
 - **Write-set:** the four doc files.
 - **Shared-state contract:** none.
@@ -309,17 +385,19 @@ a test, by construction.
 
 ## Open Questions
 
-- **[RECOMMENDED: PHASE-GATED (Phase 1)] Who may *set* policy in v1?** The
-  owner-signed-record model (Q2) verifies cleanly for `id:` owners (ed25519, they
-  hold the key, like the manifest). A `did:` owner authenticates via service-auth
-  JWT but does **not** hold a repo signing key client-side, so it cannot self-sign a
-  policy record. *Recommendation:* v1 **policy-setters are `id:` owners** (they hold
-  the key); **readers/grantees may be any DID** (`id:`/`did:plc`/`did:web`). A
-  `did:`-owner policy path (JWT-authorized, softening Q2 for that case) is a tracked
-  follow-on. This fits the likely v1 use case (history-convergence owned by a Croft
-  `id:`). *Rationale: surfaced by grounding — building owner-signed policy for `did:`
-  owners would hit a wall (no client-side repo key). Must be settled before Phase 1
-  fixes the signer type.*
+- **[RESOLVED 2026-08-05] Who may *set* policy in v1?** **Both** `id:` owners
+  (Model A, self-signed) **and** external-provider `did:` owners (Model C, service-
+  auth JWT + CISS provider counter-sign). Readers/grantees may be any DID. See the
+  Reasoning "Two owner-authorization forms" note; the phases below build both.
+- **[RECOMMENDED: ADVISORY] The set-policy lexicon method name.** Model C's JWT must
+  be `lxm`-bound to a CISS-defined method (proposed `ing.croft.ciss.setPolicy`).
+  *Recommendation:* pick the name in Phase 6; any non-atproto-protected string works
+  (the provider signs an arbitrary `lxm`). *Rationale: a naming detail, not a blocker.*
+- **[RECOMMENDED: ADVISORY] Provider attestation key: domain-separation vs a sub-key.**
+  Model C counter-signs with the provider key over a domain-separated preimage
+  (`ciss/v1/policy-attest`), safe to share the receipt-signing key. *Recommendation:*
+  domain-separation in v1; a dedicated attestation sub-key (independent rotation) is
+  the upgrade. *Rationale: blast-radius nicety, not a v1 blocker.*
 - **[RECOMMENDED: PHASE-GATED (Phase 5)] Grantee visibility of `readers[]`.** On
   policy read-back, does a grantee see the full reader list, or only that it may
   read? *Recommendation:* owner-only full visibility (a grantee learns only its own
@@ -338,5 +416,15 @@ a test, by construction.
   Phase 7 (4-file rule). Pending: Pass 2 (gap analysis), Pass 3 (quality gates).
 - **2026-08-05 — Pass 1 addendum (user).** Made comprehensive **should-NOT**
   coverage a first-class, cross-cutting requirement (regression protection): added a
-  Testing-doctrine note (every phase pairs allow+deny) and expanded Phase 6 into the
-  full positive/negative/leakage/adversarial matrix.
+  Testing-doctrine note (every phase pairs allow+deny) and expanded the corpus into
+  the full positive/negative/leakage/adversarial matrix.
+- **2026-08-05 — Q1 resolved: Model A + C in v1 (user).** Decided to build *both*
+  owner-authorization paths now, not defer the external-provider (`did:`) owner.
+  Reframed the axis as "offloaded auth to an external identity provider (today bsky,
+  not bsky-bound)." Changes: added the "Two owner-authorization forms" reasoning; the
+  `PolicyRecord` now carries `OwnerSigned | ProviderAttested` (Phase 1); **split the
+  write into Phase 5 (`id:` self-signed) + new Phase 6 (`did:` service-auth JWT +
+  provider counter-sign, reusing `ciss-auth::verify_service_auth_jwt`)**; renumbered
+  corpus→7 (now covers both owner forms) and docs→8; two new ADVISORY questions (the
+  set-policy `lxm` name; attestation-key domain-sep vs sub-key). Grew 7→8 phases.
+  **Scope change is material — warrants a Pass 2 gap analysis before execution.**
