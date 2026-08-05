@@ -186,9 +186,13 @@ ansible-playbook site.yml                 # full, idempotent, no-lockout-safe
 curl -sS https://ciss.croft.ing/healthz   # -> 200 ok
 ```
 
-The `tenants` role's unpack is guarded by `creates: /opt/ciss/current/ciss`, so a
-*new* version needs the current binary cleared (or the release path bumped) to
-re-extract; then `systemctl restart ciss` (Caddy retry masks it).
+The `tenants` role's unpack is **version-aware**: the `creates:` marker is
+`/opt/ciss/current/.installed-<version>`, so bumping `binary_version` re-extracts
+the new binary over `current/` and notifies the restart handler automatically — a
+plain `binary_version` bump + converge deploys the new binary. *(Historical note:
+before this fix the guard was keyed on `current/ciss`'s existence, so upgrades
+silently fetched-but-never-unpacked; found deploying v0.4.0. Fixed in croft-stack
+`fix(tenants): version-aware binary unpack`.)*
 
 ## 9. Incident runbook — the Caddy front
 
