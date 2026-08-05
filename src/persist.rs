@@ -404,6 +404,58 @@ impl Store {
         Ok(exists)
     }
 
+    /// The stored policy `seq` for a target, if a policy row exists — the
+    /// `prior_seq` fed to `verify_policy` at write time so a replayed/lower-seq
+    /// policy is refused before it is stored.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn policy_seq(&self, did: &str, cid: Option<&str>) -> Result<Option<u64>, PersistError> {
+        let seq: Option<i64> = match cid {
+            None => self
+                .conn
+                .query_row(
+                    "SELECT seq FROM namespace_policy WHERE did = ?1",
+                    [did],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            Some(cid) => self
+                .conn
+                .query_row(
+                    "SELECT seq FROM object_policy WHERE did = ?1 AND cid = ?2",
+                    [did, cid],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        Ok(seq.map(|s| u64::try_from(s).unwrap_or(0)))
+    }
+
+    /// Load a target's full stored policy record, if present — the durable signed
+    /// artifact, for policy read-back. Unlike [`Store::resolve_policy`] (which
+    /// fails closed for the read gate), this surfaces a parse failure as an error:
+    /// an owner reading back its own record should see a loud failure, not a
+    /// silent default.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite or deserialization failure.
+    pub fn load_policy(
+        &self,
+        did: &str,
+        cid: Option<&str>,
+    ) -> Result<Option<PolicyRecord>, PersistError> {
+        let table = if cid.is_some() {
+            "object_policy"
+        } else {
+            "namespace_policy"
+        };
+        match self.policy_json(table, did, cid)? {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Fetch a policy row's stored JSON for a target, if present. `table` is a
     /// fixed internal literal (`namespace_policy` / `object_policy`), never
     /// caller-supplied, so its interpolation carries no injection surface.

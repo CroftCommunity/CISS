@@ -1,0 +1,248 @@
+//! Gated reads — the workflow corpus (Phase 5: the `id:`-owner / Model-A
+//! lifecycle over real HTTP). An `id:` owner sets a read policy by PUTting a
+//! self-signed policy record; reads honor it live through the same server.
+//!
+//! This is the comprehensive should-work **and** should-NOT proof for Model A:
+//! grant/revoke/override behave, and every denial (a non-grantee read, a forged
+//! policy, a rolled-back seq) is refused — a regression that opens the gate must
+//! break a test here. The `did:`-owner (Model C) lifecycle lands in Phase 6, and
+//! the full cross-form matrix in Phase 7.
+
+mod common;
+
+use common::TestServer;
+
+use ciss::crypto::{derive_keypair, sha256_hex, Keypair};
+use ciss::identity::derive_id;
+use ciss::policy::{PolicyRecord, ReadClass};
+use ciss::server::{App, Blobs, Db};
+
+const MASTER: &str = "flow-gated-reads-master";
+
+/// An actor's `(pubkey, session)` headers for the `id:` session space.
+fn actor(label: &str) -> (Keypair, String, String, String) {
+    let kp = derive_keypair(MASTER, label);
+    let did = derive_id(&kp.verifying_key());
+    let (pubkey, session) = common::session_headers(&kp, &did);
+    (kp, did, pubkey, session)
+}
+
+/// A signed namespace policy record body (Model A), serialized for the wire.
+fn namespace_policy(
+    owner_did: &str,
+    class: ReadClass,
+    readers: &[String],
+    seq: u64,
+    owner_kp: &Keypair,
+) -> Vec<u8> {
+    let record = PolicyRecord::sign_owner(owner_did, None, class, readers, seq, owner_kp);
+    serde_json::to_vec(&record).expect("serialize policy")
+}
+
+#[tokio::test]
+async fn id_owner_policy_lifecycle_over_http() {
+    let app = App::new("provider-master", Blobs::Memory, Db::Memory).expect("app");
+    let server = TestServer::spawn(app).await;
+    let client = reqwest::Client::new();
+
+    let (owner_kp, owner_did, owner_pk, owner_sess) = actor("owner");
+    let (_alice_kp, alice_did, alice_pk, alice_sess) = actor("alice");
+    let (_bob_kp, bob_did, bob_pk, bob_sess) = actor("bob");
+    let (attacker_kp, _attacker_did, _apk, _asess) = actor("attacker");
+
+    // --- The owner uploads two blobs (S3 plane, owner session). ---
+    let secret = b"the secret blob".to_vec();
+    let public = b"a public blob".to_vec();
+    let secret_cid = sha256_hex(&secret);
+    let public_cid = sha256_hex(&public);
+    for (key, bytes) in [("s", &secret), ("p", &public)] {
+        let r = client
+            .put(server.url(&format!("/{owner_did}/objects/{key}")))
+            .header("x-croft-pubkey", owner_pk.as_str())
+            .header("x-croft-session", owner_sess.as_str())
+            .body(bytes.clone())
+            .send()
+            .await
+            .expect("upload");
+        assert_eq!(r.status().as_u16(), 200, "owner uploads a blob");
+    }
+
+    // A GET of `secret_cid` as some actor (headers optional for anon).
+    let get = |pk: Option<(&str, &str)>, cid: &str| {
+        let mut req = client.get(server.url(&format!("/{owner_did}/objects/{cid}")));
+        if let Some((p, s)) = pk {
+            req = req.header("x-croft-pubkey", p).header("x-croft-session", s);
+        }
+        req.send()
+    };
+    let put_policy = |body: Vec<u8>| {
+        client
+            .put(server.url(&format!("/{owner_did}/policy")))
+            .body(body)
+            .send()
+    };
+
+    // Before any policy: the secret blob is world-readable (PDS-compat).
+    assert_eq!(
+        get(None, &secret_cid).await.expect("anon get").status().as_u16(),
+        200,
+        "no policy yet -> world-readable",
+    );
+
+    // --- The owner gates the whole namespace to grantees:[alice] (seq 1). ---
+    let set = put_policy(namespace_policy(
+        &owner_did,
+        ReadClass::Grantees,
+        std::slice::from_ref(&alice_did),
+        1,
+        &owner_kp,
+    ))
+    .await
+    .expect("set policy");
+    assert_eq!(set.status().as_u16(), 200, "owner sets a policy");
+
+    // alice reads; bob and anon get 404 (oracle-free, not 403); owner reads.
+    assert_eq!(
+        get(Some((&alice_pk, &alice_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        200,
+        "the grantee reads",
+    );
+    assert_eq!(
+        get(Some((&bob_pk, &bob_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        404,
+        "a non-grantee gets 404, not the bytes",
+    );
+    assert_eq!(
+        get(None, &secret_cid).await.unwrap().status().as_u16(),
+        404,
+        "anon gets 404 under a gate",
+    );
+    assert_eq!(
+        get(Some((&owner_pk, &owner_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        200,
+        "the owner always reads its own gated object",
+    );
+
+    // --- Grant bob (seq 2): bob now reads. ---
+    let grant_bob = put_policy(namespace_policy(
+        &owner_did,
+        ReadClass::Grantees,
+        &[alice_did.clone(), bob_did.clone()],
+        2,
+        &owner_kp,
+    ))
+    .await
+    .expect("grant bob");
+    assert_eq!(grant_bob.status().as_u16(), 200);
+    assert_eq!(
+        get(Some((&bob_pk, &bob_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        200,
+        "a newly-granted reader reads",
+    );
+
+    // --- Revoke bob (seq 3): bob is denied again (revocation bites). ---
+    let revoke = put_policy(namespace_policy(
+        &owner_did,
+        ReadClass::Grantees,
+        std::slice::from_ref(&alice_did),
+        3,
+        &owner_kp,
+    ))
+    .await
+    .expect("revoke bob");
+    assert_eq!(revoke.status().as_u16(), 200);
+    assert_eq!(
+        get(Some((&bob_pk, &bob_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        404,
+        "a revoked reader is denied again",
+    );
+
+    // --- Per-object world override: the public blob is exposed again. ---
+    let override_record =
+        PolicyRecord::sign_owner(&owner_did, Some(&public_cid), ReadClass::World, &[], 1, &owner_kp);
+    let set_obj = client
+        .put(server.url(&format!("/{owner_did}/objects/{public_cid}/policy")))
+        .body(serde_json::to_vec(&override_record).unwrap())
+        .send()
+        .await
+        .expect("object policy");
+    assert_eq!(set_obj.status().as_u16(), 200);
+    assert_eq!(
+        get(None, &public_cid).await.unwrap().status().as_u16(),
+        200,
+        "a per-object world override exposes just that blob",
+    );
+    assert_eq!(
+        get(None, &secret_cid).await.unwrap().status().as_u16(),
+        404,
+        "the namespace gate still hides the other object",
+    );
+
+    // --- Adversarial: a forged policy (attacker signs for the owner's namespace)
+    // is refused (403), and access is unchanged. ---
+    let forged = namespace_policy(
+        &owner_did,
+        ReadClass::World,
+        &[],
+        99,
+        &attacker_kp, // wrong signer — does not derive owner_did
+    );
+    assert_eq!(
+        put_policy(forged).await.unwrap().status().as_u16(),
+        403,
+        "a forged policy is refused",
+    );
+    assert_eq!(
+        get(Some((&bob_pk, &bob_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        404,
+        "the forged policy changed nothing",
+    );
+
+    // --- Anti-rollback: a lower/equal seq is refused (409), no un-revoke. ---
+    let rollback = namespace_policy(
+        &owner_did,
+        ReadClass::Grantees,
+        &[alice_did.clone(), bob_did.clone()],
+        1, // <= stored seq (3)
+        &owner_kp,
+    );
+    assert_eq!(
+        put_policy(rollback).await.unwrap().status().as_u16(),
+        409,
+        "a rolled-back seq is refused",
+    );
+    assert_eq!(
+        get(Some((&bob_pk, &bob_sess)), &secret_cid).await.unwrap().status().as_u16(),
+        404,
+        "the rollback did not un-revoke bob",
+    );
+
+    // --- Read-back (Q4 owner-only reader-set visibility). ---
+    let read_policy = |pk: Option<(&str, &str)>| {
+        let mut req = client.get(server.url(&format!("/{owner_did}/policy")));
+        if let Some((p, s)) = pk {
+            req = req.header("x-croft-pubkey", p).header("x-croft-session", s);
+        }
+        req.send()
+    };
+    let owner_view = read_policy(Some((&owner_pk, &owner_sess))).await.unwrap();
+    assert_eq!(owner_view.status().as_u16(), 200);
+    let owner_json: serde_json::Value =
+        serde_json::from_str(&owner_view.text().await.unwrap()).unwrap();
+    assert!(owner_json.get("readers").is_some(), "the owner sees the reader set");
+
+    let alice_view = read_policy(Some((&alice_pk, &alice_sess))).await.unwrap();
+    assert_eq!(alice_view.status().as_u16(), 200);
+    let alice_json: serde_json::Value =
+        serde_json::from_str(&alice_view.text().await.unwrap()).unwrap();
+    assert!(alice_json.get("readers").is_none(), "a grantee never sees the reader set");
+    assert_eq!(alice_json["may_read"], true, "a grantee learns only its own access");
+
+    assert_eq!(
+        read_policy(Some((&bob_pk, &bob_sess))).await.unwrap().status().as_u16(),
+        404,
+        "a non-grantee cannot read the policy back",
+    );
+
+    server.shutdown().await;
+}

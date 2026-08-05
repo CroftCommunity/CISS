@@ -44,7 +44,7 @@ use crate::identifiers::{ContentAddr, Did};
 use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
-use crate::policy::ReadClass;
+use crate::policy::{verify_policy, Authorization, PolicyRecord, ReadClass, ResolvedPolicy};
 use crate::pricing::postage_cents;
 use crate::receipts::{
     make_unilateral_receipt, select_mode, Direction, Receipt, ReceiptCore, ReceiptMode,
@@ -79,22 +79,39 @@ fn as_u64(n: usize) -> u64 {
 }
 
 /// The provider's own identity (keypair + derived id). Signs unilateral
-/// (our-side measurement) receipts at the boundary.
+/// (our-side measurement) receipts at the boundary, and — via a **separate**
+/// derived key — attests policy records for `did:` owners (Model C).
 struct Provider {
     id: String,
     keypair: Keypair,
+    /// A dedicated key for provider policy attestations (Model C), derived from
+    /// the same seed under a distinct label so the receipt/billing `keypair`
+    /// stays single-purpose (Q3 — separates metering crypto from authZ crypto,
+    /// gives independent rotation, no new secret at rest).
+    attest_keypair: Keypair,
 }
 
 impl Provider {
     fn from_seed(seed: &str) -> Self {
         let keypair = derive_keypair(seed, "provider");
+        let attest_keypair = derive_keypair(seed, "policy-attest");
         let id = derive_id(&keypair.verifying_key());
-        Self { id, keypair }
+        Self {
+            id,
+            keypair,
+            attest_keypair,
+        }
     }
 
     /// The provider's public key (hex) — a non-secret verification anchor.
     fn public_key_hex(&self) -> String {
         self.keypair.public_key_hex()
+    }
+
+    /// The provider's policy-attestation public key — the key `verify_policy`
+    /// checks a `ProviderAttested` record under (never the receipt key).
+    fn attest_verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.attest_keypair.verifying_key()
     }
 }
 
@@ -307,6 +324,14 @@ impl App {
                 "/{did}/manifest",
                 put(put_manifest_handler).get(get_manifest_handler),
             )
+            .route(
+                "/{did}/policy",
+                put(put_policy_handler).get(get_policy_handler),
+            )
+            .route(
+                "/{did}/objects/{addr}/policy",
+                put(put_object_policy_handler).get(get_object_policy_handler),
+            )
             .route("/{did}/meter", get(get_meter_handler))
             // The atproto PDS blob surface (Phase 8) — a thin layer over the
             // same metered byte-path, mounted at its XRPC paths.
@@ -489,6 +514,19 @@ pub(crate) enum Op {
     ListBlobs {
         did: String,
     },
+    /// Set/replace the read policy for a target (namespace when `cid` is `None`,
+    /// else a single object). The `body` is a serialized, owner-authorized
+    /// [`crate::policy::PolicyRecord`] (gated reads, Phase 5/6).
+    PutPolicy {
+        did: String,
+        cid: Option<String>,
+        body: Vec<u8>,
+    },
+    /// Read back a target's policy record (owner-only reader-set visibility, Q4).
+    GetPolicy {
+        did: String,
+        cid: Option<String>,
+    },
 }
 
 impl Op {
@@ -507,7 +545,9 @@ impl Op {
             | Op::PutManifest { .. }
             | Op::GetManifest { .. }
             | Op::GetMeter { .. }
-            | Op::ListBlobs { .. } => false,
+            | Op::ListBlobs { .. }
+            | Op::PutPolicy { .. }
+            | Op::GetPolicy { .. } => false,
         }
     }
 }
@@ -541,6 +581,15 @@ pub(crate) enum OpOutcome {
     /// first-upload order. The atproto layer maps each to a CIDv1 `$link`.
     BlobList {
         cids: Vec<String>,
+    },
+    /// A policy record was accepted and stored, at sequence `seq`.
+    PolicySaved {
+        seq: u64,
+    },
+    /// A policy read-back body — either the full signed record (owner) or the
+    /// grantee's limited `{read_class, may_read}` view (Q4). Pre-serialized JSON.
+    PolicyBody {
+        json: String,
     },
 }
 
@@ -736,7 +785,12 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         Op::GetObject { .. }
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
-        | Op::ListBlobs { .. } => Ok(()),
+        | Op::ListBlobs { .. }
+        // PutPolicy is self-authorizing (the signed record proves owner authority
+        // in op_put_policy, like PutManifest); GetPolicy applies owner-only
+        // reader-set visibility inside op_get_policy. Both are checked in-handler.
+        | Op::PutPolicy { .. }
+        | Op::GetPolicy { .. } => Ok(()),
     }
 }
 
@@ -806,6 +860,8 @@ pub(crate) fn dispatch(
         Op::GetManifest { did } => op_get_manifest(state, &did),
         Op::GetMeter { did } => op_get_meter(state, &did),
         Op::ListBlobs { did } => op_list_blobs(state, principal, &did),
+        Op::PutPolicy { did, cid, body } => op_put_policy(state, &did, cid.as_deref(), &body),
+        Op::GetPolicy { did, cid } => op_get_policy(state, principal, &did, cid.as_deref()),
     }
 }
 
@@ -1115,6 +1171,101 @@ fn op_list_blobs(
     Ok(OpOutcome::BlobList { cids })
 }
 
+/// Set/replace a target's read policy from an owner-authorized record (Model A:
+/// an `id:` owner submits a self-signed [`PolicyRecord`]). The record must name
+/// the routed target, advance the stored `seq`, and verify — otherwise a distinct
+/// 4xx is returned. Verified records are persisted; reads honor them immediately
+/// via the dispatch gate.
+fn op_put_policy(
+    state: &AppState,
+    did: &str,
+    cid: Option<&str>,
+    body: &[u8],
+) -> Result<OpOutcome, ServerError> {
+    let record: PolicyRecord = serde_json::from_slice(body)
+        .map_err(|_| ServerError::BadPolicy("body is not a valid policy record"))?;
+
+    // The record's target must match the route — a caller cannot set a policy for
+    // a DID/object other than the one the URL names.
+    if record.did() != did || record.cid() != cid {
+        return Err(ServerError::BadPolicy("policy target does not match the route"));
+    }
+
+    let store = lock_store(&state.store);
+    let prior_seq = store.policy_seq(did, cid)?;
+
+    // Anti-rollback at verify time: a replayed/equal/lower seq is refused with a
+    // distinct status, named before the signature check.
+    if let Some(prior) = prior_seq {
+        if record.seq() <= prior {
+            tracing::info!(
+                resource = %did, cid = ?cid, seq = record.seq(), prior,
+                reason = "lower seq", "policy-set denied"
+            );
+            return Err(ServerError::PolicyStale);
+        }
+    }
+
+    // Authorization: the record's own signature must verify (OwnerSigned derives
+    // the id: target; a ProviderAttested record verifies under the provider's
+    // dedicated attestation key). seq was already checked above, so pass None.
+    if !verify_policy(&record, None, &state.provider.attest_verifying_key()) {
+        tracing::info!(
+            resource = %did, cid = ?cid, reason = "unauthorized policy",
+            "policy-set denied"
+        );
+        return Err(ServerError::PolicyUnauthorized);
+    }
+
+    store.save_policy(&record)?;
+    let form = match record.authorization() {
+        Authorization::OwnerSigned(_) => "OwnerSigned",
+        Authorization::ProviderAttested(_) => "ProviderAttested",
+    };
+    tracing::debug!(
+        resource = %did, cid = ?cid, seq = record.seq(), form,
+        read_class = ?record.read_class(), "policy stored"
+    );
+    Ok(OpOutcome::PolicySaved { seq: record.seq() })
+}
+
+/// Read back a target's policy record, with **owner-only reader-set visibility**
+/// (Q4): the owner sees the full signed record; a grantee sees only that it may
+/// read (its read class, never the reader set); anyone else who cannot read the
+/// target gets a 404 — the same oracle-free denial as a gated blob read.
+fn op_get_policy(
+    state: &AppState,
+    principal: &Principal,
+    did: &str,
+    cid: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    let record = lock_store(&state.store)
+        .load_policy(did, cid)?
+        .ok_or(ServerError::NotFound)?;
+    let caller = principal.did();
+
+    if caller == Some(did) {
+        // The owner: the full signed record, including readers[].
+        return Ok(OpOutcome::PolicyBody {
+            json: serde_json::to_string(&record)?,
+        });
+    }
+
+    // A non-owner sees the record only if it may read the target, and then only
+    // its own access — never the reader set.
+    if ResolvedPolicy::from_record(&record).allows(caller, did) {
+        let view = serde_json::json!({
+            "read_class": record.read_class(),
+            "may_read": true,
+        });
+        Ok(OpOutcome::PolicyBody {
+            json: view.to_string(),
+        })
+    } else {
+        Err(ServerError::NotFound)
+    }
+}
+
 // ---- HTTP handlers: extract inputs, route through the dispatch boundary. ----
 
 async fn put_object_handler(
@@ -1141,14 +1292,18 @@ async fn put_object_handler(
 async fn get_object_handler(
     State(state): State<AppState>,
     Path((did, addr)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     let addr = ContentAddr::parse(&addr)?;
+    // Authenticate the reader (an `id:` session) so a grantee is recognized by the
+    // gated-read gate; an unauthenticated read is anonymous and sees only world
+    // objects. (`did:`-reader JWT auth for reads lands in Phase 6.)
+    let principal = authenticate(&headers);
     tracing::info!(method = "GET", did = %did, cid = %addr, "object boundary");
-    // Object reads are world-readable (PDS-compat default).
     dispatch_blocking(
         &state,
-        Principal::Anonymous,
+        principal,
         Op::GetObject {
             did: did.into_string(),
             cid: addr.into_string(),
@@ -1191,6 +1346,87 @@ async fn get_manifest_handler(
     let did = Did::parse(&did)?;
     // The manifest is a signed, world-readable record (PDS-compat).
     dispatch_blocking(&state, Principal::Anonymous, Op::GetManifest { did: did.into_string() }).await
+}
+
+/// `PUT /{did}/policy` — set the namespace read policy. The body is a
+/// self-authorizing [`PolicyRecord`] (`op_put_policy` verifies it); no session
+/// header is needed, exactly like `put_manifest_handler`.
+async fn put_policy_handler(
+    State(state): State<AppState>,
+    Path(did): Path<String>,
+    body: Bytes,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    dispatch_blocking(
+        &state,
+        Principal::Anonymous,
+        Op::PutPolicy {
+            did: did.into_string(),
+            cid: None,
+            body: body.to_vec(),
+        },
+    )
+    .await
+}
+
+/// `PUT /{did}/objects/{addr}/policy` — set a per-object read policy.
+async fn put_object_policy_handler(
+    State(state): State<AppState>,
+    Path((did, addr)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let addr = ContentAddr::parse(&addr)?;
+    dispatch_blocking(
+        &state,
+        Principal::Anonymous,
+        Op::PutPolicy {
+            did: did.into_string(),
+            cid: Some(addr.into_string()),
+            body: body.to_vec(),
+        },
+    )
+    .await
+}
+
+/// `GET /{did}/policy` — read back the namespace policy. Authenticated so the
+/// owner sees the full record and a grantee its limited view (Q4).
+async fn get_policy_handler(
+    State(state): State<AppState>,
+    Path(did): Path<String>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate(&headers);
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::GetPolicy {
+            did: did.into_string(),
+            cid: None,
+        },
+    )
+    .await
+}
+
+/// `GET /{did}/objects/{addr}/policy` — read back a per-object policy (Q4).
+async fn get_object_policy_handler(
+    State(state): State<AppState>,
+    Path((did, addr)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let addr = ContentAddr::parse(&addr)?;
+    let principal = authenticate(&headers);
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::GetPolicy {
+            did: did.into_string(),
+            cid: Some(addr.into_string()),
+        },
+    )
+    .await
 }
 
 async fn get_meter_handler(
@@ -1269,7 +1505,7 @@ impl IntoResponse for OpOutcome {
                 "total_bytes": total_bytes,
             }))
             .into_response(),
-            OpOutcome::ManifestBody { json } => {
+            OpOutcome::ManifestBody { json } | OpOutcome::PolicyBody { json } => {
                 ([("content-type", "application/json")], json).into_response()
             }
             OpOutcome::Meter {
@@ -1288,6 +1524,9 @@ impl IntoResponse for OpOutcome {
             .into_response(),
             OpOutcome::BlobList { cids } => {
                 Json(serde_json::json!({ "cids": cids })).into_response()
+            }
+            OpOutcome::PolicySaved { seq } => {
+                Json(serde_json::json!({ "seq": seq })).into_response()
             }
         }
     }
@@ -1371,6 +1610,16 @@ pub enum ServerError {
     /// A blocking dispatch task failed to join (e.g. panicked) — never expected.
     #[error("internal task failure")]
     TaskJoin,
+    /// A policy record was malformed or its target did not match the route.
+    #[error("invalid policy: {0}")]
+    BadPolicy(&'static str),
+    /// A policy record failed authorization (bad/forged signature, wrong signer,
+    /// or an `OwnerSigned` record naming a non-`id:` target).
+    #[error("forbidden: policy record is not authorized for this target")]
+    PolicyUnauthorized,
+    /// A policy write did not advance the stored sequence (anti-rollback).
+    #[error("conflict: policy seq does not supersede the stored policy")]
+    PolicyStale,
 }
 
 impl IntoResponse for ServerError {
@@ -1380,8 +1629,12 @@ impl IntoResponse for ServerError {
             ServerError::BadManifest(_)
             | ServerError::BadPubkey
             | ServerError::BadCid(_)
+            | ServerError::BadPolicy(_)
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
-            ServerError::DidKeyMismatch | ServerError::Forbidden => StatusCode::FORBIDDEN,
+            ServerError::DidKeyMismatch
+            | ServerError::Forbidden
+            | ServerError::PolicyUnauthorized => StatusCode::FORBIDDEN,
+            ServerError::PolicyStale => StatusCode::CONFLICT,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
