@@ -28,7 +28,6 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ciss_auth::Principal;
 use serde::Deserialize;
 
 use crate::cidv1;
@@ -124,19 +123,24 @@ struct GetBlobParams {
     cid: String,
 }
 
-/// `com.atproto.sync.getBlob` — return a blob's raw bytes (public), metered.
+/// `com.atproto.sync.getBlob` — return a blob's raw bytes, metered. Public by
+/// default (world read), but a `Bearer` service-auth JWT (or `id:` session)
+/// authenticates the reader so a `did:`/`id:` **grantee** can read a gated blob.
 async fn get_blob(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<GetBlobParams>,
 ) -> Result<Response, ServerError> {
     let did = Did::parse(&params.did)?;
     let hex = cidv1::to_sha256_hex(&params.cid)?;
     tracing::info!(endpoint = "getBlob", did = %did, blob_cid = %params.cid, "atproto blob boundary");
 
-    // getBlob is public (PDS-compat world read).
+    // Authenticate the reader (did: JWT bound to getBlob, or id: session); no
+    // credential -> anonymous, which sees only world-readable blobs.
+    let principal = authenticate_atproto(&state, &headers, "com.atproto.sync.getBlob").await;
     let outcome = dispatch_blocking(
         &state,
-        Principal::Anonymous,
+        principal,
         Op::GetObject {
             did: did.into_string(),
             cid: hex,
@@ -166,15 +170,17 @@ struct ListBlobsParams {
 /// `com.atproto.sync.listBlobs` — the CIDv1 addresses a DID has uploaded (public).
 async fn list_blobs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListBlobsParams>,
 ) -> Result<Response, ServerError> {
     let did = Did::parse(&params.did)?;
     tracing::info!(endpoint = "listBlobs", did = %did, "atproto blob boundary");
 
-    // listBlobs is public (PDS-compat world read).
+    // Authenticate the reader so a grantee sees its granted blobs; an anonymous
+    // caller sees only the world-readable cids.
+    let principal = authenticate_atproto(&state, &headers, "com.atproto.sync.listBlobs").await;
     let outcome =
-        dispatch_blocking(&state, Principal::Anonymous, Op::ListBlobs { did: did.into_string() })
-            .await?;
+        dispatch_blocking(&state, principal, Op::ListBlobs { did: did.into_string() }).await?;
     let OpOutcome::BlobList { cids } = outcome else {
         return Err(ServerError::BadConfig);
     };

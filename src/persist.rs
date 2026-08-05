@@ -17,6 +17,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::manifest::Manifest;
+use crate::policy::{PolicyRecord, ResolvedPolicy};
 use crate::receipts::{Direction, Receipt};
 use crate::statements::Statement;
 
@@ -49,6 +50,16 @@ pub enum PersistError {
     /// A record failed to (de)serialize as JSON.
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A policy write did not supersede the stored policy for its target — the
+    /// new `seq` was not strictly greater. The write is rejected (anti-rollback),
+    /// the stored policy is unchanged.
+    #[error("policy seq {seq} does not supersede the stored policy for {target}")]
+    StalePolicySeq {
+        /// The rejected target (a DID, or `did/cid` for an object policy).
+        target: String,
+        /// The rejected sequence number.
+        seq: u64,
+    },
 }
 
 /// One row of the `did_usage` read surface: a DID's storage + transfer usage.
@@ -182,6 +193,18 @@ impl Store {
                  download_bytes INTEGER NOT NULL DEFAULT 0,
                  stored_bytes   INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE IF NOT EXISTS namespace_policy (
+                 did  TEXT PRIMARY KEY,
+                 seq  INTEGER NOT NULL,
+                 json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS object_policy (
+                 did  TEXT NOT NULL,
+                 cid  TEXT NOT NULL,
+                 seq  INTEGER NOT NULL,
+                 json TEXT NOT NULL,
+                 PRIMARY KEY (did, cid)
+             );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);
              CREATE VIEW IF NOT EXISTS did_usage AS
@@ -267,6 +290,200 @@ impl Store {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
         }
+    }
+
+    /// Persist a verified policy record for its target (a namespace `did`, or a
+    /// `(did, cid)` object), enforcing anti-rollback **in-transaction**: the write
+    /// applies only if its `seq` strictly exceeds the stored policy's `seq` for the
+    /// same target. A stale/equal `seq` is rejected with
+    /// [`PersistError::StalePolicySeq`] and the stored policy is left unchanged.
+    ///
+    /// The caller (the set-policy handler) verifies the record's signature *before*
+    /// calling this; persistence is not a trust boundary. The seq guard here is
+    /// defense-in-depth against a racing lower-seq write.
+    ///
+    /// # Errors
+    /// Returns [`PersistError::StalePolicySeq`] if the write does not supersede, or
+    /// [`PersistError`] on a SQLite or serialization failure.
+    pub fn save_policy(&self, record: &PolicyRecord) -> Result<(), PersistError> {
+        let json = serde_json::to_string(record)?;
+        let seq = i64::try_from(record.seq()).unwrap_or(i64::MAX);
+        let tx = self.conn.unchecked_transaction()?;
+        // The conditional upsert applies only when the new seq strictly exceeds
+        // the stored seq (a fresh insert always applies); a stale/equal seq
+        // changes zero rows, which we surface as StalePolicySeq (anti-rollback).
+        let (applied, target) = match record.cid() {
+            None => {
+                let n = tx.execute(
+                    "INSERT INTO namespace_policy (did, seq, json) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(did) DO UPDATE SET seq = excluded.seq, json = excluded.json
+                     WHERE excluded.seq > namespace_policy.seq",
+                    rusqlite::params![record.did(), seq, json],
+                )?;
+                (n, record.did().to_owned())
+            }
+            Some(cid) => {
+                let n = tx.execute(
+                    "INSERT INTO object_policy (did, cid, seq, json) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(did, cid) DO UPDATE SET seq = excluded.seq, json = excluded.json
+                     WHERE excluded.seq > object_policy.seq",
+                    rusqlite::params![record.did(), cid, seq, json],
+                )?;
+                (n, format!("{}/{cid}", record.did()))
+            }
+        };
+        tx.commit()?;
+        if applied == 0 {
+            return Err(PersistError::StalePolicySeq {
+                target,
+                seq: record.seq(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve the effective read policy for a target, finest-grain-wins: a
+    /// per-object policy overrides a namespace policy, which overrides the
+    /// world-readable default. A stored row that fails to parse resolves
+    /// **fail-closed** to [`ResolvedPolicy::deny`] (owner-only) — never to a more
+    /// permissive value.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn resolve_policy(
+        &self,
+        did: &str,
+        cid: Option<&str>,
+    ) -> Result<ResolvedPolicy, PersistError> {
+        // Finest grain first: a per-object policy, if the target names an object
+        // and a row exists for it, is authoritative — its mere presence overrides
+        // the namespace (so an unparseable object row fails closed here, it does
+        // not fall through to a possibly-wider namespace policy).
+        if let Some(cid) = cid {
+            if let Some(json) = self.policy_json("object_policy", did, Some(cid))? {
+                return Ok(resolved_from_json(&json));
+            }
+        }
+        if let Some(json) = self.policy_json("namespace_policy", did, None)? {
+            return Ok(resolved_from_json(&json));
+        }
+        // No policy row anywhere → the world-readable default.
+        Ok(ResolvedPolicy::world())
+    }
+
+    /// Resolve **only** a per-object policy for `(did, cid)`, returning `None` when
+    /// the object has no policy of its own (so the caller can fall back to a
+    /// namespace policy it resolved once). An unparseable object row fails closed
+    /// to [`ResolvedPolicy::deny`]. This is the batch primitive for `listBlobs`:
+    /// resolve the namespace once, then one object lookup per cid.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn resolve_object_policy(
+        &self,
+        did: &str,
+        cid: &str,
+    ) -> Result<Option<ResolvedPolicy>, PersistError> {
+        Ok(self
+            .policy_json("object_policy", did, Some(cid))?
+            .map(|json| resolved_from_json(&json)))
+    }
+
+    /// Whether `did` has any per-object policy rows at all — a single `EXISTS`
+    /// query that lets `listBlobs` skip per-cid checks entirely for the common
+    /// fully-ungated DID.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn has_object_policies(&self, did: &str) -> Result<bool, PersistError> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object_policy WHERE did = ?1)",
+            [did],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// The stored policy `seq` for a target, if a policy row exists — the
+    /// `prior_seq` fed to `verify_policy` at write time so a replayed/lower-seq
+    /// policy is refused before it is stored.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn policy_seq(&self, did: &str, cid: Option<&str>) -> Result<Option<u64>, PersistError> {
+        let seq: Option<i64> = match cid {
+            None => self
+                .conn
+                .query_row(
+                    "SELECT seq FROM namespace_policy WHERE did = ?1",
+                    [did],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            Some(cid) => self
+                .conn
+                .query_row(
+                    "SELECT seq FROM object_policy WHERE did = ?1 AND cid = ?2",
+                    [did, cid],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        Ok(seq.map(|s| u64::try_from(s).unwrap_or(0)))
+    }
+
+    /// Load a target's full stored policy record, if present — the durable signed
+    /// artifact, for policy read-back. Unlike [`Store::resolve_policy`] (which
+    /// fails closed for the read gate), this surfaces a parse failure as an error:
+    /// an owner reading back its own record should see a loud failure, not a
+    /// silent default.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite or deserialization failure.
+    pub fn load_policy(
+        &self,
+        did: &str,
+        cid: Option<&str>,
+    ) -> Result<Option<PolicyRecord>, PersistError> {
+        let table = if cid.is_some() {
+            "object_policy"
+        } else {
+            "namespace_policy"
+        };
+        match self.policy_json(table, did, cid)? {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a policy row's stored JSON for a target, if present. `table` is a
+    /// fixed internal literal (`namespace_policy` / `object_policy`), never
+    /// caller-supplied, so its interpolation carries no injection surface.
+    fn policy_json(
+        &self,
+        table: &str,
+        did: &str,
+        cid: Option<&str>,
+    ) -> Result<Option<String>, PersistError> {
+        let json: Option<String> = match cid {
+            None => self
+                .conn
+                .query_row(
+                    &format!("SELECT json FROM {table} WHERE did = ?1"),
+                    [did],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            Some(cid) => self
+                .conn
+                .query_row(
+                    &format!("SELECT json FROM {table} WHERE did = ?1 AND cid = ?2"),
+                    [did, cid],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        Ok(json)
     }
 
     /// Append a receipt to the DID's co-signed record set, keeping the cached
@@ -477,12 +694,24 @@ impl Store {
     }
 }
 
+/// Build a [`ResolvedPolicy`] from a stored policy row's JSON, **failing closed**:
+/// a row that will not parse resolves to owner-only ([`ResolvedPolicy::deny`]),
+/// never to the permissive world default. A stored row means the owner set a
+/// policy; if we cannot read it, we must not widen access.
+fn resolved_from_json(json: &str) -> ResolvedPolicy {
+    match serde_json::from_str::<PolicyRecord>(json) {
+        Ok(record) => ResolvedPolicy::from_record(&record),
+        Err(_) => ResolvedPolicy::deny(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Store;
     use crate::crypto::derive_keypair;
     use crate::identity::derive_id;
     use crate::manifest::{build_manifest, ManifestLeaf};
+    use crate::policy::{PolicyRecord, ReadClass};
 
     #[test]
     fn manifest_upsert_keeps_only_the_latest() {
@@ -497,6 +726,144 @@ mod tests {
 
         let loaded = store.load_manifest(&did).expect("load").expect("present");
         assert_eq!(loaded.root(), m2.root(), "upsert keeps the latest manifest");
+    }
+
+    #[test]
+    fn resolve_is_object_over_namespace_over_world() {
+        let owner = derive_keypair("m", "policy-owner");
+        let did = derive_id(&owner.verifying_key());
+        let cid = crate::crypto::sha256_hex(b"obj");
+        let alice = "did:plc:alice".to_owned();
+        let store = Store::open_in_memory().expect("open");
+
+        // No rows anywhere → the world default.
+        assert_eq!(
+            store.resolve_policy(&did, Some(&cid)).expect("resolve").read_class(),
+            ReadClass::World,
+        );
+
+        // A namespace policy gates the whole DID.
+        let ns = PolicyRecord::sign_owner(
+            &did,
+            None,
+            ReadClass::Grantees,
+            std::slice::from_ref(&alice),
+            1,
+            &owner,
+        );
+        store.save_policy(&ns).expect("save namespace");
+        assert_eq!(
+            store.resolve_policy(&did, None).expect("resolve").read_class(),
+            ReadClass::Grantees,
+        );
+        // An object with no policy of its own inherits the namespace policy.
+        assert_eq!(
+            store.resolve_policy(&did, Some(&cid)).expect("resolve").read_class(),
+            ReadClass::Grantees,
+            "object inherits namespace when it has no own policy",
+        );
+
+        // A per-object policy overrides the namespace for that object only.
+        let obj = PolicyRecord::sign_owner(&did, Some(&cid), ReadClass::World, &[], 1, &owner);
+        store.save_policy(&obj).expect("save object");
+        assert_eq!(
+            store.resolve_policy(&did, Some(&cid)).expect("resolve").read_class(),
+            ReadClass::World,
+            "object policy overrides namespace",
+        );
+        assert_eq!(
+            store.resolve_policy(&did, None).expect("resolve").read_class(),
+            ReadClass::Grantees,
+            "namespace policy is unchanged by the object override",
+        );
+    }
+
+    #[test]
+    fn higher_seq_supersedes_equal_or_lower_is_rejected() {
+        let owner = derive_keypair("m", "policy-owner");
+        let did = derive_id(&owner.verifying_key());
+        let alice = "did:plc:alice".to_owned();
+        let bob = "did:plc:bob".to_owned();
+        let store = Store::open_in_memory().expect("open");
+
+        let s1 = PolicyRecord::sign_owner(
+            &did,
+            None,
+            ReadClass::Grantees,
+            std::slice::from_ref(&alice),
+            1,
+            &owner,
+        );
+        store.save_policy(&s1).expect("save seq 1");
+
+        // Equal seq is rejected; the stored policy is unchanged.
+        let equal = PolicyRecord::sign_owner(
+            &did,
+            None,
+            ReadClass::Grantees,
+            &[alice.clone(), bob.clone()],
+            1,
+            &owner,
+        );
+        assert!(
+            matches!(
+                store.save_policy(&equal),
+                Err(super::PersistError::StalePolicySeq { .. })
+            ),
+            "equal seq is rejected",
+        );
+        assert_eq!(
+            store.resolve_policy(&did, None).expect("resolve").readers(),
+            std::slice::from_ref(&alice),
+            "a rejected write leaves the stored policy unchanged",
+        );
+
+        // Lower seq is rejected.
+        let lower = PolicyRecord::sign_owner(&did, None, ReadClass::Owner, &[], 0, &owner);
+        assert!(store.save_policy(&lower).is_err(), "lower seq is rejected");
+
+        // Strictly-higher seq supersedes.
+        let s2 = PolicyRecord::sign_owner(
+            &did,
+            None,
+            ReadClass::Grantees,
+            &[alice.clone(), bob.clone()],
+            2,
+            &owner,
+        );
+        store.save_policy(&s2).expect("save seq 2");
+        assert_eq!(
+            store.resolve_policy(&did, None).expect("resolve").readers().len(),
+            2,
+            "the higher-seq policy is now in force",
+        );
+    }
+
+    #[test]
+    fn unparseable_row_resolves_fail_closed_to_deny() {
+        let store = Store::open_in_memory().expect("open");
+        let did = "id:corrupt";
+        // A garbage row (corruption, or a hostile direct write) must never widen
+        // access — it fails closed to owner-only, not to the world default.
+        store
+            .conn
+            .execute(
+                "INSERT INTO namespace_policy (did, seq, json) VALUES (?1, ?2, ?3)",
+                rusqlite::params![did, 1_i64, "{ not valid json"],
+            )
+            .expect("raw insert");
+        let resolved = store.resolve_policy(did, None).expect("resolve");
+        assert_eq!(
+            resolved.read_class(),
+            ReadClass::Owner,
+            "an unparseable row is owner-only (fail-closed)",
+        );
+        assert!(resolved.readers().is_empty(), "no grantees on a fail-closed resolve");
+        assert_ne!(
+            resolved.read_class(),
+            ReadClass::World,
+            "fail-closed must never be the permissive default",
+        );
     }
 
     #[test]

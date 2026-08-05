@@ -19,6 +19,7 @@
 //! per-DID compute-observability wrapper (`ROADMAP_TODO` E83) can scope a heavy
 //! op into a per-DID cgroup without a rewrite.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,6 +44,7 @@ use crate::identifiers::{ContentAddr, Did};
 use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
+use crate::policy::{verify_policy, Authorization, PolicyRecord, ReadClass, ResolvedPolicy};
 use crate::pricing::postage_cents;
 use crate::receipts::{
     make_unilateral_receipt, select_mode, Direction, Receipt, ReceiptCore, ReceiptMode,
@@ -63,6 +65,17 @@ const SESSION_HEADER: &str = "x-croft-session";
 /// a server-issued nonce; the [`Principal`] boundary does not change.
 const SESSION_CHALLENGE_PREFIX: &str = "ciss-session/v1/";
 
+/// The lexicon method id a Model-C set-policy service-auth JWT must be bound to
+/// (`lxm`). A CISS-defined method (Q2): the `did:` owner's provider signs a token
+/// authorizing exactly this action, so a token minted for another method cannot
+/// be replayed to set policy.
+pub(crate) const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+
+/// The lexicon method a `did:` caller's **policy read-back** JWT binds to. Lets a
+/// `did:` owner (whose key lives at an external provider, so it holds no `id:`
+/// session) read its own policy back over the `did:` auth path.
+pub(crate) const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
+
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -77,22 +90,39 @@ fn as_u64(n: usize) -> u64 {
 }
 
 /// The provider's own identity (keypair + derived id). Signs unilateral
-/// (our-side measurement) receipts at the boundary.
+/// (our-side measurement) receipts at the boundary, and — via a **separate**
+/// derived key — attests policy records for `did:` owners (Model C).
 struct Provider {
     id: String,
     keypair: Keypair,
+    /// A dedicated key for provider policy attestations (Model C), derived from
+    /// the same seed under a distinct label so the receipt/billing `keypair`
+    /// stays single-purpose (Q3 — separates metering crypto from authZ crypto,
+    /// gives independent rotation, no new secret at rest).
+    attest_keypair: Keypair,
 }
 
 impl Provider {
     fn from_seed(seed: &str) -> Self {
         let keypair = derive_keypair(seed, "provider");
+        let attest_keypair = derive_keypair(seed, "policy-attest");
         let id = derive_id(&keypair.verifying_key());
-        Self { id, keypair }
+        Self {
+            id,
+            keypair,
+            attest_keypair,
+        }
     }
 
     /// The provider's public key (hex) — a non-secret verification anchor.
     fn public_key_hex(&self) -> String {
         self.keypair.public_key_hex()
+    }
+
+    /// The provider's policy-attestation public key — the key `verify_policy`
+    /// checks a `ProviderAttested` record under (never the receipt key).
+    fn attest_verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.attest_keypair.verifying_key()
     }
 }
 
@@ -305,6 +335,14 @@ impl App {
                 "/{did}/manifest",
                 put(put_manifest_handler).get(get_manifest_handler),
             )
+            .route(
+                "/{did}/policy",
+                put(put_policy_handler).get(get_policy_handler),
+            )
+            .route(
+                "/{did}/objects/{addr}/policy",
+                put(put_object_policy_handler).get(get_object_policy_handler),
+            )
             .route("/{did}/meter", get(get_meter_handler))
             // The atproto PDS blob surface (Phase 8) — a thin layer over the
             // same metered byte-path, mounted at its XRPC paths.
@@ -459,6 +497,16 @@ fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A verified Model-C set-policy authorization: the `did:` owner authenticated by
+/// a service-auth JWT (the JWT `iss`), plus the single-use `jti` that authorized
+/// the action (recorded on the attested record for audit). Produced by the async
+/// handler *before* dispatch, since JWT verification resolves the DID over the
+/// network and dispatch runs on the blocking pool.
+pub(crate) struct AuthedWrite {
+    did: String,
+    jti: Option<String>,
+}
+
 /// A request routed through the dispatch boundary.
 pub(crate) enum Op {
     PutObject {
@@ -487,6 +535,22 @@ pub(crate) enum Op {
     ListBlobs {
         did: String,
     },
+    /// Set/replace the read policy for a target (namespace when `cid` is `None`,
+    /// else a single object). Model A (`authed = None`): `body` is a serialized,
+    /// owner-signed [`crate::policy::PolicyRecord`]. Model C (`authed = Some`):
+    /// `body` is a [`crate::policy::PolicyIntent`] and CISS builds + provider-
+    /// attests the record for the JWT-authenticated `did:` owner.
+    PutPolicy {
+        did: String,
+        cid: Option<String>,
+        body: Vec<u8>,
+        authed: Option<AuthedWrite>,
+    },
+    /// Read back a target's policy record (owner-only reader-set visibility, Q4).
+    GetPolicy {
+        did: String,
+        cid: Option<String>,
+    },
 }
 
 impl Op {
@@ -505,7 +569,9 @@ impl Op {
             | Op::PutManifest { .. }
             | Op::GetManifest { .. }
             | Op::GetMeter { .. }
-            | Op::ListBlobs { .. } => false,
+            | Op::ListBlobs { .. }
+            | Op::PutPolicy { .. }
+            | Op::GetPolicy { .. } => false,
         }
     }
 }
@@ -539,6 +605,15 @@ pub(crate) enum OpOutcome {
     /// first-upload order. The atproto layer maps each to a CIDv1 `$link`.
     BlobList {
         cids: Vec<String>,
+    },
+    /// A policy record was accepted and stored, at sequence `seq`.
+    PolicySaved {
+        seq: u64,
+    },
+    /// A policy read-back body — either the full signed record (owner) or the
+    /// grantee's limited `{read_class, may_read}` view (Q4). Pre-serialized JSON.
+    PolicyBody {
+        json: String,
     },
 }
 
@@ -597,19 +672,31 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// attempt failed. Tokens and keys are never logged — only DIDs (public), the
 /// method, and the reason.
 async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principal {
+    verify_service_auth_full(state, jwt, lxm).await.0
+}
+
+/// As [`verify_service_auth`], but also returns the verified token's `jti` on
+/// success — for callers that record which single-use token authorized an action
+/// (Model C provider attestation). Returns `(Principal::Anonymous, None)` on any
+/// failure.
+async fn verify_service_auth_full(
+    state: &AppState,
+    jwt: &str,
+    lxm: &str,
+) -> (Principal, Option<String>) {
     let Ok(iss) = ciss_auth::peek_iss(jwt) else {
         tracing::info!(lxm, reason = "malformed token", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     };
     // The `iss` must be an atproto `did:*`, never an internal `id:` (Phase 1
     // space typing): the atproto plane cannot assert a native identifier.
     let Ok(did) = Did::parse(&iss) else {
         tracing::info!(%iss, lxm, reason = "malformed iss", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     };
     if did.require_atproto().is_err() {
         tracing::info!(%iss, lxm, reason = "iss not an atproto did", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     }
     let now = now_unix_s();
     let params = ServiceAuthParams {
@@ -622,26 +709,26 @@ async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principa
     // key (survives a key rotation between cache-fill and now).
     let Ok(keys) = state.resolver.resolve(&iss, false).await else {
         tracing::info!(%iss, lxm, reason = "did resolution failed", "service-auth denied");
-        return Principal::Anonymous;
+        return (Principal::Anonymous, None);
     };
     let verified = match ciss_auth::verify_service_auth_jwt(jwt, &keys, &params) {
         Ok(v) => v,
         Err(ciss_auth::JwtError::SignatureInvalid) => {
             let Ok(fresh) = state.resolver.resolve(&iss, true).await else {
                 tracing::info!(%iss, lxm, reason = "did resolution failed", "service-auth denied");
-                return Principal::Anonymous;
+                return (Principal::Anonymous, None);
             };
             match ciss_auth::verify_service_auth_jwt(jwt, &fresh, &params) {
                 Ok(v) => v,
                 Err(reason) => {
                     tracing::info!(%iss, lxm, %reason, "service-auth denied");
-                    return Principal::Anonymous;
+                    return (Principal::Anonymous, None);
                 }
             }
         }
         Err(reason) => {
             tracing::info!(%iss, lxm, %reason, "service-auth denied");
-            return Principal::Anonymous;
+            return (Principal::Anonymous, None);
         }
     };
     // Replay defense: a token carrying a `jti` is single-use within its window.
@@ -652,12 +739,13 @@ async fn verify_service_auth(state: &AppState, jwt: &str, lxm: &str) -> Principa
             .is_err()
         {
             tracing::info!(%iss, lxm, reason = "replayed jti", "service-auth denied");
-            return Principal::Anonymous;
+            return (Principal::Anonymous, None);
         }
     }
     // Grant: this DID is authorized for this method (the auth-impacting decision).
     tracing::debug!(did = %verified.did, lxm, aud = %state.service_did, "service-auth granted");
-    verified.principal()
+    let jti = verified.jti.clone();
+    (verified.principal(), jti)
 }
 
 /// The current time in unix seconds (for JWT `exp`).
@@ -734,7 +822,51 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         Op::GetObject { .. }
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
-        | Op::ListBlobs { .. } => Ok(()),
+        | Op::ListBlobs { .. }
+        // PutPolicy is self-authorizing (the signed record proves owner authority
+        // in op_put_policy, like PutManifest); GetPolicy applies owner-only
+        // reader-set visibility inside op_get_policy. Both are checked in-handler.
+        | Op::PutPolicy { .. }
+        | Op::GetPolicy { .. } => Ok(()),
+    }
+}
+
+/// Gate a read op by its target's resolved read policy (gated reads, ADR 0001
+/// §2). Runs after the base [`authorize`] in [`dispatch`], where the `Store` is
+/// reachable (the pure `authorize` cannot resolve policy). A denied read maps to
+/// [`ServerError::NotFound`] — a 404 indistinguishable from "no such object", so a
+/// gated object is never an existence oracle. The `world` default (and any object
+/// with no policy row, which resolves to `world`) is allowed on the fast path
+/// without a log line; only non-`world` decisions are traced.
+///
+/// Reads are **membership-only**: the policy signature was verified once at write
+/// time (Phases 5/6) before the row was stored, and the row is CISS's own SQLite,
+/// so there is no per-read signature check on the hot path. A stored row that
+/// fails to parse resolves fail-closed (owner-only) inside `resolve_policy`.
+///
+/// Only `GetObject` is gated here; `ListBlobs` filters per-cid in its own handler
+/// (Phase 4). Non-read ops return `Ok(())` unchanged.
+fn authorize_read(state: &AppState, principal: &Principal, op: &Op) -> Result<(), ServerError> {
+    let Op::GetObject { did, cid } = op else {
+        return Ok(());
+    };
+    let resolved = lock_store(&state.store).resolve_policy(did, Some(cid))?;
+    if resolved.read_class() == ReadClass::World {
+        return Ok(());
+    }
+    let caller = principal.did();
+    if resolved.allows(caller, did) {
+        tracing::debug!(
+            resource = %did, %cid, read_class = ?resolved.read_class(),
+            "gated-read granted"
+        );
+        Ok(())
+    } else {
+        tracing::info!(
+            resource = %did, %cid, actor = ?caller, reason = "not a grantee",
+            "gated-read denied"
+        );
+        Err(ServerError::NotFound)
     }
 }
 
@@ -747,6 +879,7 @@ pub(crate) fn dispatch(
     op: Op,
 ) -> Result<OpOutcome, ServerError> {
     authorize(principal, &op)?;
+    authorize_read(state, principal, &op)?;
     // SEAM (E83): a heavy op would enter a per-DID cgroup scope here; v0 ops are
     // all cheap, so dispatch runs in-process. The classification is live so the
     // wrapper slots in without a handler rewrite.
@@ -763,7 +896,14 @@ pub(crate) fn dispatch(
         } => op_put_manifest(state, &did, &pubkey_hex, &body),
         Op::GetManifest { did } => op_get_manifest(state, &did),
         Op::GetMeter { did } => op_get_meter(state, &did),
-        Op::ListBlobs { did } => op_list_blobs(state, &did),
+        Op::ListBlobs { did } => op_list_blobs(state, principal, &did),
+        Op::PutPolicy {
+            did,
+            cid,
+            body,
+            authed,
+        } => op_put_policy(state, &did, cid.as_deref(), &body, authed.as_ref()),
+        Op::GetPolicy { did, cid } => op_get_policy(state, principal, &did, cid.as_deref()),
     }
 }
 
@@ -1024,18 +1164,176 @@ fn op_get_meter(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
 /// The distinct content addresses a DID has uploaded, in first-upload order.
 /// The ledger's upload receipts are the source of truth for "which blobs this
 /// DID stored" — no backend enumeration primitive is required.
-fn op_list_blobs(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
-    let receipts = lock_store(&state.store).load_receipts(did)?;
-    let mut cids: Vec<String> = Vec::new();
+fn op_list_blobs(
+    state: &AppState,
+    principal: &Principal,
+    did: &str,
+) -> Result<OpOutcome, ServerError> {
+    let store = lock_store(&state.store);
+    let receipts = store.load_receipts(did)?;
+
+    // The distinct uploaded cids, in first-upload order (the ledger is the source
+    // of truth for "which blobs this DID stored").
+    let mut distinct: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
     for receipt in &receipts {
         if receipt.core().direction == Direction::Upload {
-            let cid = receipt.core().cid.clone();
-            if !cids.contains(&cid) {
-                cids.push(cid);
+            let cid = &receipt.core().cid;
+            if seen.insert(cid.clone()) {
+                distinct.push(cid.clone());
             }
         }
     }
+
+    // Fast path: a fully-ungated DID (no namespace policy, no object policy) needs
+    // no per-cid checks — every uploaded cid is world-readable (PDS-compat).
+    let namespace = store.resolve_policy(did, None)?;
+    if namespace.read_class() == ReadClass::World && !store.has_object_policies(did)? {
+        return Ok(OpOutcome::BlobList { cids: distinct });
+    }
+
+    // Gated DID: resolve the namespace once, then one object lookup per cid, and
+    // keep only the cids this caller may read. A hidden cid is neither listed nor
+    // counted — omission, not a 403, so `listBlobs` is not an enumeration oracle.
+    let caller = principal.did();
+    let mut cids: Vec<String> = Vec::new();
+    let mut hidden = 0usize;
+    for cid in distinct {
+        let resolved = match store.resolve_object_policy(did, &cid)? {
+            Some(object) => object,
+            None => namespace.clone(),
+        };
+        if resolved.allows(caller, did) {
+            cids.push(cid);
+        } else {
+            hidden += 1;
+        }
+    }
+    tracing::debug!(%did, shown = cids.len(), hidden, "listBlobs filtered");
     Ok(OpOutcome::BlobList { cids })
+}
+
+/// Set/replace a target's read policy from an owner-authorized record (Model A:
+/// an `id:` owner submits a self-signed [`PolicyRecord`]). The record must name
+/// the routed target, advance the stored `seq`, and verify — otherwise a distinct
+/// 4xx is returned. Verified records are persisted; reads honor them immediately
+/// via the dispatch gate.
+fn op_put_policy(
+    state: &AppState,
+    did: &str,
+    cid: Option<&str>,
+    body: &[u8],
+    authed: Option<&AuthedWrite>,
+) -> Result<OpOutcome, ServerError> {
+    let record = if let Some(auth) = authed {
+        // Model C: a `did:` owner authorized the action via a service-auth JWT
+        // (verified in the async handler). CISS builds the record from the intent
+        // and counter-signs it with its dedicated attestation key, so the stored
+        // record is durably verifiable without re-checking the JWT.
+        //
+        // The JWT must have authenticated the DID that owns the target.
+        if auth.did != did {
+            tracing::info!(
+                actor = %auth.did, resource = %did, reason = "did != target",
+                "policy-set denied"
+            );
+            return Err(ServerError::PolicyUnauthorized);
+        }
+        let intent: crate::policy::PolicyIntent = serde_json::from_slice(body)
+            .map_err(|_| ServerError::BadPolicy("body is not a valid policy intent"))?;
+        PolicyRecord::attest_provider(
+            did,
+            cid,
+            intent.read_class,
+            &intent.readers,
+            intent.seq,
+            auth.jti.as_deref().unwrap_or(""),
+            &state.provider.attest_keypair,
+        )
+    } else {
+        // Model A: an `id:` owner submitted a full self-signed record.
+        let record: PolicyRecord = serde_json::from_slice(body)
+            .map_err(|_| ServerError::BadPolicy("body is not a valid policy record"))?;
+        if record.did() != did || record.cid() != cid {
+            return Err(ServerError::BadPolicy("policy target does not match the route"));
+        }
+        record
+    };
+
+    let store = lock_store(&state.store);
+    let prior_seq = store.policy_seq(did, cid)?;
+
+    // Anti-rollback at verify time: a replayed/equal/lower seq is refused with a
+    // distinct status, named before the signature check.
+    if let Some(prior) = prior_seq {
+        if record.seq() <= prior {
+            tracing::info!(
+                resource = %did, cid = ?cid, seq = record.seq(), prior,
+                reason = "lower seq", "policy-set denied"
+            );
+            return Err(ServerError::PolicyStale);
+        }
+    }
+
+    // Authorization + structural validation: the record must verify (OwnerSigned
+    // derives the id: target; ProviderAttested verifies under the provider's
+    // dedicated attestation key). This also enforces readers-well-formed, so a
+    // malformed Model-C intent is refused here. seq was checked above, so None.
+    if !verify_policy(&record, None, &state.provider.attest_verifying_key()) {
+        tracing::info!(
+            resource = %did, cid = ?cid, reason = "unauthorized policy",
+            "policy-set denied"
+        );
+        return Err(ServerError::PolicyUnauthorized);
+    }
+
+    store.save_policy(&record)?;
+    let form = match record.authorization() {
+        Authorization::OwnerSigned(_) => "OwnerSigned",
+        Authorization::ProviderAttested(_) => "ProviderAttested",
+    };
+    tracing::debug!(
+        resource = %did, cid = ?cid, seq = record.seq(), form,
+        read_class = ?record.read_class(), "policy stored"
+    );
+    Ok(OpOutcome::PolicySaved { seq: record.seq() })
+}
+
+/// Read back a target's policy record, with **owner-only reader-set visibility**
+/// (Q4): the owner sees the full signed record; a grantee sees only that it may
+/// read (its read class, never the reader set); anyone else who cannot read the
+/// target gets a 404 — the same oracle-free denial as a gated blob read.
+fn op_get_policy(
+    state: &AppState,
+    principal: &Principal,
+    did: &str,
+    cid: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    let record = lock_store(&state.store)
+        .load_policy(did, cid)?
+        .ok_or(ServerError::NotFound)?;
+    let caller = principal.did();
+
+    if caller == Some(did) {
+        // The owner: the full signed record, including readers[].
+        return Ok(OpOutcome::PolicyBody {
+            json: serde_json::to_string(&record)?,
+        });
+    }
+
+    // A non-owner sees the record only if it may read the target, and then only
+    // its own access — never the reader set.
+    if ResolvedPolicy::from_record(&record).allows(caller, did) {
+        let view = serde_json::json!({
+            "read_class": record.read_class(),
+            "may_read": true,
+        });
+        Ok(OpOutcome::PolicyBody {
+            json: view.to_string(),
+        })
+    } else {
+        Err(ServerError::NotFound)
+    }
 }
 
 // ---- HTTP handlers: extract inputs, route through the dispatch boundary. ----
@@ -1064,14 +1362,18 @@ async fn put_object_handler(
 async fn get_object_handler(
     State(state): State<AppState>,
     Path((did, addr)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     let addr = ContentAddr::parse(&addr)?;
+    // Authenticate the reader (an `id:` session) so a grantee is recognized by the
+    // gated-read gate; an unauthenticated read is anonymous and sees only world
+    // objects. (`did:`-reader JWT auth for reads lands in Phase 6.)
+    let principal = authenticate(&headers);
     tracing::info!(method = "GET", did = %did, cid = %addr, "object boundary");
-    // Object reads are world-readable (PDS-compat default).
     dispatch_blocking(
         &state,
-        Principal::Anonymous,
+        principal,
         Op::GetObject {
             did: did.into_string(),
             cid: addr.into_string(),
@@ -1114,6 +1416,119 @@ async fn get_manifest_handler(
     let did = Did::parse(&did)?;
     // The manifest is a signed, world-readable record (PDS-compat).
     dispatch_blocking(&state, Principal::Anonymous, Op::GetManifest { did: did.into_string() }).await
+}
+
+/// Resolve the set-policy authorization from the request headers. A `Bearer`
+/// service-auth JWT selects **Model C** (a `did:` owner): it is verified here
+/// (async — DID resolution) against the `SET_POLICY_LXM` method, yielding the
+/// authenticated DID + `jti`. A present-but-invalid JWT is a hard 403. No bearer
+/// selects **Model A** (the body carries a self-signed record instead).
+async fn policy_write_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<AuthedWrite>, ServerError> {
+    match bearer_token(headers) {
+        Some(jwt) => {
+            let (principal, jti) = verify_service_auth_full(state, jwt, SET_POLICY_LXM).await;
+            match principal.did() {
+                Some(did) => Ok(Some(AuthedWrite {
+                    did: did.to_owned(),
+                    jti,
+                })),
+                None => Err(ServerError::PolicyUnauthorized),
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// `PUT /{did}/policy` — set the namespace read policy. Model A: the body is a
+/// self-signed [`PolicyRecord`]. Model C: a `Bearer` service-auth JWT authorizes
+/// a `did:` owner and the body is a [`crate::policy::PolicyIntent`].
+async fn put_policy_handler(
+    State(state): State<AppState>,
+    Path(did): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let authed = policy_write_auth(&state, &headers).await?;
+    dispatch_blocking(
+        &state,
+        Principal::Anonymous,
+        Op::PutPolicy {
+            did: did.into_string(),
+            cid: None,
+            body: body.to_vec(),
+            authed,
+        },
+    )
+    .await
+}
+
+/// `PUT /{did}/objects/{addr}/policy` — set a per-object read policy (Model A or C).
+async fn put_object_policy_handler(
+    State(state): State<AppState>,
+    Path((did, addr)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let addr = ContentAddr::parse(&addr)?;
+    let authed = policy_write_auth(&state, &headers).await?;
+    dispatch_blocking(
+        &state,
+        Principal::Anonymous,
+        Op::PutPolicy {
+            did: did.into_string(),
+            cid: Some(addr.into_string()),
+            body: body.to_vec(),
+            authed,
+        },
+    )
+    .await
+}
+
+/// `GET /{did}/policy` — read back the namespace policy. Authenticated so the
+/// owner sees the full record and a grantee its limited view (Q4). Accepts either
+/// a `did:` service-auth JWT (`lxm = getPolicy`) or an `id:` session, so a `did:`
+/// owner can read its own policy back.
+async fn get_policy_handler(
+    State(state): State<AppState>,
+    Path(did): Path<String>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::GetPolicy {
+            did: did.into_string(),
+            cid: None,
+        },
+    )
+    .await
+}
+
+/// `GET /{did}/objects/{addr}/policy` — read back a per-object policy (Q4).
+async fn get_object_policy_handler(
+    State(state): State<AppState>,
+    Path((did, addr)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let addr = ContentAddr::parse(&addr)?;
+    let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::GetPolicy {
+            did: did.into_string(),
+            cid: Some(addr.into_string()),
+        },
+    )
+    .await
 }
 
 async fn get_meter_handler(
@@ -1192,7 +1607,7 @@ impl IntoResponse for OpOutcome {
                 "total_bytes": total_bytes,
             }))
             .into_response(),
-            OpOutcome::ManifestBody { json } => {
+            OpOutcome::ManifestBody { json } | OpOutcome::PolicyBody { json } => {
                 ([("content-type", "application/json")], json).into_response()
             }
             OpOutcome::Meter {
@@ -1211,6 +1626,9 @@ impl IntoResponse for OpOutcome {
             .into_response(),
             OpOutcome::BlobList { cids } => {
                 Json(serde_json::json!({ "cids": cids })).into_response()
+            }
+            OpOutcome::PolicySaved { seq } => {
+                Json(serde_json::json!({ "seq": seq })).into_response()
             }
         }
     }
@@ -1294,6 +1712,16 @@ pub enum ServerError {
     /// A blocking dispatch task failed to join (e.g. panicked) — never expected.
     #[error("internal task failure")]
     TaskJoin,
+    /// A policy record was malformed or its target did not match the route.
+    #[error("invalid policy: {0}")]
+    BadPolicy(&'static str),
+    /// A policy record failed authorization (bad/forged signature, wrong signer,
+    /// or an `OwnerSigned` record naming a non-`id:` target).
+    #[error("forbidden: policy record is not authorized for this target")]
+    PolicyUnauthorized,
+    /// A policy write did not advance the stored sequence (anti-rollback).
+    #[error("conflict: policy seq does not supersede the stored policy")]
+    PolicyStale,
 }
 
 impl IntoResponse for ServerError {
@@ -1303,8 +1731,12 @@ impl IntoResponse for ServerError {
             ServerError::BadManifest(_)
             | ServerError::BadPubkey
             | ServerError::BadCid(_)
+            | ServerError::BadPolicy(_)
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
-            ServerError::DidKeyMismatch | ServerError::Forbidden => StatusCode::FORBIDDEN,
+            ServerError::DidKeyMismatch
+            | ServerError::Forbidden
+            | ServerError::PolicyUnauthorized => StatusCode::FORBIDDEN,
+            ServerError::PolicyStale => StatusCode::CONFLICT,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -1469,5 +1901,238 @@ mod tests {
             !inherit_fd_requested(Some("2"), Some("4242"), pid),
             "more than one fd is not the v0 single-socket case",
         );
+    }
+
+    // --- Gated reads (Phase 3): the dispatch-level authorization choke point.
+    // These exercise the real `dispatch` gate (dispatch → resolve_policy → allows
+    // → op_get_object | NotFound) with a policy seeded directly into the store
+    // (the HTTP set-policy route lands in Phase 5). ---
+
+    mod gated_reads {
+        use super::super::{dispatch, lock_store, App, Blobs, Db, Op, OpOutcome, ServerError};
+        use crate::crypto::derive_keypair;
+        use crate::identity::derive_id;
+        use crate::policy::{PolicyRecord, ReadClass};
+        use ciss_auth::Principal;
+
+        fn upload(app: &App, owner: &Principal, did: &str, bytes: &[u8]) -> String {
+            match dispatch(
+                &app.state,
+                owner,
+                Op::PutObject {
+                    did: did.to_owned(),
+                    key: "k".to_owned(),
+                    bytes: bytes.to_vec(),
+                },
+            )
+            .expect("owner uploads a blob")
+            {
+                OpOutcome::Stored { cid, .. } => cid,
+                _ => panic!("expected a Stored outcome from PutObject"),
+            }
+        }
+
+        #[test]
+        fn public_read_is_unbroken_without_a_policy() {
+            // Regression guard: with no policy row, a read stays world-readable
+            // (PDS-compat) — the gate must never over-reach.
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let cid = upload(&app, &owner, &did, b"public bytes");
+
+            let out = dispatch(
+                &app.state,
+                &Principal::Anonymous,
+                Op::GetObject {
+                    did: did.clone(),
+                    cid,
+                },
+            );
+            assert!(out.is_ok(), "anon reads a public (ungated) object");
+        }
+
+        #[test]
+        fn gated_object_denies_non_grantee_with_notfound() {
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let alice = "did:plc:alice".to_owned();
+            let cid = upload(&app, &owner, &did, b"secret bytes");
+
+            // The owner gates the whole namespace to grantees:[alice].
+            let policy = PolicyRecord::sign_owner(
+                &did,
+                None,
+                ReadClass::Grantees,
+                std::slice::from_ref(&alice),
+                1,
+                &owner_kp,
+            );
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed policy");
+
+            let get = |p: &Principal| {
+                dispatch(
+                    &app.state,
+                    p,
+                    Op::GetObject {
+                        did: did.clone(),
+                        cid: cid.clone(),
+                    },
+                )
+            };
+
+            // A denied read is a 404 (oracle-free), never the bytes.
+            assert!(
+                matches!(get(&Principal::Anonymous), Err(ServerError::NotFound)),
+                "anon is denied with 404, not the bytes",
+            );
+            assert!(
+                matches!(
+                    get(&Principal::Authenticated("did:plc:bob".to_owned())),
+                    Err(ServerError::NotFound)
+                ),
+                "a non-grantee is denied with 404",
+            );
+            // The grantee and the owner read.
+            assert!(get(&Principal::Authenticated(alice)).is_ok(), "the grantee reads");
+            assert!(get(&owner).is_ok(), "the owner reads its own gated object");
+        }
+
+        #[test]
+        fn owner_only_policy_admits_only_the_owner() {
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let cid = upload(&app, &owner, &did, b"owner-only bytes");
+
+            let policy =
+                PolicyRecord::sign_owner(&did, None, ReadClass::Owner, &[], 1, &owner_kp);
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed policy");
+
+            let get = |p: &Principal| {
+                dispatch(
+                    &app.state,
+                    p,
+                    Op::GetObject {
+                        did: did.clone(),
+                        cid: cid.clone(),
+                    },
+                )
+            };
+            assert!(get(&owner).is_ok(), "owner reads");
+            assert!(
+                matches!(get(&Principal::Anonymous), Err(ServerError::NotFound)),
+                "anon denied",
+            );
+            assert!(
+                matches!(
+                    get(&Principal::Authenticated("did:plc:alice".to_owned())),
+                    Err(ServerError::NotFound)
+                ),
+                "a stranger denied",
+            );
+        }
+
+        fn list(app: &App, p: &Principal, did: &str) -> Vec<String> {
+            match dispatch(
+                &app.state,
+                p,
+                Op::ListBlobs {
+                    did: did.to_owned(),
+                },
+            )
+            .expect("listBlobs")
+            {
+                OpOutcome::BlobList { cids } => cids,
+                _ => panic!("expected a BlobList outcome"),
+            }
+        }
+
+        #[test]
+        fn list_blobs_omits_a_hidden_object_cid() {
+            // A per-object gate on one blob under an (ungated) world namespace: the
+            // hidden cid is neither listed nor counted for a non-grantee, while the
+            // public cid stays visible to everyone.
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let alice = "did:plc:alice".to_owned();
+
+            let public = upload(&app, &owner, &did, b"public blob");
+            let secret = upload(&app, &owner, &did, b"secret blob");
+            let policy = PolicyRecord::sign_owner(
+                &did,
+                Some(&secret),
+                ReadClass::Grantees,
+                std::slice::from_ref(&alice),
+                1,
+                &owner_kp,
+            );
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed object policy");
+
+            assert_eq!(
+                list(&app, &Principal::Anonymous, &did),
+                vec![public.clone()],
+                "anon sees only the public cid; the hidden cid is neither listed nor counted",
+            );
+            assert_eq!(
+                list(&app, &Principal::Authenticated("did:plc:bob".to_owned()), &did),
+                vec![public.clone()],
+                "a non-grantee sees only the public cid",
+            );
+
+            let grantee = list(&app, &Principal::Authenticated(alice), &did);
+            assert_eq!(grantee.len(), 2, "the grantee sees public + granted");
+            assert!(grantee.contains(&public) && grantee.contains(&secret));
+
+            assert_eq!(list(&app, &owner, &did).len(), 2, "the owner sees all");
+        }
+
+        #[test]
+        fn namespace_gate_hides_every_cid_from_anon() {
+            // A namespace-wide grantees policy: an anon caller sees an empty listing
+            // (no world cids), while the owner still sees all uploads.
+            let app = App::new("gate-seed", Blobs::Memory, Db::Memory).expect("app");
+            let owner_kp = derive_keypair("gate", "owner");
+            let did = derive_id(&owner_kp.verifying_key());
+            let owner = Principal::Authenticated(did.clone());
+            let alice = "did:plc:alice".to_owned();
+
+            upload(&app, &owner, &did, b"one");
+            upload(&app, &owner, &did, b"two");
+            let policy = PolicyRecord::sign_owner(
+                &did,
+                None,
+                ReadClass::Grantees,
+                std::slice::from_ref(&alice),
+                1,
+                &owner_kp,
+            );
+            lock_store(&app.state.store)
+                .save_policy(&policy)
+                .expect("seed namespace policy");
+
+            assert!(
+                list(&app, &Principal::Anonymous, &did).is_empty(),
+                "anon sees nothing under a namespace gate",
+            );
+            assert_eq!(
+                list(&app, &Principal::Authenticated(alice), &did).len(),
+                2,
+                "the grantee sees both",
+            );
+            assert_eq!(list(&app, &owner, &did).len(), 2, "the owner sees all");
+        }
     }
 }
