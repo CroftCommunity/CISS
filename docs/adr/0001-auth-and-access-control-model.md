@@ -18,6 +18,11 @@
 > broker-as-issuer alternative (Model B), and the degraded-mode design are in
 > `docs/notes/atproto-integration-model.md`. The crib source is `rsky-crypto`
 > (in-corpus reference), not `rsky-pds` (not in the local corpus).
+>
+> This amendment's scope is the whole ADR, not only §3: the **DPoP** language in §4
+> and Consequences is superseded — the built path verifies a **service-auth JWT**
+> (no DPoP; DPoP is the parked Model M2) — and "cribbed from rsky-pds" (§3,
+> Consequences) is superseded by the `rsky-crypto` / `croft-broker` JOSE port.
 
 ---
 

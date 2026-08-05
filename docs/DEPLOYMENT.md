@@ -94,7 +94,7 @@ CISS ships as a **pinned, checksummed GitHub release binary** (the same pattern
 croft-stack uses for the iroh relay):
 
 1. Build a release binary for the box (`cargo build --release`). The current
-   estate is Debian 13 (trixie, glibc 2.41, x86_64), so the v0.1.0 asset is a
+   estate is Debian 13 (trixie, glibc 2.41, x86_64), so the release asset is a
    stripped **glibc** build. *(A fully-static `x86_64-unknown-linux-musl` build is
    the portability hardening follow-up; on a single trixie box the glibc build is
    correct and simplest.)*

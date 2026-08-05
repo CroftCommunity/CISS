@@ -1,8 +1,9 @@
 # CISS testing strategy
 
-How CISS is tested, and specifically the **workflow test tier** we are adding
-alongside the authentication work. The existing suites are not replaced — this
-adds a layer above them.
+How CISS is tested, and specifically the **workflow test tier** that sits
+alongside the pointwise suites. The existing suites are not replaced — this is a
+layer above them (the atproto-identity flows, `tests/flow_atproto_identity.rs`, and
+the security/quota/hardening flows are live).
 
 ## Why a new tier
 
@@ -34,7 +35,7 @@ story. So the workflow tier is not optional alongside auth — the workflow test
 | Unit / behavior | `#[cfg(test)]` in `src/*.rs` | one function/type | pin behavior, mutation resistance |
 | Wiring | `tests/wiring_*.rs` | one feature, end to end | anti-dead-code gate (the feature is really reached) |
 | E-suite | `tests/e0..e9.rs`, `e86_abuse.rs` | one protocol property over HTTP | protocol conformance + adversarial single properties |
-| **Workflow (new)** | `tests/flows/`, `tests/flow_*.rs` | **multi-actor, multi-step, stateful** | the relational stories: lifecycles, gating, revocation, and every security finding as a permanent guard |
+| **Workflow** | `tests/flow_*.rs` | **multi-actor, multi-step, stateful** | the relational stories: lifecycles, gating, revocation, and every security finding as a permanent guard |
 
 Keep the lower tiers as-is. The workflow tier consumes the same real server over
 real HTTP; it adds a persona vocabulary on top, nothing more.
@@ -73,9 +74,10 @@ Harness principles:
   shuts it down cleanly (port-leak stays observable).
 - **Typed outcomes.** `.ok()`, `.refused(status)`, `.returns(bytes)`,
   `.omits(cid)` — a flow asserts intent, not raw status codes scattered inline.
-- **Actors carry credentials, not the test.** When auth lands, an `Actor` holds
-  its session token; `world.anonymous()` holds none. Swapping who performs a step
-  is `.as(&actor)`, so multi-actor interaction is first-class.
+- **Actors carry credentials, not the test.** An `Actor` holds its `id:` session;
+  an `AtprotoActor` mints a `did:` service-auth JWT; `world.anonymous()` holds
+  none. Swapping who performs a step is a persona choice, so multi-actor
+  interaction is first-class.
 
 ## Flow catalog (first set)
 

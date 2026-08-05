@@ -11,6 +11,8 @@ which forces a strict separation:
 
 ```
    ┌─ Layer 2: the metered boundary (server.rs, pds_api.rs, cidv1.rs) ─────────┐
+   │  · authenticates the caller to a verified Principal (ciss-auth,           │
+   │    ciss-resolve) before it acts — see §4a                                 │
    │  · content-addresses bytes (SHA-256) and RE-VERIFIES them on read         │
    │  · signs a receipt for every transfer (postage)                           │
    │  · derives rent from the customer's OWN signed manifest                    │
@@ -41,6 +43,10 @@ Both the S3 plane and the atproto plane route through the *same* dispatch, so
 they meter identically.
 
 **PUT / uploadBlob (upload):**
+0. **Authenticate + authorize.** `uploadBlob` resolves the caller to a verified
+   `Principal` — a `did:` service-auth JWT (Model R) or an `id:` signed session —
+   and acts only as that DID; an unverified caller is `401`. See
+   `SECURITY-POSTURE.md` §4 (A1–A7).
 1. `cid = sha256_hex(bytes)` — the boundary computes the content address.
 2. `blobs.put(did, cid, bytes)` — Layer 1 writes and reports the byte count.
 3. **Byte-count integrity check:** the boundary byte count must equal what the
@@ -127,6 +133,30 @@ is taken over (so two peers hash the same bytes); `pricing.rs` keeps every figur
 in integer cents; `clock.rs` and `rng.rs` are deterministic so every assertion is
 exact.
 
+## 4a. Identity & authentication
+
+Layer 2 authenticates the caller to a verified `Principal` before it acts. There
+are two identity spaces, kept distinct by type, and two crates that keep the
+crypto isolated from the network:
+
+- **`id:<64-hex>`** — this codebase's native space (`"id:" ++ SHA-256(pubkey)`).
+  A caller proves possession by signing a session challenge; no external
+  resolution. Verified by `ciss-auth::verify_session`.
+- **`did:plc` / `did:web`** — atproto identities (Model R). A caller presents a
+  **service-auth JWT** (a short-lived compact JWS minted by
+  `com.atproto.server.getServiceAuth`, `iss`=caller DID, `aud`=CISS's
+  `did:web:ciss.croft.ing`, `lxm`=method, ~60s `exp`) signed by the caller's repo
+  key. CISS **resolves** the `iss` DID to its signing key and **verifies** the JWT
+  against it — it issues nothing (resource-server, not an issuer).
+
+The split by crate is deliberate: **`ciss-auth`** is pure crypto (no network) — it
+verifies a signature against a key it is handed; **`ciss-resolve`** owns all
+network/cache/timeout (did:plc via `plc.directory`, did:web via `.well-known`)
+behind a `DidResolver` trait, resolving fail-closed with a TTL cache and a pinned
+admin-DID break-glass set. CISS serves its own did:web document at
+`GET /.well-known/did.json`. Full trust model + invariants: `SECURITY-POSTURE.md`
+§4 (A1–A7); design: `docs/notes/atproto-integration-model.md`; decision: ADR 0001.
+
 ## 5. Persistence
 
 Per Phase-0 discovery, storage mirrors the official-PDS **per-actor SQLite**
@@ -135,10 +165,13 @@ layout:
 - `meter.sqlite` (**canonical**, WAL) co-locates each DID's `manifest`,
   `receipt`, and `statement` rows, keyed by the `did` column, plus a small `meta`
   key/value table.
-- The **provider key seed** lives in that `meta` table — generated with OS
-  randomness on first start and reused thereafter. Because it is in the canonical
-  SQLite (Litestream-backed), the signing identity survives a backup/restore, so
-  historical receipts stay verifiable. No env var or secret file is needed.
+- The **provider signing seed is never stored in the database** (finding I8). It
+  is supplied by the unit as a secret — a systemd credential
+  (`$CREDENTIALS_DIRECTORY/provider-seed`) or `CISS_PROVIDER_SEED` — and under
+  systemd the service **fails closed** if neither is present. Only the provider's
+  **public** key is persisted to the `meta` table, as a durable verification
+  anchor so historical receipts stay verifiable across a key rotation or loss. See
+  `SECURITY-POSTURE.md` §9 (S1/S2).
 - A `rusqlite::Connection` is `!Sync`; v0 resolves this with a single-writer
   `Arc<Mutex<Store>>`. `SEAM:` a real deployment shards a `Store` per DID behind a
   small pool.
@@ -181,10 +214,6 @@ Marked `SEAM:` in code and tracked in `discovery/ROADMAP_TODO`:
   socket-activation fd and drains on SIGTERM. v0 ships the *lean* strategy
   (graceful drain + Caddy request-retry, see DEPLOYMENT.md); socket-activation /
   `SO_REUSEPORT` blue-green is the stretch.
-- **Auth (Phase-8).** `uploadBlob` requires a bearer token; v0 uses a **mock**
-  check where the token stands in for the acting DID (`SEAM:`), with
-  `getBlob`/`listBlobs` public. Real atproto OAuth/DPoP session verification is a
-  later spike.
 - **getBlob Content-Type echo.** UNCONFIRMED in the lexicon; v0 returns
   `application/octet-stream` rather than guess the echo behavior.
 
