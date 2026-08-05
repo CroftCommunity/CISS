@@ -96,11 +96,26 @@ Confirmed firsthand against the code (2026-08-05):
   `Outcome` has `.ok/.refused/.returns/.omits/.discloses` (`tests/common/mod.rs`).
   Gated-read flows + a policy `PUT` mirror the manifest flow. *Evidence:*
   `tests/flow_billing_integrity.rs`, `tests/common/mod.rs` `Outcome`.
+- **[Pass 2] Model-C reuse is real, not aspirational:**
+  - `authenticate_atproto(state, headers, lxm)` (`src/server.rs:575`, `pub(crate)`)
+    accepts an **arbitrary `lxm`** and runs the full peek→resolve→`verify_service_auth_jwt`
+    →`ReplayGuard` path; `ServiceAuthParams::expected_lxm` is matched at
+    `crates/ciss-auth/src/service_jwt.rs:113`. Phase 6 reuses it with `SET_POLICY_LXM`.
+  - The **provider signing key is reachable**: `Provider` holds a `keypair`
+    (`src/server.rs:88`, `derive_keypair(seed,"provider")`), and `crypto::Keypair`
+    exposes `sign_message(&str) -> hex` (`src/crypto.rs:75`), already used to sign
+    receipts (`src/receipts.rs:282`). Phase 6 adds a `Provider::attest_policy` method
+    over that primitive.
+  - `AppState` already carries the `resolver` and `ReplayGuard` (from the deployed
+    atproto increment), so Phase 6 needs no new wiring for JWT verification.
+  - **Signature domains stay disjoint:** receipts sign a bare content-hash, manifests
+    sign `ciss/v1/manifest:…`, policy (A) `ciss/v1/policy:…`, attestation (C)
+    `ciss/v1/policy-attest:…` — no cross-context confusion.
 
 ## Documentation Impact
 
 - `docs/spec/gated-reads.md` — flip `[PLANNED build]` sections to live as they land:
-  §3/§5 in **Phase 3–4**, §6 wire in **Phase 5**; change log each time.
+  §3/§5 in **Phase 3–4**, §4.1 + §6 wire across **Phase 5–6** (A then C); change log each time.
 - `docs/SECURITY-POSTURE.md` — new invariants + close §14.1 gap in **Phase 7**.
 - `docs/adr/0001-auth-and-access-control-model.md` — record the resolved §2 grain
   decision + policy-record shape in **Phase 7**.
@@ -151,7 +166,10 @@ a test, by construction.
 - **Read-set:** `src/manifest.rs` (preimage pattern), `src/canonical.rs`, `src/crypto.rs`.
 - **Write-set:** `src/policy.rs`, `src/lib.rs`.
 - **Shared-state contract:** none beyond the file write-set (pure).
-- **Risks:** ed25519-only signer (Open Q1) — v1 verifies `id:`/ed25519 owners.
+- **Risks / [Pass 2] form-vs-target rule:** `OwnerSigned` is valid **only for an
+  `id:` target** (the DID must be ed25519-derivable, so `derive_id(signer) == did`
+  can hold); a `did:` target must use `ProviderAttested`. `verify_policy` enforces
+  this pairing — an `OwnerSigned` record naming a `did:` target is refused.
 - **Done when:**
   1. *Behavioral:* a policy record signed by the owner ed25519 key that derives the
      target DID verifies; a forged signer, wrong-DID signer, replayed/lower `seq`,
@@ -190,9 +208,14 @@ a test, by construction.
 - **Goal:** gate `getBlob`/object GET by policy; deny → 404; `world` unchanged.
 - **Changes:**
   - [ ] `src/server.rs` — in `dispatch`, for read ops resolve
-    `state.store.resolve_policy(did, cid)` and evaluate membership against the
+    `state.store.resolve_policy(did, cid)` and evaluate **membership** against the
     `Principal`; deny → `ServerError::NotFound`. Keep `authorize` a pure fn fed the
     resolved policy (world → allow fast path when no row).
+  - **[Pass 2] Read is membership-only — no signature re-verify.** The policy
+    signature (Model A or C) is checked **once, at write** (Phase 5/6) before
+    `save_policy`; the stored row is trusted (CISS's own SQLite). Reads do a single
+    indexed lookup + set-membership — no per-read crypto on the hot path. An
+    unparseable stored row fails **closed** (deny), never widens (Phase 2 guarantee).
 - **Call chain:** `get_object_handler / pds getBlob → dispatch → resolve_policy →
   authorize(policy, principal) → op_get_object | NotFound`.
 - **Wiring test:** `tests/wiring_s3_metered.rs` / `wiring_pds_blob.rs` extended (or a
@@ -268,13 +291,19 @@ a test, by construction.
   - [ ] Define the set-policy lexicon method id (proposed `ing.croft.ciss.setPolicy`)
     as a constant; the JWT's `lxm` must equal it, `aud` == CISS service DID, `iss` ==
     the target-owning DID.
-  - [ ] `src/server.rs` — the policy handlers accept an alternate authorization: a
-    `Bearer` service-auth JWT + a **policy body** (readers/read_class/seq). Verify the
-    JWT via `ciss_auth::verify_service_auth_jwt` (reused, with `lxm`=set-policy); on
-    success, construct the `PolicyRecord`, **provider-attest** it (sign
-    `ciss/v1/policy-attest:…` with the provider key), and `save_policy`.
-  - [ ] `src/server.rs` / provider — a `provider.attest_policy(record)` signing helper
-    (domain-separated preimage; provider key). The stored record is `ProviderAttested`.
+  - [ ] `src/server.rs` — **extend the Phase-5 policy handler** to also accept a
+    `Bearer` service-auth JWT + a **policy body** (readers/read_class/seq). Reuse
+    **`authenticate_atproto(state, headers, SET_POLICY_LXM)`** (`server.rs:575`,
+    already `pub(crate)`; peeks `iss` → resolves → `verify_service_auth_jwt` →
+    `ReplayGuard`) to obtain the owner `Principal`. **[Pass 2] Assert the
+    authenticated DID equals the target-owning DID** (the policy is for the caller's
+    own namespace) — else `Forbidden`. On success, construct the `PolicyRecord`,
+    **provider-attest** it, and `save_policy`.
+  - [ ] `src/server.rs` — add **`Provider::attest_policy(preimage) -> String`**
+    (`self.keypair.sign_message("ciss/v1/policy-attest:…")`) — the provider `keypair`
+    exists (`server.rs:88`, `crypto::Keypair::sign_message`); the domain prefix keeps
+    the attestation sig distinct from receipt sigs (bare content-hash) and manifest
+    sigs (`ciss/v1/manifest`). The stored record is `ProviderAttested`.
 - **Call chain:** `PUT /{did}/policy (Bearer jwt + body) → put_policy_handler →
   verify_service_auth_jwt(lxm=setPolicy, aud=CISS) → provider.attest_policy →
   Store::save_policy`; reads verify the provider attestation (Phase 3).
@@ -428,3 +457,39 @@ a test, by construction.
   corpus→7 (now covers both owner forms) and docs→8; two new ADVISORY questions (the
   set-policy `lxm` name; attestation-key domain-sep vs sub-key). Grew 7→8 phases.
   **Scope change is material — warrants a Pass 2 gap analysis before execution.**
+
+### Pass 2: Gap Analysis — 2026-08-05
+
+**Found:**
+- **Read-path re-verify defect.** Phase 3 said reads verify the stored record's
+  signature — wrong: verification is a **write-time** concern (Phase 5/6). Reads must
+  be membership-only over the write-verified row (perf; the DB is CISS's own),
+  fail-closed on an unparseable row. Fixed Phase 3.
+- **Phase 6 reuse under-specified.** The precise reuse is
+  `authenticate_atproto(state, headers, SET_POLICY_LXM)` (`server.rs:575`, `pub(crate)`),
+  **plus a missing check**: the authenticated DID must equal the target-owning DID
+  (else a `did:` owner could set policy on another DID's namespace). Added.
+- **Provider signing method missing.** The provider `keypair` exists but is private;
+  Phase 6 must add `Provider::attest_policy` over `Keypair::sign_message`. Added, with
+  the `ciss/v1/policy-attest` domain confirmed disjoint from receipt/manifest sigs.
+- **Handler sharing.** Phases 5 and 6 write the same `PUT /{did}/policy` handler;
+  Phase 6 **extends** the Phase-5 handler (dispatch on OwnerSigned-body vs Bearer-JWT).
+  Made explicit.
+- **Form-vs-target rule.** `OwnerSigned` is valid only for `id:` targets; a `did:`
+  target must be `ProviderAttested`. `verify_policy` enforces it. Added to Phase 1.
+
+**Concurrency:** no changes — all 8 phases sequential confirmed. Phases 3–6 share the
+`src/server.rs` write-set (disqualifies parallel), and the chain
+record→storage→gate→write→corpus→docs is a strict dependency spine. No missed
+parallelism.
+
+**Changed:** Phase 3 (membership-only read); Phase 1 (form-vs-target rule); Phase 6
+(authenticate_atproto reuse + DID-match + `Provider::attest_policy` + handler
+extension); Verified Assumptions (Model-C reuse verified firsthand:
+`server.rs:575/88`, `crypto.rs:75`, `service_jwt.rs:113`, `receipts.rs:282`);
+Documentation Impact (§4.1/§6 flips across Phase 5–6).
+
+**Confirmed:** the `dispatch`/`authorize` choke point, `ServerError::NotFound→404`,
+the manifest signing pattern, the `persist` table/ALTER pattern, `AppState` already
+carrying `resolver`+`ReplayGuard`, and the flow-harness assertions all hold as Pass 1
+stated. **No new open questions surfaced** — the gaps were fixes, not decisions.
