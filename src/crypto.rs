@@ -52,6 +52,20 @@ pub struct Keypair {
 }
 
 impl Keypair {
+    /// Reconstruct a keypair from a raw 32-byte Ed25519 seed and a role label.
+    ///
+    /// Unlike [`derive_keypair`], which *hashes* a master seed, this treats the
+    /// bytes as the seed directly — the form a client persists (seed on disk) and
+    /// reloads across runs. Ed25519 is deterministic, so the same seed yields the
+    /// same public key and the same signatures, run to run.
+    #[must_use]
+    pub fn from_seed(seed: &[u8; 32], label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            signing_key: SigningKey::from_bytes(seed),
+        }
+    }
+
     /// The role label this keypair was derived for (e.g. `"customer"`).
     #[must_use]
     pub fn label(&self) -> &str {
@@ -137,7 +151,38 @@ pub fn verify_message(verifying_key: &VerifyingKey, message: &str, signature_hex
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_keypair, public_key_from_hex, verify_message, CryptoError};
+    use super::{
+        derive_keypair, public_key_from_hex, verify_message, Keypair, CryptoError,
+    };
+
+    #[test]
+    fn from_seed_reconstructs_the_same_key_and_signature() {
+        // A client persists its raw 32-byte seed and reloads it across runs. The
+        // reconstructed keypair must be byte-identical — same public key, and
+        // (Ed25519 being deterministic) the same signature over a given message —
+        // or a stored session/receipt signature would fail to verify after reload.
+        let seed = [7u8; 32];
+        let a = Keypair::from_seed(&seed, "client");
+        let b = Keypair::from_seed(&seed, "client");
+        assert_eq!(a.public_key_hex(), b.public_key_hex(), "reload parity: pubkey");
+        assert_eq!(
+            a.sign_message("ciss-session/v1/id:demo"),
+            b.sign_message("ciss-session/v1/id:demo"),
+            "reload parity: signature",
+        );
+        let key = public_key_from_hex(&a.public_key_hex()).expect("valid hex");
+        assert!(
+            verify_message(&key, "ciss-session/v1/id:demo", &a.sign_message("ciss-session/v1/id:demo")),
+            "a signature from the reconstructed key verifies against its pubkey",
+        );
+    }
+
+    #[test]
+    fn distinct_seeds_reconstruct_distinct_keys() {
+        let a = Keypair::from_seed(&[1u8; 32], "client");
+        let b = Keypair::from_seed(&[2u8; 32], "client");
+        assert_ne!(a.public_key_hex(), b.public_key_hex());
+    }
 
     #[test]
     fn derivation_is_deterministic_in_seed_and_label() {

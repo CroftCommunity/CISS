@@ -1,0 +1,32 @@
+[package]
+name = "ciss-cli"
+version = "0.4.0"
+edition = "2021"
+publish = false
+description = "ciss-ctl — the CISS client CLI. Owns a client identity keypair, drives the S3 + atproto blob planes over one metered byte-path, and manages gated-read ACLs. Links the server's own crates so client crypto cannot drift from the wire."
+
+[[bin]]
+name = "ciss-ctl"
+path = "src/main.rs"
+
+[dependencies]
+# The client links the server's crates so its crypto (session challenge, DID
+# derivation, CIDv1 bridge, policy preimage) is byte-identical to the wire — drift
+# becomes a compile error, not a silent 403.
+ciss = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+thiserror = "2"
+# CSPRNG for native key generation. getrandom (already in the ciss dep tree) is a
+# thin, audited wrapper over the OS entropy source — the seed is real randomness,
+# not the deterministic simulation RNG (`ciss::rng`).
+getrandom = "0.2"
+# Seed <-> hex for the on-disk key file (matches the server's hex key encoding).
+hex = "0.4"
+# Wipe the transient seed buffer after the keypair is built; the secret should
+# live only on disk (0600) and inside the zeroize-on-drop signing key.
+zeroize = "1"
+# Import existing ssh-keygen ed25519 keys via a maintained OpenSSH parser (D1),
+# rather than shelling to ssh-keygen or hand-rolling the OpenSSH wrapper.
+ssh-key = { version = "0.6", features = ["ed25519"] }
