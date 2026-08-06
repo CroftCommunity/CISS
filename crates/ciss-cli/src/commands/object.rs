@@ -94,7 +94,7 @@ pub async fn get(
 ) -> Result<()> {
     let res = match via {
         Plane::S3 => client.get_s3(session, did, cid).await?,
-        Plane::Pds => client.get_blob(did, cid).await?,
+        Plane::Pds => client.get_blob(session, did, cid).await?,
     };
     match output {
         Some(path) => {

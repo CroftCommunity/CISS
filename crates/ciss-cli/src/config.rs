@@ -1,13 +1,11 @@
 //! Client configuration: where a profile's key material and credentials live.
 //!
-//! Layout (fixed in Phase 2, forward-compatible with the `did:` credential in
-//! Phase 7):
-//!
 //! ```text
 //! $XDG_CONFIG_HOME/ciss-ctl/
 //!   profiles/
 //!     <profile>/
-//!       identity.key   # raw ed25519 seed hex, mode 0600 (id: profiles)
+//!       identity.key   # raw ed25519 seed hex, mode 0600 (id: identity)
+//!       pds.json       # did: PDS credential (host + identifier + app password), mode 0600
 //! ```
 //!
 //! `$XDG_CONFIG_HOME` wins when set and non-empty; otherwise `$HOME/.config`.

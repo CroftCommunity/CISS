@@ -36,7 +36,7 @@ async fn s3_and_pds_planes_are_interchangeable_over_one_digest() {
     let a_cid = sha256_hex(&a);
     let put = client.put_s3(&session, "a.txt", &a).await.expect("s3 put");
     assert_eq!(put.cid, a_cid);
-    let via_pds = client.get_blob(&did, &put.cid).await.expect("pds get of an s3-stored object");
+    let via_pds = client.get_blob(None, &did, &put.cid).await.expect("pds get of an s3-stored object");
     assert_eq!(via_pds.bytes, a, "cross-plane fetch is byte-identical (s3->pds)");
 
     // pds put -> s3 get.

@@ -63,7 +63,7 @@ async fn did_bearer_upload_stores_and_reads_back() {
     let up = client.upload_blob_bearer(&token, &payload).await.expect("bearer upload");
     assert_eq!(up.cid, cid, "uploadBlob content-addresses to the same sha256 hex");
 
-    let got = client.get_blob(CALLER_DID, &cid).await.expect("public read back");
+    let got = client.get_blob(None, CALLER_DID, &cid).await.expect("public read back");
     assert_eq!(got.bytes, payload, "blob reads back byte-identically");
 }
 

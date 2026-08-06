@@ -173,6 +173,6 @@ async fn live_did_service_auth_round_trip() {
     let payload = b"a blob uploaded via a live did: service-auth token".to_vec();
     let up = server.upload_blob_bearer(&token, &payload).await.expect("live bearer upload");
     assert_eq!(up.cid, sha256_hex(&payload), "content-addressed");
-    let got = server.get_blob(&account_did, &up.cid).await.expect("read back");
+    let got = server.get_blob(None, &account_did, &up.cid).await.expect("read back");
     assert_eq!(got.bytes, payload, "live did: blob round-trips");
 }

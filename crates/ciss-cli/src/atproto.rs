@@ -14,6 +14,28 @@ use crate::config::Config;
 const CREATE_SESSION: &str = "com.atproto.server.createSession";
 const GET_SERVICE_AUTH: &str = "com.atproto.server.getServiceAuth";
 
+/// A transport failure, phrased like the CISS client's (`server unreachable at
+/// <host>` for a connect/timeout, else the raw cause).
+fn transport_error(action: &str, host: &str, e: &reqwest::Error) -> anyhow::Error {
+    if e.is_connect() || e.is_timeout() {
+        anyhow::anyhow!("{action} failed: server unreachable at {host}")
+    } else {
+        anyhow::anyhow!("{action} failed: {e}")
+    }
+}
+
+/// The `HTTP <code> — <body>` detail for a non-2xx PDS response (consumes it).
+async fn http_error_detail(resp: reqwest::Response) -> String {
+    let code = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        format!("HTTP {code}")
+    } else {
+        format!("HTTP {code} — {trimmed}")
+    }
+}
+
 /// A PDS credential for the `did:` plane. No signing key — the repo key stays at
 /// the PDS. `Debug` deliberately redacts the app password.
 #[derive(Clone, Serialize, Deserialize)]
@@ -96,11 +118,9 @@ pub async fn create_session(
         }))
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("PDS login failed (connect): {e}"))?;
+        .map_err(|e| transport_error("PDS login", &cred.pds_host, &e))?;
     if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("PDS login failed: HTTP {code} ({})", body.trim());
+        bail!("PDS login failed: {}", http_error_detail(resp).await);
     }
     let v: serde_json::Value = resp.json().await.context("parse createSession response")?;
     Ok(PdsSession {
@@ -142,11 +162,9 @@ pub async fn get_service_auth(
         .bearer_auth(access_jwt)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("getServiceAuth failed (connect): {e}"))?;
+        .map_err(|e| transport_error("getServiceAuth", pds_host, &e))?;
     if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("getServiceAuth failed: HTTP {code} ({})", body.trim());
+        bail!("getServiceAuth failed: {}", http_error_detail(resp).await);
     }
     let v: serde_json::Value = resp.json().await.context("parse getServiceAuth response")?;
     v["token"]
