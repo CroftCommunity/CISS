@@ -60,11 +60,17 @@ async fn end_to_end_capability_tour() {
     assert!(ok && grantee_did.starts_with("id:"), "grantee key gen");
     ctl(&home, &base, "stranger", &["key", "gen"]);
 
-    // 2. Metered upload on the S3 plane; cid == sha256(file).
+    // 2. Metered upload; cid == sha256(file). Store explicitly via s3 so the
+    //    next step is a genuine cross-plane fetch regardless of the default plane.
     let file = dir.join("memo.txt");
     let contents = b"the capability tour memo".to_vec();
     std::fs::write(&file, &contents).unwrap();
-    let (put_json, ok) = ctl(&home, &base, "owner", &["--json", "put", file.to_str().unwrap()]);
+    let (put_json, ok) = ctl(
+        &home,
+        &base,
+        "owner",
+        &["--json", "put", file.to_str().unwrap(), "--via", "s3"],
+    );
     assert!(ok, "put --via s3");
     let cid = serde_json::from_str::<serde_json::Value>(&put_json).unwrap()["cid"]
         .as_str()

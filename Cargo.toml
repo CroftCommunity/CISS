@@ -1,6 +1,6 @@
 [package]
 name = "ciss"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 publish = false
 description = "CISS — Croft Item Storage Server: a PDS-like cooperative metered-storage server in Rust (an S3-compatible + atproto blob boundary over the E0–E9 metering ledger). Ports the item-storage protocol; build plan in the discovery repo (2026-07-31-1-plan-coop-metered-storage-service.md)."
