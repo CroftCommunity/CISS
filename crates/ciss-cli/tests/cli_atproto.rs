@@ -45,11 +45,11 @@ async fn s3_and_pds_planes_are_interchangeable_over_one_digest() {
     let up = client.upload_blob(&session, &b).await.expect("pds put");
     assert_eq!(up.cid, b_cid, "uploadBlob's CIDv1 bridges back to the same sha256 hex");
     assert_eq!(up.bytes, b.len() as u64);
-    let via_s3 = client.get_s3(&did, &up.cid).await.expect("s3 get of a pds-stored blob");
+    let via_s3 = client.get_s3(None, &did, &up.cid).await.expect("s3 get of a pds-stored blob");
     assert_eq!(via_s3.bytes, b, "cross-plane fetch is byte-identical (pds->s3)");
 
     // ls reflects both stored cids (hex, matching the s3 addressing).
-    let cids = client.list_blobs(&did).await.expect("list blobs");
+    let cids = client.list_blobs(None, &did).await.expect("list blobs");
     assert!(cids.contains(&a_cid), "ls lists the s3-stored cid, got {cids:?}");
     assert!(cids.contains(&b_cid), "ls lists the pds-stored cid, got {cids:?}");
 }

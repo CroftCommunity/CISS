@@ -49,7 +49,7 @@ async fn s3_put_get_meter_round_trips_and_meters() {
         put.etag,
     );
 
-    let got = client.get_s3(&did, &expected_cid).await.expect("get");
+    let got = client.get_s3(None, &did, &expected_cid).await.expect("get");
     assert_eq!(got.bytes, payload, "GET returns byte-identical content");
     assert!(got.etag.as_deref().unwrap_or_default().contains(&expected_cid));
 
@@ -96,7 +96,7 @@ async fn get_missing_object_is_404_oracle_free() {
     let did = session_for(&keypair).did;
 
     let missing = "0".repeat(64);
-    let err = client.get_s3(&did, &missing).await.expect_err("missing object");
+    let err = client.get_s3(None, &did, &missing).await.expect_err("missing object");
     let msg = err.to_string();
     assert!(msg.contains("404"), "missing object is 404, got {msg:?}");
     assert!(

@@ -85,6 +85,7 @@ pub async fn put(
 /// or the output cannot be written.
 pub async fn get(
     client: &Client,
+    session: Option<&Session>,
     did: &str,
     cid: &str,
     output: Option<&Path>,
@@ -92,7 +93,7 @@ pub async fn get(
     json_out: bool,
 ) -> Result<()> {
     let res = match via {
-        Plane::S3 => client.get_s3(did, cid).await?,
+        Plane::S3 => client.get_s3(session, did, cid).await?,
         Plane::Pds => client.get_blob(did, cid).await?,
     };
     match output {
@@ -158,8 +159,13 @@ pub async fn meter(client: &Client, session: &Session, json_out: bool) -> Result
 /// # Errors
 ///
 /// Fails if the list read is refused or unreachable.
-pub async fn ls(client: &Client, did: &str, json_out: bool) -> Result<()> {
-    let cids = client.list_blobs(did).await?;
+pub async fn ls(
+    client: &Client,
+    session: Option<&Session>,
+    did: &str,
+    json_out: bool,
+) -> Result<()> {
+    let cids = client.list_blobs(session, did).await?;
     if json_out {
         println!("{}", serde_json::json!({ "cids": cids }));
     } else if cids.is_empty() {

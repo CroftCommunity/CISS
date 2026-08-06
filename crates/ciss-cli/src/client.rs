@@ -30,6 +30,17 @@ impl Session {
     }
 }
 
+/// Attach a signed `id:` session (`x-croft-*`) to a request if one is given; an
+/// absent session is an anonymous caller (world reads only, no grantee identity).
+fn with_session(builder: reqwest::RequestBuilder, session: Option<&Session>) -> reqwest::RequestBuilder {
+    match session {
+        Some(s) => builder
+            .header("x-croft-pubkey", &s.pubkey)
+            .header("x-croft-session", &s.signature),
+        None => builder,
+    }
+}
+
 /// Build a signed session for `keypair` acting as its derived `id:` DID.
 #[must_use]
 pub fn session_for(keypair: &Keypair) -> Session {
@@ -147,16 +158,23 @@ impl Client {
         })
     }
 
-    /// `GET /{did}/objects/{cid}` (public read). The returned bytes are verified
-    /// to content-address to `cid` before this returns — a mismatch is an error,
-    /// never a trusted body.
+    /// `GET /{did}/objects/{cid}`. Pass a `session` so a gated object recognizes
+    /// the caller as owner/grantee; `None` is an anonymous world read. The bytes
+    /// are verified to content-address to `cid` before returning — a mismatch is
+    /// an error, never a trusted body.
     ///
     /// # Errors
     ///
-    /// Fails on a connect error, a non-2xx status, or a cid mismatch.
-    pub async fn get_s3(&self, did: &str, cid: &str) -> Result<GetResult> {
+    /// Fails on a connect error, a non-2xx status (a gated denial is 404), or a
+    /// cid mismatch.
+    pub async fn get_s3(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        cid: &str,
+    ) -> Result<GetResult> {
         let url = format!("{}/{}/objects/{}", self.base, did, cid);
-        let resp = self.send(self.http.get(&url), "download").await?;
+        let resp = self.send(with_session(self.http.get(&url), session), "download").await?;
         let resp = self.ensure_success(resp, "download").await?;
         let etag = header_owned(&resp, "etag");
         let bytes = resp.bytes().await.context("read download body")?.to_vec();
@@ -281,19 +299,21 @@ impl Client {
         Ok(GetResult { bytes, etag: None })
     }
 
-    /// `GET /xrpc/com.atproto.sync.listBlobs?did=` (public). Returns the stored
-    /// cids as sha256 hex (bridged from CIDv1), matching the S3 addressing.
+    /// `GET /xrpc/com.atproto.sync.listBlobs?did=`. Pass a `session` so gated
+    /// objects the caller may read are included; a non-grantee sees them omitted
+    /// (omission, not a 403 — `listBlobs` is not an enumeration oracle). Returns
+    /// the visible cids as sha256 hex (bridged from CIDv1).
     ///
     /// # Errors
     ///
     /// Fails on a connect error, a non-2xx status, or a malformed cid entry.
-    pub async fn list_blobs(&self, did: &str) -> Result<Vec<String>> {
+    pub async fn list_blobs(&self, session: Option<&Session>, did: &str) -> Result<Vec<String>> {
         let url = format!(
             "{}/xrpc/com.atproto.sync.listBlobs?did={}",
             self.base,
             enc(did),
         );
-        let resp = self.send(self.http.get(&url), "list").await?;
+        let resp = self.send(with_session(self.http.get(&url), session), "list").await?;
         let resp = self.ensure_success(resp, "list").await?;
         let v: serde_json::Value = resp.json().await.context("parse listBlobs response")?;
         v["cids"]
@@ -306,6 +326,48 @@ impl Client {
                     .map_err(|e| anyhow!("bridge CIDv1 -> sha256 hex failed for {link:?}: {e}"))
             })
             .collect()
+    }
+
+    /// `PUT /{did}/objects/{cid}/policy` with a self-signed `PolicyRecord` body
+    /// (Model A — the record self-authorizes, so no session header is needed).
+    /// Returns the stored `seq`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status (a stale `seq` is 409).
+    pub async fn put_object_policy(&self, did: &str, cid: &str, record_json: &[u8]) -> Result<u64> {
+        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let resp = self
+            .send(self.http.put(&url).body(record_json.to_vec()), "set policy")
+            .await?;
+        let resp = self.ensure_success(resp, "set policy").await?;
+        let v: serde_json::Value = resp.json().await.context("parse policy response")?;
+        v["seq"].as_u64().context("policy response missing seq")
+    }
+
+    /// `GET /{did}/objects/{cid}/policy` with the caller's `session`. Returns the
+    /// policy body the caller is allowed to see (the owner's full record, or a
+    /// grantee's `{read_class, may_read}` view), or `None` when the gate returns
+    /// 404 (no policy, or not visible to the caller — the oracle-free denial).
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status other than 404.
+    pub async fn get_object_policy(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        cid: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let resp = self
+            .send(with_session(self.http.get(&url), session), "get policy")
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let resp = self.ensure_success(resp, "get policy").await?;
+        Ok(Some(resp.json().await.context("parse policy body")?))
     }
 
     /// Send a request, translating a connect/timeout failure into an actionable

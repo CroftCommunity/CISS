@@ -670,20 +670,38 @@ throwaway creds (D4).
 
 ---
 
-### Phase 8a: Object ACL — Model A (`id:` owner, self-signed)
+### Phase 8a: Object ACL — Model A (`id:` owner, self-signed) ✅ COMPLETE (2026-08-06)
 
 **Goal:** An `id:` owner sets/reads a per-object read policy and the gate proves
 **oracle-free denial**. (Model C `did:` owner is Phase 8b — split from the original
 Phase 8 to respect the 4-file rule and because Model A has **no `did:`
 dependency**.)
 **Changes:**
-- [ ] `crates/ciss-cli/src/commands/acl.rs` — `acl set <cid> --class
+- [x] `crates/ciss-cli/src/commands/acl.rs` — `acl set <cid> --class
   world|grantees|owner [--readers did,…]` (Model A: build via
   `PolicyRecord::sign_owner`, PUT the signed record); `acl get <cid>` (GET).
-- [ ] `crates/ciss-cli/src/client.rs` — policy PUT/GET methods; on `set`, read the
-  current policy first to choose `seq = current+1` (else the server `409`s), and
-  map `409` to the actionable message from the Observability note.
-- [ ] wire the `acl` subcommand in `main.rs`.
+- [x] `crates/ciss-cli/src/client.rs` — `put_object_policy` (→ `seq`) and
+  `get_object_policy`; `acl set` reads the current policy first to pick
+  `seq = current+1` (else `409`), which `status_hint` maps.
+- [x] wire the `acl` subcommand in `main.rs`.
+
+**Scope note:** gated reads made **`get`/`ls` session-aware** — the server
+authenticates the reader and filters (`get_object`/`listBlobs`), so `get_s3` and
+`list_blobs` gained an `Option<&Session>` (the caller is recognized as owner/
+grantee, or anonymous → world-only). `get` also gained `--owner <did>` so a
+grantee can fetch a shared object from another namespace. That widened the
+write-set past 3 files (acl.rs, client.rs, object.rs, main.rs) — justified: the
+gate is unusable without the reader session.
+
+**Executed:** RED→GREEN `tests/cli_acl.rs` — a three-party (`owner`/`grantee`/
+`stranger`) story asserting the full matrix: owner+grantee read the gated object,
+stranger and anonymous get **404 (not 403)**; `ls` omits the cid for non-grantees
+(no enumeration oracle); the owner's `acl get` shows `readers[]` while the
+grantee's view is only `{read_class, may_read:true}` (**no reader-set leak**); and
+a stale/equal `seq` is **409**. Manually validated end-to-end against a local
+server across three profiles (owner sets, owner+grantee read, stranger 404,
+`acl get` shows readers, `ls` omits). Clippy clean; full suite green. Removed the
+now-unused `not_yet_implemented` stub (every subcommand is implemented).
 **Call chain:** `main` → `Acl::Set` → (`client::get_object_policy` for current
 `seq`) → `PolicyRecord::sign_owner` → `client::put_object_policy()` → server
 `put_object_policy_handler`.

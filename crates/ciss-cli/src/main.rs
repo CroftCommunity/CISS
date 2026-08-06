@@ -98,6 +98,10 @@ enum Commands {
         /// Where to write the fetched bytes (stdout if omitted).
         #[arg(short, long)]
         output: Option<String>,
+        /// The owning DID's namespace to read from (defaults to your own). Use
+        /// this to fetch an object shared with you by another owner.
+        #[arg(long)]
+        owner: Option<String>,
         /// Which plane to fetch over.
         #[arg(long, value_enum, default_value_t = Plane::S3)]
         via: Plane,
@@ -145,12 +149,6 @@ enum AclCommand {
         /// The object's content id (cid).
         cid: String,
     },
-}
-
-/// A subcommand whose implementation lands in a later phase. Fails loudly so an
-/// unimplemented path can never be mistaken for a working one.
-fn not_yet_implemented(what: &str, phase: &str) -> anyhow::Error {
-    anyhow::anyhow!("`{what}` is not implemented yet (arrives in {phase})")
 }
 
 /// Print a DID as plain text or `{"did":…}` under `--json`. DIDs are `id:`/`did:`
@@ -227,7 +225,9 @@ async fn did_get(
     let pds = reqwest::Client::new();
     let account = atproto::create_session(&pds, &cred).await?;
     let server = client::Client::new(&global.server);
-    commands::object::get(&server, &account.did, cid, output, via, global.json).await
+    // A `did:` read over the atproto plane is public (world) here; a gated `did:`
+    // read via a service-auth bearer is Model C (Phase 8b).
+    commands::object::get(&server, None, &account.did, cid, output, via, global.json).await
 }
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -266,12 +266,15 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_put(&cli.global, &config, Path::new(&file), via).await,
         },
-        Commands::Get { cid, output, via } => match cli.global.identity {
+        Commands::Get { cid, output, owner, via } => match cli.global.identity {
             IdentityKind::Id => {
-                let did = identity::whoami(&config)?;
+                let keypair = identity::load_keypair(&config)?;
+                let session = client::session_for(&keypair);
+                let did = owner.unwrap_or_else(|| session.did.clone());
                 let http = client::Client::new(&cli.global.server);
                 commands::object::get(
                     &http,
+                    Some(&session),
                     &did,
                     &cid,
                     output.as_deref().map(Path::new),
@@ -290,12 +293,21 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             commands::object::meter(&http, &session, cli.global.json).await
         }
         Commands::Ls => {
-            let did = identity::whoami(&config)?;
+            let keypair = identity::load_keypair(&config)?;
+            let session = client::session_for(&keypair);
             let http = client::Client::new(&cli.global.server);
-            commands::object::ls(&http, &did, cli.global.json).await
+            commands::object::ls(&http, Some(&session), &session.did, cli.global.json).await
         }
-        Commands::Acl(AclCommand::Set { .. }) => Err(not_yet_implemented("acl set", "Phase 8a")),
-        Commands::Acl(AclCommand::Get { .. }) => Err(not_yet_implemented("acl get", "Phase 8a")),
+        Commands::Acl(AclCommand::Set { cid, class, readers }) => {
+            let keypair = identity::load_keypair(&config)?;
+            let http = client::Client::new(&cli.global.server);
+            commands::acl::set(&http, &keypair, &cid, &class, &readers, cli.global.json).await
+        }
+        Commands::Acl(AclCommand::Get { cid }) => {
+            let keypair = identity::load_keypair(&config)?;
+            let http = client::Client::new(&cli.global.server);
+            commands::acl::get(&http, &keypair, &cid, cli.global.json).await
+        }
     }
 }
 
