@@ -36,6 +36,12 @@ cctl() { ciss-ctl --server https://ciss.croft.ing "$@"; }
 export XDG_CONFIG_HOME="$(mktemp -d)/cfg"
 ```
 
+`cctl foo` now runs `ciss-ctl --server https://ciss.croft.ing foo` (the `"$@"`
+forwards your arguments). `XDG_CONFIG_HOME` points `ciss-ctl`'s key/credential
+store at a throwaway dir, so nothing lands in your real `~/.config/ciss-ctl`.
+Both are session-scoped: `unset -f cctl` drops the wrapper, and
+`rm -rf "$XDG_CONFIG_HOME"` wipes every test identity when you're done.
+
 Confirm the server is reachable and serving its identity:
 
 ```bash
@@ -43,12 +49,15 @@ curl -s https://ciss.croft.ing/.well-known/did.json
 # {"@context":[…],"id":"did:web:ciss.croft.ing","service":[{…"serviceEndpoint":"https://ciss.croft.ing"…}]}
 ```
 
-The server enforces auth — an unauthenticated write is refused:
+The server enforces auth — an unauthenticated write is refused. Use a **full**,
+well-formed DID (64 hex chars — here all zeros, a valid DID we hold no key for);
+a *malformed* DID would be rejected as `400` before auth is even checked:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
-  https://ciss.croft.ing/id:0000…0000/objects/x --data-binary probe
-# 401
+  https://ciss.croft.ing/id:0000000000000000000000000000000000000000000000000000000000000000/objects/x \
+  --data-binary probe
+# 401     (an unowned but well-formed DID → unauthenticated write refused)
 ```
 
 ---
