@@ -62,6 +62,7 @@ optional with safe defaults:
 | `CISS_DID_RESOLVE_TIMEOUT_MS` | `3000` | hard resolve timeout (fails closed) |
 | `CISS_DID_CACHE_TTL_S` | `300` | resolution cache TTL |
 | `CISS_ADMIN_PINS_FILE` | — | pinned-admin-DID file (break-glass) |
+| `CISS_ADMIN_USAGE` | unset (off) | when set (`1`/`true`), an admin-pin DID may run **cross-DID** `du` (usage inspection: object sizes, not content — ADR 0003 / invariant Z9). Off by default; `du` is then self-only. |
 
 The admin-pin file (lines `<did> <did:key>`) is security-sensitive break-glass
 material; provision it like `provider-seed` (a systemd credential / mode-0400

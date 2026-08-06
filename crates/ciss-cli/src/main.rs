@@ -157,6 +157,15 @@ enum Commands {
     /// read). `id:` plane.
     Ls,
 
+    /// Show per-object sizes + total for a namespace (`du`). Defaults to your own;
+    /// `--did <did>` inspects another namespace (server-side admin only, off by
+    /// default).
+    Du {
+        /// The DID to report on (defaults to your own identity).
+        #[arg(long)]
+        did: Option<String>,
+    },
+
     /// Manage a per-object read ACL (gated reads).
     #[command(subcommand)]
     Acl(AclCommand),
@@ -268,6 +277,8 @@ async fn login(
 const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
 /// The lexicon method listBlobs binds a `did:` service-auth token to.
 const LISTBLOBS_LXM: &str = "com.atproto.sync.listBlobs";
+/// The lexicon method usage inspection (`du`) binds a `did:` token to (ADR 0003).
+const DU_LXM: &str = "ing.croft.ciss.du";
 /// The lexicon methods a Model-C `did:` owner's policy set/read tokens bind to.
 const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
 const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
@@ -466,6 +477,18 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_ls(&cli.global, &config).await,
         },
+        Commands::Du { did } => match cli.global.identity {
+            IdentityKind::Id => {
+                let keypair = identity::load_keypair(&config)?;
+                let session = client::session_for(&keypair);
+                let target = did.unwrap_or_else(|| session.did.clone());
+                let http = server_client(&cli.global);
+                let usage = http.du(Some(&session), &target).await?;
+                commands::object::print_usage(&usage, cli.global.json);
+                Ok(())
+            }
+            IdentityKind::Did => did_du(&cli.global, &config, did).await,
+        },
         Commands::Acl(AclCommand::Set { cid, class, readers }) => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
@@ -502,6 +525,26 @@ fn require_id_plane(identity: IdentityKind, command: &str) -> anyhow::Result<()>
              `--identity did`)."
         );
     }
+    Ok(())
+}
+
+/// `--identity did du [--did <other>]`: relay a `du`-scoped service-auth JWT and
+/// report usage for the account's own DID (or another, if the account is a
+/// server-side admin and the flag is on).
+async fn did_du(
+    global: &GlobalArgs,
+    config: &config::Config,
+    did: Option<String>,
+) -> anyhow::Result<()> {
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let server = server_client(global);
+    let aud = resolve_aud(global, &server).await?;
+    let (account_did, tokens) =
+        atproto::service_auth_tokens(&pds, &cred, &aud, &[DU_LXM]).await?;
+    let target = did.unwrap_or(account_did);
+    let usage = server.du_bearer(&tokens[0], &target).await?;
+    commands::object::print_usage(&usage, global.json);
     Ok(())
 }
 

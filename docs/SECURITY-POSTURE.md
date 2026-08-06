@@ -182,6 +182,16 @@ attestations are signed with a **dedicated** `policy-attest` key
 by both key and signing domain, so metering crypto and authorization crypto never
 overlap.
 
+**Invariant Z9 — usage inspection (`du`) is self-only unless an admin flag opts in
+(ADR 0003).** `GET /{did}/du` returns per-object **sizes** (never content) for
+`{did}`. It is allowed when the caller **owns** `{did}` (self usage — no new trust
+decision). A **cross-DID** query is refused `403` **unless** the server sets
+`CISS_ADMIN_USAGE` **and** the caller's DID is in the admin pin set (ADR 0001 §5);
+then an admin may read another DID's object **sizes**, including gated ones — a
+deliberate, flag-guarded exception to Z5's visibility (sizes only, admins only,
+opt-in). With the flag unset (the default) Z5 is intact and `du` is an ordinary
+owner-only read. The `403` does not vary by whether `{did}` exists (no oracle).
+
 ## 6. Content integrity
 
 **Invariant C1 — the server, not the client, names content.** An object's address
