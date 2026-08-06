@@ -326,13 +326,30 @@ impl Client {
     ///
     /// Fails on a connect error, a non-2xx status, or a malformed cid entry.
     pub async fn list_blobs(&self, session: Option<&Session>, did: &str) -> Result<Vec<String>> {
-        let url = format!(
-            "{}/xrpc/com.atproto.sync.listBlobs?did={}",
-            self.base,
-            enc(did),
-        );
+        let url = self.list_blobs_url(did);
         let resp = self.send(with_session(self.http.get(&url), session), "list").await?;
-        let resp = self.ensure_success(resp, "list").await?;
+        Self::parse_cid_list(self.ensure_success(resp, "list").await?).await
+    }
+
+    /// `GET /xrpc/com.atproto.sync.listBlobs?did=` as a `did:` caller, presenting a
+    /// service-auth JWT (`lxm=com.atproto.sync.listBlobs`) so the caller lists its
+    /// own (or granted) blobs. Returns the visible cids as sha256 hex.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error, a non-2xx status, or a malformed cid entry.
+    pub async fn list_blobs_bearer(&self, token: &str, did: &str) -> Result<Vec<String>> {
+        let url = self.list_blobs_url(did);
+        let resp = self.send(self.http.get(&url).bearer_auth(token), "list").await?;
+        Self::parse_cid_list(self.ensure_success(resp, "list").await?).await
+    }
+
+    fn list_blobs_url(&self, did: &str) -> String {
+        format!("{}/xrpc/com.atproto.sync.listBlobs?did={}", self.base, enc(did))
+    }
+
+    /// Parse a `listBlobs` response body (`{cids:[CIDv1,…]}`) into sha256-hex cids.
+    async fn parse_cid_list(resp: reqwest::Response) -> Result<Vec<String>> {
         let v: serde_json::Value = resp.json().await.context("parse listBlobs response")?;
         v["cids"]
             .as_array()

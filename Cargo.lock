@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "ciss"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "ciss-cli"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "axum",

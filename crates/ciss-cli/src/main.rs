@@ -266,6 +266,8 @@ async fn login(
 
 /// The lexicon method uploadBlob binds a `did:` service-auth token to.
 const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
+/// The lexicon method listBlobs binds a `did:` service-auth token to.
+const LISTBLOBS_LXM: &str = "com.atproto.sync.listBlobs";
 /// The lexicon methods a Model-C `did:` owner's policy set/read tokens bind to.
 const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
 const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
@@ -455,13 +457,15 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let http = server_client(&cli.global);
             commands::object::meter(&http, &session, cli.global.json).await
         }
-        Commands::Ls => {
-            require_id_plane(cli.global.identity, "ls")?;
-            let keypair = identity::load_keypair(&config)?;
-            let session = client::session_for(&keypair);
-            let http = server_client(&cli.global);
-            commands::object::ls(&http, Some(&session), &session.did, cli.global.json).await
-        }
+        Commands::Ls => match cli.global.identity {
+            IdentityKind::Id => {
+                let keypair = identity::load_keypair(&config)?;
+                let session = client::session_for(&keypair);
+                let http = server_client(&cli.global);
+                commands::object::ls(&http, Some(&session), &session.did, cli.global.json).await
+            }
+            IdentityKind::Did => did_ls(&cli.global, &config).await,
+        },
         Commands::Acl(AclCommand::Set { cid, class, readers }) => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
@@ -485,16 +489,33 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Reject a `did:`-plane invocation of an `id:`-only command with a clear message,
-/// rather than the confusing "no identity — run key gen" a missing local key gives.
+/// Reject a `did:`-plane invocation of a command the **server** only exposes to an
+/// `id:` session, with a clear message (rather than the confusing "no identity —
+/// run key gen" a missing local key gives). Currently only `meter`: the server's
+/// meter endpoint authenticates an `id:` session, so `did:` metering would need a
+/// server change.
 fn require_id_plane(identity: IdentityKind, command: &str) -> anyhow::Result<()> {
     if identity == IdentityKind::Did {
         anyhow::bail!(
-            "`{command}` is an id: capability (it reads your own metered namespace \
-             over a self-signed session); it does not apply to a did: identity. \
-             Run it under an id: profile (omit `--identity did`)."
+            "`{command}` is not available for a did: identity — the server authenticates \
+             this endpoint with an id: session. Run it under an id: profile (omit \
+             `--identity did`)."
         );
     }
+    Ok(())
+}
+
+/// `--identity did ls`: relay a `listBlobs`-scoped service-auth JWT and list the
+/// account's own blobs over the atproto plane.
+async fn did_ls(global: &GlobalArgs, config: &config::Config) -> anyhow::Result<()> {
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let server = server_client(global);
+    let aud = resolve_aud(global, &server).await?;
+    let (account_did, tokens) =
+        atproto::service_auth_tokens(&pds, &cred, &aud, &[LISTBLOBS_LXM]).await?;
+    let cids = server.list_blobs_bearer(&tokens[0], &account_did).await?;
+    commands::object::print_cids(&cids, global.json);
     Ok(())
 }
 
