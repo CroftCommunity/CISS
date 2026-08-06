@@ -1,6 +1,6 @@
 # Plan — `ciss-ctl`, the CISS client CLI
 
-- **Date:** 2026-08-06 · **Status:** ✅ **READY FOR EXECUTION — Passes 1/2/3 complete; Phase 0 (D1–D4) executed incl. live bsky probe; one ADVISORY open question (non-gating)** · **TDD-first**
+- **Date:** 2026-08-06 · **Status:** ✅ **DELIVERED — all phases (0–10) complete, merged to `main` (PR #6) + tap (PR #1); live-validated end-to-end against bsky.social; `brew install --HEAD` works** · **TDD-first** · Follow-on: versioned Homebrew formula once a release ships `ciss-ctl`.
 - **Owns:** a new workspace member `crates/ciss-cli` producing the `ciss-ctl`
   binary. Homebrew-installable from the same tap as the server.
 - **Contracts spoken to:** `README.md` API surface, `docs/spec/gated-reads.md`
@@ -828,15 +828,23 @@ so it is a real test, not prose.
 
 ---
 
-### Phase 10: Homebrew distribution
+### Phase 10: Homebrew distribution ✅ COMPLETE (2026-08-06, HEAD formula)
 
 **Goal:** `brew install` yields a working `ciss-ctl`.
 **Changes:**
-- [ ] `CroftCommunity/homebrew-tap` (cloned at
-  `/Users/cpettet/git/chasemp/CroftC/homebrew-tap`) — add `Formula/ciss-ctl.rb`
-  building `ciss-ctl`; push tag on `ciss`, verify SHA256 against the uploaded
-  release asset (per the Homebrew workflow rules in CLAUDE.md and the
-  `cli-distribution` skill). Git identity: `chasemp` / `github-personal`.
+- [x] `CroftCommunity/homebrew-tap` — added `Formula/ciss-ctl.rb` (merged via
+  tap PR #1). It builds only the `crates/ciss-cli` workspace member and installs
+  from **HEAD** (`brew install --HEAD croftcommunity/tap/ciss-ctl`), since no
+  tagged CISS release ships `ciss-ctl` yet. `brew test` covers `--version` +
+  `key gen` + `whoami`. Git identity: `chasemp` / `github-personal`.
+
+**Executed:** CISS PR #6 merged Phases 1–9 to `main`; tap PR #1 added the formula.
+`brew style` clean; `brew install --HEAD` compiled and installed
+`/opt/homebrew/bin/ciss-ctl` (0.4.0); `brew test` exits 0; the Homebrew-installed
+binary generates a `0600` identity. **Follow-on (release-gated):** replace the
+HEAD-only stanza with a versioned `url` + verified `sha256` once a CISS release
+(e.g. `v0.5.0`) includes `ciss-ctl` — per the CLAUDE.md Homebrew workflow (prefer
+the uploaded release asset for a deterministic hash). Tracked, not blocking.
 **Call chain:** n/a (packaging).
 **Wiring test:** `brew install` from the tap on a clean machine → `ciss-ctl
 --version` works; `brew test` runs `key gen` + `whoami`.
