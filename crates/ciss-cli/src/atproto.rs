@@ -142,6 +142,16 @@ fn tighten_dir(_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The `did:` account identifier (handle or DID) stored in the profile's
+/// `pds.json`, if any — a non-erroring inspect for listing/orientation. Reads the
+/// file directly (ignores the env credential, which is not profile-scoped).
+#[must_use]
+pub fn profile_identifier(config: &Config) -> Option<String> {
+    let text = std::fs::read_to_string(config.credential_path()).ok()?;
+    let cred: PdsCredential = serde_json::from_str(&text).ok()?;
+    Some(cred.identifier)
+}
+
 /// A logged-in PDS session: the access token plus the resolved account DID.
 pub struct PdsSession {
     /// The PDS-issued access JWT (bearer for `getServiceAuth`).

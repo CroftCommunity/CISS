@@ -68,6 +68,19 @@ curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
 `$XDG_CONFIG_HOME/ciss-ctl/profiles/<profile>/identity.key` (mode `0600`,
 seed-only). The `id:` DID is `"id:" + sha256(pubkey)`.
 
+**Orient first.** Before creating or overwriting keys, see what already exists.
+`key list` enumerates every profile and its DID/account (read-only, never errors —
+even on an empty store):
+
+```bash
+cctl key list
+# (no identities yet — run `ciss-ctl key gen` or `ciss-ctl login`)   ← on a fresh store
+```
+
+`key gen` refuses to clobber an existing key, so `key list` is how you check
+before you act. (For just the active profile, `cctl key show` inspects it and
+errors if none.)
+
 ```bash
 cctl key gen
 # id:b8c1ecda…
@@ -83,6 +96,16 @@ Import an existing OpenSSH ed25519 key (passphrase-less) as its own profile:
 ssh-keygen -t ed25519 -N "" -f /tmp/demo_key -q
 cctl --profile imported key import /tmp/demo_key
 # id:0da99fa5…      (deterministic; encrypted keys are refused)
+```
+
+`key list` now shows both profiles (the `*` marks the active one; `--json` gives a
+machine array):
+
+```bash
+cctl key list
+# * default    id   id:b8c1ecda…
+#   imported   id   id:0da99fa5…
+#   (* = active profile; select another with --profile <name>)
 ```
 
 ---

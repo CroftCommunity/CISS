@@ -95,6 +95,14 @@ pub fn whoami(config: &Config) -> Result<String> {
     Ok(derive_id(&load_keypair(config)?.verifying_key()))
 }
 
+/// The profile's `id:` DID if it has a local key, else `None` (a non-erroring
+/// inspect, for listing/orientation — unlike [`whoami`], which errors).
+#[must_use]
+pub fn profile_did(config: &Config) -> Option<String> {
+    let keypair = load_keypair(config).ok()?;
+    Some(derive_id(&keypair.verifying_key()))
+}
+
 /// The active identity's DID and public-key hex.
 ///
 /// # Errors
