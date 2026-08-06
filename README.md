@@ -169,8 +169,9 @@ ACLs (Model A `id:` / Model C `did:`), and shows the bytes transferred.
 
 ```bash
 ciss-ctl key gen                                  # or: key import ~/.ssh/id_ed25519
-ciss-ctl put note.txt                             # S3 plane → {cid, bytes, receipt}
-ciss-ctl get <cid> --via pds -o out.txt           # cross-plane fetch (same bytes)
+ciss-ctl put note.txt                             # atproto uploadBlob (default) → {cid, cidv1, bytes}
+ciss-ctl put note.txt --via s3                    # S3-compat plane → same cid
+ciss-ctl get <cid> --via s3 -o out.txt            # cross-plane fetch (same bytes)
 ciss-ctl meter                                    # receipts + bytes + postage
 ciss-ctl acl set <cid> --class grantees --readers id:<did>   # gate a private object
 ```

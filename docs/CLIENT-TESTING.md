@@ -112,30 +112,38 @@ cctl key list
 
 ## 2. Metered upload — two planes, one digest
 
-CISS exposes an S3-compatible plane and an atproto blob plane over one metered
-byte-path. `put`/`get` take `--via s3` (default) or `--via pds`; both address the
-same content id.
+CISS exposes an atproto blob plane and an S3-compatible plane over one metered
+byte-path. `put`/`get` **default to `--via pds`** (the atproto interface); pass
+`--via s3` for the S3-compat path. Both address the same content id.
 
 ```bash
 echo "hello from ciss-ctl" > note.txt
 
 cctl put note.txt
-# uploaded via s3
-#   cid:     f2c13d14…        (= sha256 of the file)
-#   bytes:   29               (bytes transferred — the metered quantity)
-#   receipt: unilateral       (provider-signed receipt; see §7)
-#   etag:    "f2c13d14…"
+# uploaded via pds (atproto uploadBlob)
+#   cid:   98ea6e4f…          (= sha256 of the file)
+#   cidv1: bafkrei…           (the atproto address for the same digest)
+#   bytes: 29                 (bytes transferred — the metered quantity)
 
 CID=$(cctl --json put note.txt | python3 -c 'import sys,json;print(json.load(sys.stdin)["cid"])')
 ```
 
-Cross-plane fetch — store one way, read the other, identical bytes (the client
-bridges the S3 hex cid ↔ the atproto CIDv1):
+The S3-compat plane is `--via s3` — same digest, and it surfaces the
+provider-signed receipt mode + an ETag:
 
 ```bash
-cctl get "$CID" -o out_s3.txt              # via s3 (default)
-cctl get "$CID" --via pds -o out_pds.txt   # via the atproto plane
-diff out_s3.txt out_pds.txt && echo "identical across planes"
+cctl put note.txt --via s3
+# uploaded via s3
+#   cid: 98ea6e4f…  bytes: 29  receipt: unilateral  etag: "98ea6e4f…"
+```
+
+Cross-plane fetch — store one way, read the other, identical bytes (the client
+bridges the atproto CIDv1 ↔ the S3 hex cid):
+
+```bash
+cctl get "$CID" -o out_pds.txt             # via pds (default)
+cctl get "$CID" --via s3 -o out_s3.txt     # via the S3 plane
+diff out_pds.txt out_s3.txt && echo "identical across planes"
 ```
 
 The client-side meter — receipts and bytes transferred (this is the aggregate the

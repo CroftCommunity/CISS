@@ -119,14 +119,14 @@ enum Commands {
     /// Print the DID of the active identity.
     Whoami,
 
-    /// Upload a file over the S3 or atproto plane; prints the content id (cid)
+    /// Upload a file over the atproto or S3 plane; prints the content id (cid)
     /// and the bytes transferred. Both planes land at the same backend digest.
     Put {
         /// Path to the file to upload.
         file: String,
-        /// Byte-path to upload over: `s3` (metered object PUT) or `pds`
-        /// (atproto uploadBlob). Same resulting cid either way.
-        #[arg(long, value_enum, default_value_t = Plane::S3)]
+        /// Byte-path to upload over: `pds` (atproto uploadBlob, the default) or
+        /// `s3` (the S3-compat object PUT). Same resulting cid either way.
+        #[arg(long, value_enum, default_value_t = Plane::Pds)]
         via: Plane,
     },
 
@@ -143,8 +143,9 @@ enum Commands {
         /// this to fetch an object another owner has shared with you.
         #[arg(long)]
         owner: Option<String>,
-        /// Byte-path to fetch over: `s3` or `pds` (both address one digest).
-        #[arg(long, value_enum, default_value_t = Plane::S3)]
+        /// Byte-path to fetch over: `pds` (the default) or `s3` (both address
+        /// the same digest).
+        #[arg(long, value_enum, default_value_t = Plane::Pds)]
         via: Plane,
     },
 

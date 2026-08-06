@@ -56,16 +56,16 @@ to a native key, so an imported identity re-derives the same DID. Encrypted
 ## Two planes, one digest
 
 Every command takes `--server <url>` (default `http://127.0.0.1:8080`). Upload
-and fetch work over the S3 plane (`--via s3`, the default) or the atproto blob
-plane (`--via pds`); both address the same content id.
+and fetch **default to the atproto blob plane** (`--via pds`); pass `--via s3` for
+the S3-compat plane. Both address the same content id.
 
 ```bash
-ciss-ctl put note.txt                       # S3 plane → {cid, bytes, receipt}
-ciss-ctl put note.txt --via pds             # atproto uploadBlob → same cid
-ciss-ctl get <cid> -o out.txt               # fetch (re-verified against the cid)
-ciss-ctl get <cid> --via pds -o out.txt     # fetch the other way — same bytes
+ciss-ctl put note.txt                       # atproto uploadBlob (default) → {cid, cidv1, bytes}
+ciss-ctl put note.txt --via s3              # S3-compat plane → same cid, + receipt/etag
+ciss-ctl get <cid> -o out.txt               # fetch via pds (re-verified against the cid)
+ciss-ctl get <cid> --via s3 -o out.txt      # fetch the other way — same bytes
 ciss-ctl ls                                 # cids stored under your identity
-ciss-ctl meter                              # receipts + bytes + postage
+ciss-ctl meter                              # receipts + bytes + postage (server-side, per DID)
 ```
 
 `get` verifies `sha256(bytes) == cid` **before** writing (temp-then-rename), so
