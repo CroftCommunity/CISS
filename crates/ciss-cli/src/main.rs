@@ -157,14 +157,10 @@ enum Commands {
     /// read). `id:` plane.
     Ls,
 
-    /// Show per-object sizes + total for a namespace (`du`). Defaults to your own;
-    /// `--did <did>` inspects another namespace (server-side admin only, off by
-    /// default).
-    Du {
-        /// The DID to report on (defaults to your own identity).
-        #[arg(long)]
-        did: Option<String>,
-    },
+    /// Show per-object sizes + total for **your own** namespace (`du`). Self-only:
+    /// the server never reports another DID's usage. (An operator may lock `du` to
+    /// admins via `CISS_ADMIN_ONLY_DU`.)
+    Du,
 
     /// Manage a per-object read ACL (gated reads).
     #[command(subcommand)]
@@ -477,17 +473,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_ls(&cli.global, &config).await,
         },
-        Commands::Du { did } => match cli.global.identity {
+        Commands::Du => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
                 let session = client::session_for(&keypair);
-                let target = did.unwrap_or_else(|| session.did.clone());
                 let http = server_client(&cli.global);
-                let usage = http.du(Some(&session), &target).await?;
+                let usage = http.du(Some(&session), &session.did).await?;
                 commands::object::print_usage(&usage, cli.global.json);
                 Ok(())
             }
-            IdentityKind::Did => did_du(&cli.global, &config, did).await,
+            IdentityKind::Did => did_du(&cli.global, &config).await,
         },
         Commands::Acl(AclCommand::Set { cid, class, readers }) => match cli.global.identity {
             IdentityKind::Id => {
@@ -528,22 +523,16 @@ fn require_id_plane(identity: IdentityKind, command: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// `--identity did du [--did <other>]`: relay a `du`-scoped service-auth JWT and
-/// report usage for the account's own DID (or another, if the account is a
-/// server-side admin and the flag is on).
-async fn did_du(
-    global: &GlobalArgs,
-    config: &config::Config,
-    did: Option<String>,
-) -> anyhow::Result<()> {
+/// `--identity did du`: relay a `du`-scoped service-auth JWT and report usage for
+/// the account's own DID (self-only; the server never serves another DID's usage).
+async fn did_du(global: &GlobalArgs, config: &config::Config) -> anyhow::Result<()> {
     let cred = atproto::load_credential(config)?;
     let pds = reqwest::Client::new();
     let server = server_client(global);
     let aud = resolve_aud(global, &server).await?;
     let (account_did, tokens) =
         atproto::service_auth_tokens(&pds, &cred, &aud, &[DU_LXM]).await?;
-    let target = did.unwrap_or(account_did);
-    let usage = server.du_bearer(&tokens[0], &target).await?;
+    let usage = server.du_bearer(&tokens[0], &account_did).await?;
     commands::object::print_usage(&usage, global.json);
     Ok(())
 }

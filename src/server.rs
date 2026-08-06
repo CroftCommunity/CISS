@@ -216,12 +216,14 @@ pub(crate) struct AppState {
     replay: Arc<ReplayGuard>,
     /// This service's atproto DID — the `aud` a service-auth JWT must name.
     service_did: Arc<str>,
-    /// DIDs authorized for **cross-DID** usage inspection (`du`, ADR 0003) — the
-    /// break-glass admin pins, at deploy. Empty by default (self-only `du`).
+    /// When `admin_only_du` is set, the DIDs permitted to run `du` (the break-glass
+    /// admin pins, at deploy). `du` is always self-only regardless; this set only
+    /// governs *who* may run it under the lockdown.
     admin_dids: Arc<std::collections::HashSet<String>>,
-    /// The `CISS_ADMIN_USAGE` flag: cross-DID admin `du` is allowed only when this
-    /// is set **and** the caller is in `admin_dids`. Off by default.
-    admin_usage: bool,
+    /// The `CISS_ADMIN_ONLY_DU` lockdown flag (ADR 0003). When set, only a DID in
+    /// `admin_dids` may run `du` — still only for its own namespace. Off by
+    /// default: any authenticated caller may `du` its own namespace.
+    admin_only_du: bool,
 }
 
 /// The cooperative metered-storage server.
@@ -303,27 +305,27 @@ impl App {
                 resolver: Arc::new(StaticResolver::default()),
                 replay: Arc::new(ReplayGuard::new()),
                 service_did: Arc::from(default_service_did().as_str()),
-                // Usage inspection (ADR 0003): self-only by default. An operator
-                // opts into cross-DID admin `du` via `with_admin_usage`.
+                // Usage inspection (`du`, ADR 0003): always self-only. Off by
+                // default; an operator locks `du` to admins via `with_admin_only_du`.
                 admin_dids: Arc::new(std::collections::HashSet::new()),
-                admin_usage: false,
+                admin_only_du: false,
             },
         }
     }
 
-    /// Enable cross-DID admin usage inspection (`du`, ADR 0003 / invariant Z9).
-    /// `admin_dids` is the set authorized to read *other* DIDs' object sizes
-    /// (the break-glass admin pins, at deploy); `enabled` is the `CISS_ADMIN_USAGE`
-    /// flag. Both must hold for a cross-DID `du` to succeed; self `du` is always
-    /// allowed regardless. Off by default (self-only).
+    /// Lock `du` to admins (`CISS_ADMIN_ONLY_DU`, ADR 0003 / invariant Z9). `du` is
+    /// always **self-only** (cross-DID is never served); this only governs *who*
+    /// may run it. With `enabled` set, only a DID in `admin_dids` (the break-glass
+    /// admin pins, at deploy) may run `du` on its own namespace. Off by default:
+    /// any authenticated caller may `du` its own namespace.
     #[must_use]
-    pub fn with_admin_usage(
+    pub fn with_admin_only_du(
         mut self,
         admin_dids: std::collections::HashSet<String>,
         enabled: bool,
     ) -> Self {
         self.state.admin_dids = Arc::new(admin_dids);
-        self.state.admin_usage = enabled;
+        self.state.admin_only_du = enabled;
         self
     }
 
@@ -582,8 +584,8 @@ pub(crate) enum Op {
         did: String,
         cid: Option<String>,
     },
-    /// Usage report for a DID: per-object sizes + total (ADR 0003). Self-only
-    /// unless `CISS_ADMIN_USAGE` + an admin-pin caller (checked in-handler).
+    /// Usage report for a DID: per-object sizes + total (ADR 0003). Always
+    /// self-only; `CISS_ADMIN_ONLY_DU` further restricts to admins (checked in-handler).
     Du {
         did: String,
     },
@@ -1262,16 +1264,22 @@ fn op_list_blobs(
 /// summed per distinct cid, in first-upload order) + total. Reads the maintained
 /// receipt ledger — no filesystem walk.
 ///
-/// Authorization: the caller must **own** `did` (self usage), or — **only** when
-/// `CISS_ADMIN_USAGE` is enabled — be an **admin-pin** DID (cross-DID audit; sees
-/// sizes, never content). Otherwise `403`, with a response that does not vary by
-/// whether `did` exists (no existence oracle).
+/// Authorization (ADR 0003 / invariant Z9): **self-only** — the caller may report
+/// on its **own** namespace. Cross-DID / store-wide usage is **never** exposed over
+/// the wire (an operator uses the on-box `ciss usage` report). A non-owner —
+/// including an anonymous caller — is refused `403`, with a response that does not
+/// vary by whether `did` exists (no existence oracle).
 fn op_du(state: &AppState, principal: &Principal, did: &str) -> Result<OpOutcome, ServerError> {
     let caller = principal.did();
-    let is_self = caller == Some(did);
-    let is_admin = state.admin_usage && caller.is_some_and(|c| state.admin_dids.contains(c));
-    if !is_self && !is_admin {
-        tracing::info!(resource = %did, actor = ?caller, reason = "not self or admin", "du denied");
+    // Self-only, always: cross-DID usage is never exposed over the wire.
+    if caller != Some(did) {
+        tracing::info!(resource = %did, actor = ?caller, reason = "not owner", "du denied");
+        return Err(ServerError::Forbidden);
+    }
+    // Lockdown (CISS_ADMIN_ONLY_DU): when set, only an admin-pin DID may run `du`
+    // at all — still only for its own namespace (checked above).
+    if state.admin_only_du && !caller.is_some_and(|c| state.admin_dids.contains(c)) {
+        tracing::info!(resource = %did, reason = "du locked to admins", "du denied");
         return Err(ServerError::Forbidden);
     }
 
@@ -1631,9 +1639,10 @@ async fn get_meter_handler(
     dispatch_blocking(&state, principal, Op::GetMeter { did: did.into_string() }).await
 }
 
-/// `GET /{did}/du` — per-object sizes + total for `did` (ADR 0003). Self usage for
-/// the owner; cross-DID only for an admin-pin caller when `CISS_ADMIN_USAGE` is
-/// on. Accepts an `id:` session or a `did:` service-auth JWT bound to `du`.
+/// `GET /{did}/du` — per-object sizes + total for `did` (ADR 0003). **Self-only**
+/// (the owner of `did`); cross-DID is never served. `CISS_ADMIN_ONLY_DU` further
+/// restricts `du` to admin-pin DIDs. Accepts an `id:` session or a `did:`
+/// service-auth JWT bound to `du`.
 async fn du_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,

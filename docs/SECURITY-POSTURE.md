@@ -182,15 +182,15 @@ attestations are signed with a **dedicated** `policy-attest` key
 by both key and signing domain, so metering crypto and authorization crypto never
 overlap.
 
-**Invariant Z9 — usage inspection (`du`) is self-only unless an admin flag opts in
-(ADR 0003).** `GET /{did}/du` returns per-object **sizes** (never content) for
-`{did}`. It is allowed when the caller **owns** `{did}` (self usage — no new trust
-decision). A **cross-DID** query is refused `403` **unless** the server sets
-`CISS_ADMIN_USAGE` **and** the caller's DID is in the admin pin set (ADR 0001 §5);
-then an admin may read another DID's object **sizes**, including gated ones — a
-deliberate, flag-guarded exception to Z5's visibility (sizes only, admins only,
-opt-in). With the flag unset (the default) Z5 is intact and `du` is an ordinary
-owner-only read. The `403` does not vary by whether `{did}` exists (no oracle).
+**Invariant Z9 — usage inspection (`du`) is self-only over the wire (ADR 0003).**
+`GET /{did}/du` returns per-object **sizes** (never content) for `{did}`, and only
+when the authenticated caller **owns** `{did}`. A **cross-DID** query is refused
+`403` **for everyone, including admins** — no one reads another user's storage
+over the wire; cross-DID / store-wide inspection is an on-box operator action
+(`ciss usage`). This does **not** weaken Z5: there is no admin-sees-others'-sizes
+exception. The optional `CISS_ADMIN_ONLY_DU` flag only ever *narrows* access —
+when set, only an admin-pin DID (ADR 0001 §5) may run `du`, still self-only. The
+`403` does not vary by whether `{did}` exists (no oracle).
 
 ## 6. Content integrity
 
