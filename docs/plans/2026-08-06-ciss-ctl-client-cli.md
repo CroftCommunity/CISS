@@ -449,22 +449,38 @@ passphrase-protected keys are out of v1 (error clearly).
 
 ---
 
-### Phase 4: S3 plane — `put` / `get` / `meter` (`id:` session)
+### Phase 4: S3 plane — `put` / `get` / `meter` (`id:` session) ✅ COMPLETE (2026-08-06)
 
 **Goal:** Upload/fetch/meter over the S3 plane with a signed session; show bytes
 transferred.
 **Changes:**
-- [ ] `crates/ciss-cli/src/client.rs` — async reqwest client; session-header
+- [x] `crates/ciss-cli/src/client.rs` — async reqwest client; session-header
   builder (sign `ciss-session/v1/<did>` via `Keypair::sign_message`, set
   `x-croft-pubkey`/`x-croft-session`); base-URL/profile plumbing.
-- [ ] `crates/ciss-cli/src/commands/object.rs` — `put <file>` (S3 `PUT
+- [x] `crates/ciss-cli/src/commands/object.rs` — `put <file>` (S3 `PUT
   /{did}/objects/{key}` → print `{cid, bytes, receipt_mode}` — shape pinned in
   Verified Assumptions), `get <cid>` (S3 GET, write bytes to `-o`, re-verify
   `sha256(bytes)==cid`), `meter` (GET `/{did}/meter`).
-- [ ] `crates/ciss-cli/src/client.rs` — the **error-code→message mapping** from the
-  Observability note (401/403/404/409/connect-fail → actionable text + exit codes),
-  the shared surface every later phase reuses.
-- [ ] wire subcommands.
+- [x] `crates/ciss-cli/src/client.rs` — the **error-code→message mapping** from the
+  Observability note (401/403/404/409/connect-fail → actionable text). *(Distinct
+  process exit codes deferred; every error exits 1 with actionable text — the
+  load-bearing part. Noted as a minor follow-on.)*
+- [x] wire subcommands.
+
+**Structural:** `ciss-cli` became **lib+bin** (`src/lib.rs` exposes
+`client`/`commands`/`config`/`identity`; `main.rs` is parse+dispatch) so
+integration tests drive the CLI's own `Client` against an in-process `App`, per
+the harness convention. `main` dispatch is now async.
+
+**Executed:** RED-first pure guards in `client.rs` unit tests — `verify_cid`
+(flipped byte **and** truncation fail) and `status_hint` (401→session,
+403→signer, 404→oracle-free "not found/not visible", 409→seq) — then GREEN.
+Integration `tests/cli_s3.rs` (in-process `ciss` App): metered put→get→meter
+round-trip (cid==sha256, bytes==len, receipt unilateral, ETag echoes cid,
+receipts=2, running_total=2×len); **tampered session → 401** (distinct from a
+good one, which still works); missing object → **oracle-free 404**; dead server →
+"unreachable". Manually validated against a locally-launched `ciss` server:
+identical round-trip, meter increments, 404 message. Clippy clean; full suite green.
 **Call chain:** `main` → `Put` → `client::put_s3()` (session header) → server
 `put_object_handler` → prints receipt; `Get` → `client::get_s3()` → re-verify.
 **Wiring test:** `tests/cli_s3.rs` — against an in-process `App` on an ephemeral

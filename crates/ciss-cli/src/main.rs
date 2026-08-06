@@ -6,10 +6,11 @@
 //! error, non-zero exit) rather than succeeding silently, so an unimplemented
 //! path is never mistaken for a working one.
 
+use std::path::Path;
+
 use clap::{Args, Parser, Subcommand};
 
-mod config;
-mod identity;
+use ciss_cli::{client, commands, config, identity};
 
 /// Which identity plane the client acts under.
 ///
@@ -163,7 +164,7 @@ fn print_did(did: &str, json: bool) {
     }
 }
 
-fn dispatch(cli: Cli) -> anyhow::Result<()> {
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let config = config::Config::new(&cli.global.profile)?;
     match cli.command {
         Commands::Key(KeyCommand::Gen) => {
@@ -191,9 +192,34 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             print_did(&did, cli.global.json);
             Ok(())
         }
-        Commands::Put { .. } => Err(not_yet_implemented("put", "Phase 4")),
-        Commands::Get { .. } => Err(not_yet_implemented("get", "Phase 4")),
-        Commands::Meter => Err(not_yet_implemented("meter", "Phase 4")),
+        Commands::Put { file, via } => match via {
+            Plane::S3 => {
+                let session = client::session_for(&identity::load_keypair(&config)?);
+                let http = client::Client::new(&cli.global.server);
+                commands::object::put(&http, &session, Path::new(&file), cli.global.json).await
+            }
+            Plane::Pds => Err(not_yet_implemented("put --via pds", "Phase 5")),
+        },
+        Commands::Get { cid, output, via } => match via {
+            Plane::S3 => {
+                let did = identity::whoami(&config)?;
+                let http = client::Client::new(&cli.global.server);
+                commands::object::get(
+                    &http,
+                    &did,
+                    &cid,
+                    output.as_deref().map(Path::new),
+                    cli.global.json,
+                )
+                .await
+            }
+            Plane::Pds => Err(not_yet_implemented("get --via pds", "Phase 5")),
+        },
+        Commands::Meter => {
+            let session = client::session_for(&identity::load_keypair(&config)?);
+            let http = client::Client::new(&cli.global.server);
+            commands::object::meter(&http, &session, cli.global.json).await
+        }
         Commands::Ls => Err(not_yet_implemented("ls", "Phase 5")),
         Commands::Acl(AclCommand::Set { .. }) => Err(not_yet_implemented("acl set", "Phase 8a")),
         Commands::Acl(AclCommand::Get { .. }) => Err(not_yet_implemented("acl get", "Phase 8a")),
@@ -202,5 +228,5 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dispatch(Cli::parse())
+    dispatch(Cli::parse()).await
 }

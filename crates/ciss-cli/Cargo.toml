@@ -30,3 +30,14 @@ zeroize = "1"
 # Import existing ssh-keygen ed25519 keys via a maintained OpenSSH parser (D1),
 # rather than shelling to ssh-keygen or hand-rolling the OpenSSH wrapper.
 ssh-key = { version = "0.6", features = ["ed25519"] }
+# Async HTTP to the CISS server. Mirrors the workspace's reqwest config (rustls,
+# no OpenSSL) plus `json` for the metering/receipt bodies.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "charset", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Serve the real `ciss` App in-process on an ephemeral port, so integration tests
+# drive the CLI's own client against the actual server (not mocked HTTP).
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
