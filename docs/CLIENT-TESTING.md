@@ -193,35 +193,83 @@ you never trip the anti-rollback `409`).
 
 ---
 
-## 5. The `did:` identity — an atproto account (Model R)
+## 5. The `did:` identity — the full e2e with your own atproto account (Model R)
 
-A `did:` identity is your **atproto account** (a bsky `did:plc`); its signing key
-stays at your PDS. `ciss-ctl` holds a **credential** (an app password), not a key,
-and relays a short-lived, method-scoped service-auth JWT your PDS mints. The VPS
-resolves your `did:plc` via plc.directory and verifies it.
+This is the real end-to-end most worth exercising: you log in with **your own bsky
+app password**, and CISS treats your **atproto account** (`did:plc`) as the
+identity. Your account's signing key never leaves your PDS; `ciss-ctl` holds only
+the app-password credential and, on each `did:` action, relays a short-lived,
+method-scoped service-auth JWT that **bsky** mints. The VPS resolves your
+`did:plc` via `plc.directory` and verifies it. **CISS never sees your password** —
+only the JWT; your password only ever goes from your machine to your own PDS.
+There is no OAuth/browser step in v1 — the app password *is* the login.
 
-Needs a real atproto account (use a **throwaway** one) and network. Create a bsky
-**app password** (revocable), then:
+### 5.1 Create an app password
+
+In the bsky app: **Settings → App Passwords → Add App Password**. This is a
+revocable, scoped credential — not your account password. (Use a throwaway
+account if you prefer.)
+
+### 5.2 Log in (stores the credential locally at `0600`)
 
 ```bash
-export CISS_PDS_HOST=https://bsky.social
-export CISS_PDS_IDENTIFIER=you.bsky.social
-export CISS_PDS_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+cctl login --pds https://bsky.social --identifier you.bsky.social
+# app password for you.bsky.social at https://bsky.social:   ← typed, not echoed
+# logged in as you.bsky.social (did:plc:xyfhca…) — credential saved to profile 'default'.
+# run `did:` commands with:  ciss-ctl --identity did --profile default …
+```
 
+`login` verifies the credential against bsky before saving (a bad app password
+fails right here, not later), learns your `did:plc`, and writes it to
+`$XDG_CONFIG_HOME/ciss-ctl/profiles/default/pds.json` at mode `0600`. The password
+is never echoed and never printed. To confirm:
+
+```bash
+ls -l "$XDG_CONFIG_HOME/ciss-ctl/profiles/default/pds.json"   # -rw------- (0600)
+```
+
+*Non-interactive alternative* (CI): set `CISS_PDS_APP_PASSWORD` and `login` reads
+it from the env instead of prompting. Env `CISS_PDS_HOST`/`CISS_PDS_IDENTIFIER`/
+`CISS_PDS_APP_PASSWORD` also work without `login` at all — but `login` is the
+first-class path.
+
+### 5.3 Upload and read back as your `did:` — against the VPS
+
+```bash
 echo "via a did: service-auth token" > blob.txt
+
 cctl --identity did put blob.txt --via pds
 # uploaded via pds (did: service-auth)
-#   cid: 0cb6dc2d…   cidv1: bafkrei…   bytes: 23
+#   cid: 6f15e9d6…   cidv1: bafkrei…   bytes: 30
 
 CID=$(cctl --identity did --json put blob.txt --via pds \
       | python3 -c 'import sys,json;print(json.load(sys.stdin)["cid"])')
 cctl --identity did get "$CID" --via pds -o back.txt
-# wrote 23 bytes to back.txt (cid verified)   ← the VPS resolved your did:plc live
+# wrote 30 bytes to back.txt (cid verified)   ← the VPS resolved YOUR did:plc live
 ```
 
-Under a `did:` identity, `--via s3` is refused (no local signing key). A `did:`
-owner can also set an object policy (Model C — CISS provider-attests it from your
-JWT): `cctl --identity did acl set <cid> --class grantees --readers did:plc:…`.
+Under `-v`, you can watch the two-hop flow — the client discovers the service DID,
+your PDS mints the JWT, and CISS accepts it:
+
+```bash
+cctl --identity did -v put blob.txt --via pds
+# [ciss-ctl] discover service DID: HTTP 200
+# [ciss-ctl] upload: HTTP 200
+```
+
+Under a `did:` identity, `--via s3` is refused (there is no local signing key). A
+`did:` owner can also set an object policy (Model C — CISS provider-attests it
+from your JWT):
+
+```bash
+cctl --identity did acl set "$CID" --class grantees --readers did:plc:somereader
+# policy set (Model C): 6f15e9d6… class=grantees seq=1
+```
+
+On the **server side** (next section), a `did:` upload shows up under your real
+`did:plc` in the meter and receipts — the same ledger as `id:`, keyed by your
+atproto identity. This is the whole point: one metered byte-path, whether you
+authenticate with a local key or your atproto account.
 
 ---
 

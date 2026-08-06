@@ -104,6 +104,18 @@ enum Commands {
     #[command(subcommand)]
     Key(KeyCommand),
 
+    /// Log in to your atproto PDS with an app password and save the credential
+    /// for a `did:` profile (writes pds.json at mode 0600). The password is read
+    /// from CISS_PDS_APP_PASSWORD if set, else prompted without echo.
+    Login {
+        /// Your PDS base URL.
+        #[arg(long, default_value = "https://bsky.social")]
+        pds: String,
+        /// Your account handle or DID (e.g. you.bsky.social).
+        #[arg(long)]
+        identifier: String,
+    },
+
     /// Print the DID of the active identity.
     Whoami,
 
@@ -200,6 +212,52 @@ fn print_did(did: &str, json: bool) {
 /// request's outcome is logged when asked.
 fn server_client(global: &GlobalArgs) -> client::Client {
     client::Client::new(&global.server).with_verbose(global.verbose)
+}
+
+/// `ciss-ctl login`: read the app password (env `CISS_PDS_APP_PASSWORD` or a
+/// no-echo prompt), verify it against the PDS with a real login (so a bad
+/// credential fails now, not on first use), and persist it to the profile's
+/// `pds.json` at 0600. The password never touches the CISS server — only the
+/// PDS, and only to obtain the short-lived tokens the `did:` commands relay.
+async fn login(
+    global: &GlobalArgs,
+    config: &config::Config,
+    pds: &str,
+    identifier: &str,
+) -> anyhow::Result<()> {
+    let app_password = match std::env::var("CISS_PDS_APP_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => rpassword::prompt_password(format!("app password for {identifier} at {pds}: "))
+            .context("read app password")?,
+    };
+    let cred = atproto::PdsCredential {
+        pds_host: pds.to_owned(),
+        identifier: identifier.to_owned(),
+        app_password,
+    };
+
+    // Verify the credential (and learn the account DID) before storing it.
+    let http = reqwest::Client::new();
+    let session = atproto::create_session(&http, &cred).await?;
+    atproto::save_credential(config, &cred)?;
+
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "did": session.did,
+                "identifier": identifier,
+                "profile": global.profile,
+            })
+        );
+    } else {
+        println!(
+            "logged in as {identifier} ({}) — credential saved to profile '{}'.",
+            session.did, global.profile
+        );
+        println!("run `did:` commands with:  ciss-ctl --identity did --profile {} …", global.profile);
+    }
+    Ok(())
 }
 
 /// The lexicon method uploadBlob binds a `did:` service-auth token to.
@@ -345,6 +403,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let did = identity::import(&config, std::path::Path::new(&path))?;
             print_did(&did, cli.global.json);
             Ok(())
+        }
+        Commands::Login { pds, identifier } => {
+            login(&cli.global, &config, &pds, &identifier).await
         }
         Commands::Whoami => {
             let did = identity::whoami(&config)?;

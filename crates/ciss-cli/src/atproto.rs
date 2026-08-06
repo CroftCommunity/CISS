@@ -89,6 +89,59 @@ pub fn load_credential(config: &Config) -> Result<PdsCredential> {
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
+/// Persist a `did:` credential to the profile's `pds.json` at mode 0600 (the
+/// profile dir is tightened to 0700). Overwrites an existing credential — a
+/// re-login simply replaces it.
+///
+/// # Errors
+///
+/// Fails if the profile directory or file cannot be created/written.
+pub fn save_credential(config: &Config, cred: &PdsCredential) -> Result<()> {
+    let dir = config.profile_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    tighten_dir(&dir)?;
+    let json = serde_json::to_vec_pretty(cred).context("serialize credential")?;
+    write_secret_file(&config.credential_path(), &json)
+}
+
+/// Write `bytes` to `path` at mode 0600, replacing any existing file (re-login).
+#[cfg(unix)]
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Truncate-or-create with 0600; a pre-existing file keeps whatever mode it
+    // had, so reset it explicitly after.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create credential file {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("write credential file {}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("write credential file {}", path.display()))
+}
+
+#[cfg(unix)]
+fn tighten_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn tighten_dir(_dir: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 /// A logged-in PDS session: the access token plus the resolved account DID.
 pub struct PdsSession {
     /// The PDS-issued access JWT (bearer for `getServiceAuth`).
@@ -220,4 +273,50 @@ fn now_unix_s() -> Result<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock is before the unix epoch")?
         .as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_credential, save_credential, PdsCredential};
+    use crate::config::Config;
+
+    /// `save_credential` persists a `did:` credential at mode 0600 and it reads
+    /// back intact via `load_credential` (the file path, with env unset).
+    #[test]
+    fn save_credential_round_trips_at_0600() {
+        let tmp = std::env::temp_dir().join(format!("ciss-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY (edition 2021): this is the only lib test that touches these vars.
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::env::remove_var("CISS_PDS_HOST");
+        std::env::remove_var("CISS_PDS_IDENTIFIER");
+        std::env::remove_var("CISS_PDS_APP_PASSWORD");
+
+        let config = Config::new("default").expect("config");
+        let cred = PdsCredential {
+            pds_host: "https://bsky.social".to_owned(),
+            identifier: "you.bsky.social".to_owned(),
+            app_password: "abcd-efgh-ijkl-mnop".to_owned(),
+        };
+        save_credential(&config, &cred).expect("save credential");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(config.credential_path())
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "credential file must be 0600, got {mode:o}");
+        }
+
+        let loaded = load_credential(&config).expect("load credential");
+        assert_eq!(loaded.pds_host, cred.pds_host);
+        assert_eq!(loaded.identifier, cred.identifier);
+        assert_eq!(loaded.app_password, cred.app_password);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
 }
