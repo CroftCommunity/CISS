@@ -174,6 +174,29 @@ pub async fn mint_service_auth(
     Ok((token, session.did))
 }
 
+/// Log in once and mint a service-auth token for each `lxm` (all against `aud`,
+/// `exp = now + 60s`). Returns the account DID and the tokens in `lxms` order —
+/// for a command that needs several method-scoped tokens (e.g. getPolicy +
+/// setPolicy) without repeating the login.
+///
+/// # Errors
+///
+/// Fails if login or any mint fails.
+pub async fn service_auth_tokens(
+    http: &reqwest::Client,
+    cred: &PdsCredential,
+    aud: &str,
+    lxms: &[&str],
+) -> Result<(String, Vec<String>)> {
+    let session = create_session(http, cred).await?;
+    let exp = now_unix_s()? + 60;
+    let mut tokens = Vec::with_capacity(lxms.len());
+    for lxm in lxms {
+        tokens.push(get_service_auth(http, &cred.pds_host, &session.access_jwt, aud, lxm, exp).await?);
+    }
+    Ok((session.did, tokens))
+}
+
 fn now_unix_s() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

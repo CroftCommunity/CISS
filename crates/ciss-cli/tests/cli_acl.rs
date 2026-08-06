@@ -4,11 +4,16 @@
 //! grantee's policy view carries no reader set), and **anti-rollback** (a stale
 //! `seq` is 409).
 
+use std::sync::Arc;
+
 use ciss::crypto::{derive_keypair, sha256_hex, Keypair};
 use ciss::identity::derive_id;
 use ciss::policy::{PolicyRecord, ReadClass};
 use ciss::server::{App, Blobs, Db};
+use ciss_auth::{did_key_secp256k1, mint_service_auth_jwt};
 use ciss_cli::client::{session_for, Client, Session};
+use ciss_resolve::{DidResolver, StaticResolver};
+use k256::ecdsa::SigningKey;
 
 async fn spawn_server() -> String {
     let app = App::new("provider-master", Blobs::Memory, Db::Memory).expect("build app");
@@ -136,6 +141,128 @@ async fn model_a_three_party_gate_is_oracle_free_and_leak_free() {
             .is_none(),
         "stranger's policy read is an oracle-free 404 (None)",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Model C: a did: owner sets a provider-attested policy via a service-auth JWT.
+// ---------------------------------------------------------------------------
+
+const SERVICE_DID: &str = "did:web:ciss.test";
+const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
+const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+const GETBLOB_LXM: &str = "com.atproto.sync.getBlob";
+const FAR_FUTURE: u64 = 4_000_000_000;
+
+/// A `did:` persona: a secp256k1 key and its `did:web:<name>.test` DID.
+struct Persona {
+    did: String,
+    sk: SigningKey,
+}
+
+fn persona(name: &str, seed_byte: u8) -> Persona {
+    let mut seed = [seed_byte; 32];
+    seed[0] ^= name.len() as u8;
+    Persona {
+        did: format!("did:web:{name}.test"),
+        sk: SigningKey::from_slice(&seed).expect("valid scalar"),
+    }
+}
+
+impl Persona {
+    /// A single-use `jti` unique per (persona, method), so distinct tokens never
+    /// collide in the server's replay guard.
+    fn jti(&self, lxm: &str) -> String {
+        format!("jti-{}-{lxm}", self.did)
+    }
+    /// Mint a valid service-auth token for `lxm` (aud = the test service DID).
+    fn token(&self, lxm: &str) -> String {
+        let jti = self.jti(lxm);
+        mint_service_auth_jwt(&self.sk, &self.did, SERVICE_DID, lxm, FAR_FUTURE, Some(&jti))
+    }
+    /// An expired token — a present-but-invalid credential.
+    fn expired_token(&self, lxm: &str) -> String {
+        let jti = format!("{}-expired", self.jti(lxm));
+        mint_service_auth_jwt(&self.sk, &self.did, SERVICE_DID, lxm, 1, Some(&jti))
+    }
+}
+
+async fn spawn_atproto(personas: &[&Persona]) -> String {
+    let mut resolver = StaticResolver::default();
+    for p in personas {
+        resolver = resolver.with(p.did.clone(), did_key_secp256k1(p.sk.verifying_key()));
+    }
+    let resolver: Arc<dyn DidResolver> = Arc::new(resolver);
+    let app = App::new("provider-master", Blobs::Memory, Db::Memory)
+        .expect("build app")
+        .with_did_resolver(resolver, SERVICE_DID);
+    let router = app.router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+/// A `did:` owner uploads a blob, sets a Model-C `grantees` policy (a PolicyIntent
+/// + a `setPolicy` service-auth JWT the provider attests), and the gate holds: a
+/// granted `did:` reader reads it, an ungranted one gets 404, and a bad JWT on the
+/// set is a hard 403 (distinct from a read's oracle-free 404).
+#[tokio::test]
+async fn model_c_did_owner_gate_and_bad_jwt_is_403() {
+    let owner = persona("owner", 0x31);
+    let grantee = persona("grantee", 0x32);
+    let stranger = persona("stranger", 0x33);
+    let base = spawn_atproto(&[&owner, &grantee, &stranger]).await;
+    let client = Client::new(&base);
+
+    // Owner uploads a blob into its repo (Phase 7 bearer upload).
+    let payload = b"a model-C gated blob".to_vec();
+    let cid = sha256_hex(&payload);
+    client
+        .upload_blob_bearer(&owner.token(UPLOAD_LXM), &payload)
+        .await
+        .expect("owner upload");
+
+    // Owner sets a grantees policy naming the grantee, via intent + setPolicy JWT.
+    let intent = serde_json::json!({
+        "read_class": "grantees",
+        "readers": [grantee.did],
+        "seq": 1,
+    })
+    .to_string();
+    let seq = client
+        .put_object_policy_intent(&owner.did, &cid, intent.as_bytes(), &owner.token(SET_POLICY_LXM))
+        .await
+        .expect("Model-C set policy");
+    assert_eq!(seq, 1, "provider-attested policy stored at seq 1");
+
+    // A granted did: reader reads the blob via a getBlob bearer.
+    let got = client
+        .get_blob_bearer(&owner.did, &cid, &grantee.token(GETBLOB_LXM))
+        .await
+        .expect("grantee reads the gated blob");
+    assert_eq!(got.bytes, payload);
+
+    // An ungranted did: reader is denied 404 (oracle-free).
+    let err = client
+        .get_blob_bearer(&owner.did, &cid, &stranger.token(GETBLOB_LXM))
+        .await
+        .expect_err("ungranted reader denied");
+    assert!(err.to_string().contains("404"), "ungranted read is 404, got {err}");
+
+    // A present-but-invalid JWT on the set is a hard 403 — the spec's Model-C
+    // fail, distinct from a read's 404.
+    let err = client
+        .put_object_policy_intent(
+            &owner.did,
+            &cid,
+            intent.as_bytes(),
+            &owner.expired_token(SET_POLICY_LXM),
+        )
+        .await
+        .expect_err("bad set token");
+    assert!(err.to_string().contains("403"), "bad Model-C credential is 403, got {err}");
 }
 
 /// A stale/equal `seq` is refused 409 — the anti-rollback wall. The CLI's

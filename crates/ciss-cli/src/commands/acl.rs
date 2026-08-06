@@ -63,6 +63,75 @@ pub async fn set(
     Ok(())
 }
 
+/// `acl set` for a **Model-C** `did:` owner: PUT a `PolicyIntent` authorized by a
+/// service-auth JWT (`set_token`, `lxm=setPolicy`); CISS builds and attests the
+/// record. The monotonic `seq` is read back first (`get_token`, `lxm=getPolicy`)
+/// so the happy path avoids the anti-rollback `409`.
+///
+/// # Errors
+///
+/// Fails on an invalid `--class`, a policy read/write error, or a rejected token
+/// (a bad Model-C credential is a hard `403`).
+pub async fn set_model_c(
+    client: &Client,
+    owner_did: &str,
+    cid: &str,
+    class: &str,
+    readers: &[String],
+    // `(getPolicy token, setPolicy token)` — the read-back and the write credential.
+    tokens: (&str, &str),
+    json_out: bool,
+) -> Result<()> {
+    let (get_token, set_token) = tokens;
+    parse_class(class)?; // validate before minting/sending
+    let current = client.get_object_policy_bearer(owner_did, cid, get_token).await?;
+    let next_seq = current
+        .as_ref()
+        .and_then(|v| v["seq"].as_u64())
+        .unwrap_or(0)
+        + 1;
+    let intent = serde_json::json!({
+        "read_class": class,
+        "readers": readers,
+        "seq": next_seq,
+    })
+    .to_string();
+    let seq = client
+        .put_object_policy_intent(owner_did, cid, intent.as_bytes(), set_token)
+        .await?;
+    if json_out {
+        println!("{}", serde_json::json!({"cid": cid, "read_class": class, "seq": seq, "model": "C"}));
+    } else {
+        println!("policy set (Model C): {cid} class={class} seq={seq}");
+    }
+    Ok(())
+}
+
+/// `acl get` for a `did:` owner: read the policy via a `getPolicy` service-auth JWT.
+///
+/// # Errors
+///
+/// Fails on a connect error; a 404 (no policy, or not visible) is a clear message.
+pub async fn get_model_c(
+    client: &Client,
+    owner_did: &str,
+    cid: &str,
+    get_token: &str,
+    json_out: bool,
+) -> Result<()> {
+    match client.get_object_policy_bearer(owner_did, cid, get_token).await? {
+        Some(policy) => {
+            if json_out {
+                println!("{policy}");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&policy).unwrap_or_else(|_| policy.to_string()));
+            }
+            Ok(())
+        }
+        None => bail!("no policy on {cid} (or it is not visible to you)"),
+    }
+}
+
 /// `ciss-ctl acl get <cid>`: read the policy on an object in the caller's own
 /// namespace (the owner view — the full record including the reader set).
 ///

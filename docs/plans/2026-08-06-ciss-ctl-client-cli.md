@@ -732,17 +732,31 @@ reader-leak; manual three-party run against a local server.
 
 ---
 
-### Phase 8b: Object ACL — Model C (`did:` owner, provider-attested)
+### Phase 8b: Object ACL — Model C (`did:` owner, provider-attested) ✅ COMPLETE (2026-08-06)
 
 **Goal:** A `did:` owner sets/reads policy via a service-auth JWT (the atproto
 authorization form), reusing the 8a command surface.
 **Changes:**
-- [ ] `crates/ciss-cli/src/commands/acl.rs` (extend) — for a `did:` profile, PUT a
-  `PolicyIntent` with a `Bearer` service-auth JWT (`lxm=ing.croft.ciss.setPolicy`);
-  `acl get` uses `lxm=ing.croft.ciss.getPolicy`. The JWT comes from Phase 7's
-  `atproto::get_service_auth` (or the Phase-6 mint in-process).
-- [ ] `docs/spec/gated-reads.md` — one-line note: `ciss-ctl acl` is the reference
+- [x] `crates/ciss-cli/src/commands/acl.rs` (extend) — `set_model_c`/`get_model_c`:
+  PUT a `PolicyIntent` with a `Bearer` service-auth JWT (`lxm=setPolicy`), read
+  back with `lxm=getPolicy`; auto-`seq` via a getPolicy read. `client.rs` gained
+  `put_object_policy_intent`, `get_blob_bearer`, `get_object_policy_bearer`;
+  `atproto.rs` gained `service_auth_tokens` (one login → many method tokens);
+  `main.rs` branches `acl set|get` on `--identity`.
+- [x] `docs/spec/gated-reads.md` — §6 note: `ciss-ctl acl` is the reference
   Model-A/C integrator.
+
+**Executed:** RED→GREEN offline `tests/cli_acl.rs::model_c_did_owner_gate_and_bad_jwt_is_403`
+— a `did:` owner (StaticResolver + Phase-6 mint) uploads a blob, sets a Model-C
+`grantees` policy (intent + `setPolicy` JWT → provider-attested), a granted `did:`
+reader reads it via a `getBlob` bearer, an ungranted reader gets **404**, and a
+present-but-invalid (expired) JWT on the set is a hard **403** (distinct from a
+read's 404). **Discovery:** the server's replay guard rejects a reused `jti`, so
+the test mints a unique `jti` per (persona, method) — confirming the test exercises
+real auth. **Live risk cleared:** bsky's `getServiceAuth` **accepts the custom
+`lxm=ing.croft.ciss.setPolicy`** and mints a valid token (probed live), so
+Model-C-over-live-bsky is viable — the full live demo is Phase 9. Clippy clean;
+full suite green.
 **Call chain:** `main` → `Acl::Set{profile:did}` → `atproto::get_service_auth(lxm=
 setPolicy)` → `client::put_object_policy_intent(Bearer)` → server
 `put_object_policy_handler` (Model C branch → provider-attest).

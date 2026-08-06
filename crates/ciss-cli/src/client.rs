@@ -345,6 +345,58 @@ impl Client {
         v["seq"].as_u64().context("policy response missing seq")
     }
 
+    /// `PUT /{did}/objects/{cid}/policy` as a **Model-C** `did:` owner: a
+    /// `PolicyIntent` body plus a service-auth JWT bearer (`lxm=setPolicy`). CISS
+    /// verifies the token, then builds and provider-attests the record. Returns
+    /// the stored `seq`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status (a bad/absent token is 403, a
+    /// stale `seq` is 409).
+    pub async fn put_object_policy_intent(
+        &self,
+        did: &str,
+        cid: &str,
+        intent_json: &[u8],
+        token: &str,
+    ) -> Result<u64> {
+        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let resp = self
+            .send(
+                self.http.put(&url).bearer_auth(token).body(intent_json.to_vec()),
+                "set policy",
+            )
+            .await?;
+        let resp = self.ensure_success(resp, "set policy").await?;
+        let v: serde_json::Value = resp.json().await.context("parse policy response")?;
+        v["seq"].as_u64().context("policy response missing seq")
+    }
+
+    /// `GET /xrpc/com.atproto.sync.getBlob` as a `did:` reader, presenting a
+    /// service-auth JWT (`lxm=getBlob`) so a gated blob recognizes the caller as a
+    /// grantee. Bytes are verified against `cid` before returning.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a bad cid, a connect error, a non-2xx status (a gated denial is
+    /// 404), or a cid mismatch.
+    pub async fn get_blob_bearer(&self, did: &str, cid: &str, token: &str) -> Result<GetResult> {
+        let cidv1 = ciss::cidv1::from_sha256_hex(cid)
+            .map_err(|e| anyhow!("bridge sha256 hex -> CIDv1 failed for {cid:?}: {e}"))?;
+        let url = format!(
+            "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+            self.base,
+            enc(did),
+            enc(&cidv1),
+        );
+        let resp = self.send(self.http.get(&url).bearer_auth(token), "download").await?;
+        let resp = self.ensure_success(resp, "download").await?;
+        let bytes = resp.bytes().await.context("read getBlob body")?.to_vec();
+        verify_cid(cid, &bytes)?;
+        Ok(GetResult { bytes, etag: None })
+    }
+
     /// `GET /{did}/objects/{cid}/policy` with the caller's `session`. Returns the
     /// policy body the caller is allowed to see (the owner's full record, or a
     /// grantee's `{read_class, may_read}` view), or `None` when the gate returns
@@ -362,6 +414,30 @@ impl Client {
         let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
         let resp = self
             .send(with_session(self.http.get(&url), session), "get policy")
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let resp = self.ensure_success(resp, "get policy").await?;
+        Ok(Some(resp.json().await.context("parse policy body")?))
+    }
+
+    /// `GET /{did}/objects/{cid}/policy` as a **Model-C** `did:` owner, presenting
+    /// a service-auth JWT (`lxm=getPolicy`). Returns the policy body, or `None` on
+    /// a 404 (no policy, or not visible).
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status other than 404.
+    pub async fn get_object_policy_bearer(
+        &self,
+        did: &str,
+        cid: &str,
+        token: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let resp = self
+            .send(self.http.get(&url).bearer_auth(token), "get policy")
             .await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);

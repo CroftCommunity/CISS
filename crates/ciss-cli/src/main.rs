@@ -163,6 +163,9 @@ fn print_did(did: &str, json: bool) {
 
 /// The lexicon method uploadBlob binds a `did:` service-auth token to.
 const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
+/// The lexicon methods a Model-C `did:` owner's policy set/read tokens bind to.
+const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
 
 /// Resolve the token `aud`: the explicit `--aud`, else the service DID the server
 /// advertises.
@@ -228,6 +231,48 @@ async fn did_get(
     // A `did:` read over the atproto plane is public (world) here; a gated `did:`
     // read via a service-auth bearer is Model C (Phase 8b).
     commands::object::get(&server, None, &account.did, cid, output, via, global.json).await
+}
+
+/// `--identity did acl set` (Model C): mint a getPolicy + setPolicy service-auth
+/// JWT and have CISS provider-attest the policy for the account's own object.
+async fn did_acl_set(
+    global: &GlobalArgs,
+    config: &config::Config,
+    cid: &str,
+    class: &str,
+    readers: &[String],
+) -> anyhow::Result<()> {
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let server = client::Client::new(&global.server);
+    let aud = resolve_aud(global, &server).await?;
+    let (owner_did, tokens) =
+        atproto::service_auth_tokens(&pds, &cred, &aud, &[GET_POLICY_LXM, SET_POLICY_LXM]).await?;
+    commands::acl::set_model_c(
+        &server,
+        &owner_did,
+        cid,
+        class,
+        readers,
+        (&tokens[0], &tokens[1]),
+        global.json,
+    )
+    .await
+}
+
+/// `--identity did acl get` (Model C): mint a getPolicy JWT and read the policy back.
+async fn did_acl_get(
+    global: &GlobalArgs,
+    config: &config::Config,
+    cid: &str,
+) -> anyhow::Result<()> {
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let server = client::Client::new(&global.server);
+    let aud = resolve_aud(global, &server).await?;
+    let (owner_did, tokens) =
+        atproto::service_auth_tokens(&pds, &cred, &aud, &[GET_POLICY_LXM]).await?;
+    commands::acl::get_model_c(&server, &owner_did, cid, &tokens[0], global.json).await
 }
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -298,16 +343,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let http = client::Client::new(&cli.global.server);
             commands::object::ls(&http, Some(&session), &session.did, cli.global.json).await
         }
-        Commands::Acl(AclCommand::Set { cid, class, readers }) => {
-            let keypair = identity::load_keypair(&config)?;
-            let http = client::Client::new(&cli.global.server);
-            commands::acl::set(&http, &keypair, &cid, &class, &readers, cli.global.json).await
-        }
-        Commands::Acl(AclCommand::Get { cid }) => {
-            let keypair = identity::load_keypair(&config)?;
-            let http = client::Client::new(&cli.global.server);
-            commands::acl::get(&http, &keypair, &cid, cli.global.json).await
-        }
+        Commands::Acl(AclCommand::Set { cid, class, readers }) => match cli.global.identity {
+            IdentityKind::Id => {
+                let keypair = identity::load_keypair(&config)?;
+                let http = client::Client::new(&cli.global.server);
+                commands::acl::set(&http, &keypair, &cid, &class, &readers, cli.global.json).await
+            }
+            IdentityKind::Did => did_acl_set(&cli.global, &config, &cid, &class, &readers).await,
+        },
+        Commands::Acl(AclCommand::Get { cid }) => match cli.global.identity {
+            IdentityKind::Id => {
+                let keypair = identity::load_keypair(&config)?;
+                let http = client::Client::new(&cli.global.server);
+                commands::acl::get(&http, &keypair, &cid, cli.global.json).await
+            }
+            IdentityKind::Did => did_acl_get(&cli.global, &config, &cid).await,
+        },
     }
 }
 

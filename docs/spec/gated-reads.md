@@ -233,6 +233,13 @@ signer, non-`id:` target for `OwnerSigned`, or a failed/wrong-target JWT), `409`
 **Revoke / re-grant** is just a higher-`seq` policy with the new `readers[]` /
 `read_class`; there is no delete verb — a policy is superseded, never rolled back.
 
+**Reference integrator.** The `ciss-ctl acl set|get` client
+(`crates/ciss-cli`) is the reference implementation of both models: Model A
+(`--identity id`) builds and PUTs a self-signed `PolicyRecord`; Model C
+(`--identity did`) relays a `setPolicy`/`getPolicy` service-auth JWT and PUTs a
+`PolicyIntent`. Both auto-select `seq = current + 1` (reading the policy back
+first) so the happy path never trips the `409` anti-rollback.
+
 **Read-back visibility (owner-only, resolved).** On `GET`, the **owner** receives
 the full signed record (including `readers[]`); a **grantee** receives only
 `{"read_class": …, "may_read": true}` — never the reader set; any other caller
