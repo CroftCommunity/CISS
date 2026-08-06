@@ -138,8 +138,8 @@ ciss/v1/policy:<target_tag>:<seq>:<read_class>:<len>:<readers_sorted_joined>
 - `<len>` = the number of readers; `<readers_sorted_joined>` = the `readers`
   entries **sorted ascending**, joined by `,` (empty string when none).
 
-Example (namespace, `id:alice…`, grantees `[did:plc:bob, did:web:carol.example]`, seq 7):
-`ciss/v1/policy:ns:id:alice…:7:grantees:2:did:plc:bob,did:web:carol.example`
+Example (namespace `id:8a1f…`, grantees `[did:plc:bob, did:web:carol.example]`, seq 7):
+`ciss/v1/policy:ns:id:8a1f…:7:grantees:2:did:plc:bob,did:web:carol.example`
 
 (CISS's provider attestation signs a parallel `ciss/v1/policy-attest:<owner_did>:…`
 preimage with its dedicated attestation key — internal; integrators don't build it.)
@@ -176,8 +176,9 @@ readers/grantees may be **any** DID either way.
   a **service-auth JWT** (`iss`=owner DID, `aud`=CISS, `lxm`=the set-policy method,
   short `exp`). The provider vouches, via the owner's repo key, that the owner
   authorized a *set-policy action*. CISS verifies the JWT (the same DID-resolution
-  path it uses for `uploadBlob`), then **counter-signs the resulting policy with its
-  provider key** (a domain-separated attestation) so the stored record stays durably
+  path it uses for `uploadBlob`), then **counter-signs the resulting policy with a
+  dedicated attestation key** (`policy-attest`, domain-separated and **separate from
+  the receipt/billing key** — §4, invariant Z8) so the stored record stays durably
   verifiable after the short-lived JWT expires.
 
 **Property to understand (Model C):** the JWT authorizes the *action*, not the
@@ -216,9 +217,10 @@ The request body depends on the owner's authorization form (§4.1):
   §4) carrying `authorization: {OwnerSigned: {signer, sig}}`. No auth header — the
   record's own signature is the authorization. The record's `did`/`cid` must match
   the route.
-- **Model C (`did:` owner).** The request carries `Authorization: Bearer <service-
-  auth JWT>` (`lxm = ing.croft.ciss.setPolicy`, `aud =` the CISS service DID,
-  `iss =` the owning DID) and the body is a **`PolicyIntent`**: `{"read_class":
+- **Model C (`did:` owner).** The request carries a `Bearer` service-auth JWT
+  (`Authorization: Bearer <jwt>`, with `lxm = ing.croft.ciss.setPolicy`,
+  `aud =` the CISS service DID, `iss =` the owning DID) and the body is a
+  **`PolicyIntent`**: `{"read_class":
   "world|grantees|owner", "readers": ["did:…", …], "seq": <n>}`. CISS verifies the
   JWT, asserts the authenticated DID equals the target DID, then builds and
   provider-attests the record. A present-but-invalid JWT is a hard `403`.
@@ -255,11 +257,12 @@ grain is a tracked extension, designed **when that query surface is concrete**
 interim escape hatch if some segment-level differentiation is needed before then.
 
 **Design constraint kept in mind:** v1's model must not preclude adding
-range-scoped policy later — the policy `target` is an opaque, extensible string
-(`<did>` / `<did>/<cid>` today), so a future `<did>/range/<lo>-<hi>` target slots
-in without reshaping the record or the resolution order (finest grain wins). If a
-v1 choice would conflict with range grain, prefer the choice that leaves room for
-it.
+range-scoped policy later. Today a record addresses its subject by `did` + optional
+`cid`, and the signing preimage's `target_tag` is an extensible discriminator
+(`ns:<did>` / `obj:<did>:<cid>`); a future range grain adds another target kind
+(e.g. `range:<did>:<lo>-<hi>`) and one more step to the finest-grain-wins
+resolution order — **without reshaping the record**. If a v1 choice would conflict
+with range grain, prefer the choice that leaves room for it.
 
 ## 8. Not in v1 (explicit, so integrators don't rely on them)
 
