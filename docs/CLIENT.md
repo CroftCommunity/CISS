@@ -102,17 +102,21 @@ stays at your PDS. `ciss-ctl` holds a **credential** (an app password), not a
 key. On each `did:` action it logs in and relays a short-lived, method-scoped
 service-auth JWT that your PDS mints — CISS is verify-only.
 
-Credentials come from the environment (or the profile's `pds.json`):
+Log in once with a bsky **app password** (revocable; create it in Settings → App
+Passwords). `login` verifies it, then stores it in the profile's `pds.json` at
+`0600`:
 
 ```bash
-export CISS_PDS_HOST=https://bsky.social
-export CISS_PDS_IDENTIFIER=you.bsky.social
-export CISS_PDS_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx   # a bsky app password
+ciss-ctl login --pds https://bsky.social --identifier you.bsky.social
+# app password: ****   (prompted without echo; or set CISS_PDS_APP_PASSWORD)
 
 ciss-ctl --identity did put photo.jpg --via pds    # upload under a service-auth JWT
 ciss-ctl --identity did get <cid> --via pds -o out
 ciss-ctl --identity did acl set <cid> --class grantees --readers did:plc:…  # Model C
 ```
+
+`CISS_PDS_HOST`/`CISS_PDS_IDENTIFIER`/`CISS_PDS_APP_PASSWORD` also work without
+`login` (useful in CI).
 
 Under a `did:` identity, `--via s3` is refused (there is no local signing key) —
 the atproto plane is the `did:` path.
