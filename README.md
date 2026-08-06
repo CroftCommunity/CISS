@@ -159,6 +159,26 @@ speaks CIDv1 (`ref.$link`); the backend is keyed by the same digest in hex, and
 |---|---|---|
 | `GET` | `/healthz` | `200 ok` once serving. Fast, side-effect-free (croft-stack readiness probe). |
 
+## Client (`ciss-ctl`)
+
+`ciss-ctl` is the reference client (`crates/ciss-cli`), homebrew-installable. It
+links the server's own crates, so its crypto matches the wire byte-for-byte. It
+owns a client identity (native ed25519, or imported from `ssh-keygen`), uploads
+and fetches over **either** plane interchangeably (one digest), manages gated-read
+ACLs (Model A `id:` / Model C `did:`), and shows the bytes transferred.
+
+```bash
+ciss-ctl key gen                                  # or: key import ~/.ssh/id_ed25519
+ciss-ctl put note.txt                             # S3 plane → {cid, bytes, receipt}
+ciss-ctl get <cid> --via pds -o out.txt           # cross-plane fetch (same bytes)
+ciss-ctl meter                                    # receipts + bytes + postage
+ciss-ctl acl set <cid> --class grantees --readers id:<did>   # gate a private object
+```
+
+Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`
+path relays a PDS-minted service-auth JWT (Model R) — the client holds a
+credential, never a key. Full walkthrough: **`docs/CLIENT.md`**.
+
 ## Configuration
 
 The binary takes exactly two flags (the croft-stack tenant contract) and manages

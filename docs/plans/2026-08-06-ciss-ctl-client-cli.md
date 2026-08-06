@@ -782,14 +782,28 @@ if the custom-`lxm` risk clears.
 
 ---
 
-### Phase 9: End-to-end demo + docs
+### Phase 9: End-to-end demo + docs ✅ COMPLETE (2026-08-06)
 
 **Goal:** A repeatable capability tour and user-facing docs.
 **Changes:**
-- [ ] `scripts/demo.sh` (or a `just demo`) — launches a local `ciss`, runs the full
-  tour (keygen → put both planes → meter → acl set → 3-party read → get).
-- [ ] `docs/CLIENT.md` — the walkthrough (below).
-- [ ] `README.md` — a **Client** section linking `ciss-ctl`.
+- [x] `tests/cli_demo.rs` (chosen over `scripts/demo.sh` per the Risks note — a
+  real asserting test can't drift) — `end_to_end_capability_tour` drives the
+  **real `ciss-ctl` binary** against an in-process server through the whole tour;
+  plus an `#[ignore]`d `live_did_service_auth_round_trip`.
+- [x] `docs/CLIENT.md` — the full walkthrough (identity, two planes, gated reads,
+  the `did:` Model-R path, output/diagnostics, v1 SEAMs).
+- [x] `README.md` — a **Client (`ciss-ctl`)** section.
+
+**Executed:** `end_to_end_capability_tour` (multi-thread runtime; blocking binary
+calls against the in-process App) asserts each step: two identities; S3 put with
+`cid == sha256(file)`; cross-plane `get --via pds` byte-identical; `meter`
+increments; `acl set` → `seq=1`; grantee reads via `--owner`, **stranger denied
+(non-zero exit / 404)**; owner `acl get` shows `readers[]`; stranger `ls` omits
+the cid. **The live `did:` round-trip was run and passed** against `bsky.social`
+with the `.env` account: login → `getServiceAuth` → in-process CISS with the
+**production resolver** resolves the account `did:plc` via plc.directory → verifies
+the ES256K token → `uploadBlob` stores → `getBlob` reads back. That closes the last
+unproven link (relay → live resolution → upload). Clippy clean; full suite green.
 **Call chain:** n/a (docs + orchestration script).
 **Wiring test:** `tests/cli_demo.rs` (preferred over a bare shell script so it is a
 real, asserting test) runs the tour end-to-end against an in-process server and
