@@ -41,3 +41,9 @@ serde_json = "1"
 # drive the CLI's own client against the actual server (not mocked HTTP).
 axum = "0.8.9"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+# `did:` offline test: mint a service-auth JWT (Phase 6 helper) standing in for
+# the PDS, and inject its did:key via a StaticResolver. `ciss` does not re-export
+# ciss-auth/ciss-resolve, so the test depends on them directly.
+ciss-auth = { path = "../ciss-auth" }
+ciss-resolve = { path = "../ciss-resolve" }
+k256 = { version = "0.13", features = ["ecdsa"] }

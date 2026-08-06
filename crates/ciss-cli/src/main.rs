@@ -8,9 +8,10 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 
-use ciss_cli::{client, commands, config, identity};
+use ciss_cli::{atproto, client, commands, config, identity};
 
 /// Which identity plane the client acts under.
 ///
@@ -40,6 +41,11 @@ struct GlobalArgs {
     /// Which identity plane to use.
     #[arg(long, global = true, value_enum, default_value_t = IdentityKind::Id)]
     identity: IdentityKind,
+
+    /// For the `did:` plane: the CISS service DID to target as the token `aud`.
+    /// Defaults to the value the server advertises at `/.well-known/did.json`.
+    #[arg(long, global = true)]
+    aud: Option<String>,
 
     /// Emit machine-readable JSON instead of human text.
     #[arg(long, global = true)]
@@ -157,6 +163,73 @@ fn print_did(did: &str, json: bool) {
     }
 }
 
+/// The lexicon method uploadBlob binds a `did:` service-auth token to.
+const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
+
+/// Resolve the token `aud`: the explicit `--aud`, else the service DID the server
+/// advertises.
+async fn resolve_aud(global: &GlobalArgs, http: &client::Client) -> anyhow::Result<String> {
+    match &global.aud {
+        Some(aud) => Ok(aud.clone()),
+        None => http.discover_service_did().await,
+    }
+}
+
+/// `--identity did put --via pds`: log in to the PDS, mint a service-auth JWT, and
+/// upload the blob under it. `--via s3` is refused (no local signing key exists in
+/// a `did:` profile) rather than silently mis-signed.
+async fn did_put(
+    global: &GlobalArgs,
+    config: &config::Config,
+    file: &Path,
+    via: Plane,
+) -> anyhow::Result<()> {
+    if via == Plane::S3 {
+        anyhow::bail!(
+            "--via s3 needs an id: identity (a local signing key); a did: identity uses \
+             the atproto plane — retry with --via pds"
+        );
+    }
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let server = client::Client::new(&global.server);
+    let aud = resolve_aud(global, &server).await?;
+    let (token, _account_did) = atproto::mint_service_auth(&pds, &cred, &aud, UPLOAD_LXM).await?;
+    let body = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let res = server.upload_blob_bearer(&token, &body).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({"cid": res.cid, "cidv1": res.cidv1, "bytes": res.bytes, "via": "pds"})
+        );
+    } else {
+        println!("uploaded via pds (did: service-auth)");
+        println!("  cid:   {}", res.cid);
+        println!("  cidv1: {}", res.cidv1);
+        println!("  bytes: {}", res.bytes);
+    }
+    Ok(())
+}
+
+/// `--identity did get --via pds`: resolve the account DID (via login) and read
+/// the blob back (public). `--via s3` is refused for symmetry with `did_put`.
+async fn did_get(
+    global: &GlobalArgs,
+    config: &config::Config,
+    cid: &str,
+    output: Option<&Path>,
+    via: Plane,
+) -> anyhow::Result<()> {
+    if via == Plane::S3 {
+        anyhow::bail!("a did: identity reads over the atproto plane — retry with --via pds");
+    }
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let account = atproto::create_session(&pds, &cred).await?;
+    let server = client::Client::new(&global.server);
+    commands::object::get(&server, &account.did, cid, output, via, global.json).await
+}
+
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let config = config::Config::new(&cli.global.profile)?;
     match cli.command {
@@ -185,24 +258,32 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             print_did(&did, cli.global.json);
             Ok(())
         }
-        Commands::Put { file, via } => {
-            let session = client::session_for(&identity::load_keypair(&config)?);
-            let http = client::Client::new(&cli.global.server);
-            commands::object::put(&http, &session, Path::new(&file), via, cli.global.json).await
-        }
-        Commands::Get { cid, output, via } => {
-            let did = identity::whoami(&config)?;
-            let http = client::Client::new(&cli.global.server);
-            commands::object::get(
-                &http,
-                &did,
-                &cid,
-                output.as_deref().map(Path::new),
-                via,
-                cli.global.json,
-            )
-            .await
-        }
+        Commands::Put { file, via } => match cli.global.identity {
+            IdentityKind::Id => {
+                let session = client::session_for(&identity::load_keypair(&config)?);
+                let http = client::Client::new(&cli.global.server);
+                commands::object::put(&http, &session, Path::new(&file), via, cli.global.json).await
+            }
+            IdentityKind::Did => did_put(&cli.global, &config, Path::new(&file), via).await,
+        },
+        Commands::Get { cid, output, via } => match cli.global.identity {
+            IdentityKind::Id => {
+                let did = identity::whoami(&config)?;
+                let http = client::Client::new(&cli.global.server);
+                commands::object::get(
+                    &http,
+                    &did,
+                    &cid,
+                    output.as_deref().map(Path::new),
+                    via,
+                    cli.global.json,
+                )
+                .await
+            }
+            IdentityKind::Did => {
+                did_get(&cli.global, &config, &cid, output.as_deref().map(Path::new), via).await
+            }
+        },
         Commands::Meter => {
             let session = client::session_for(&identity::load_keypair(&config)?);
             let http = client::Client::new(&cli.global.server);

@@ -605,20 +605,37 @@ round-trip test is the guard; keep the mint's key type zeroized.
 
 ---
 
-### Phase 7: `did:` service-auth path in the CLI — the `getServiceAuth` relay (Model R)
+### Phase 7: `did:` service-auth path in the CLI — the `getServiceAuth` relay (Model R) ✅ COMPLETE (2026-08-06)
 
 **Goal:** The CLI acts as a `did:` caller by **relaying a PDS-minted service-auth
 JWT** (not self-minting): log in to the user's atproto account, fetch a
 method-scoped JWT via `getServiceAuth`, and drive `uploadBlob`/`getBlob` with it.
 **Changes:**
-- [ ] `crates/ciss-cli/src/atproto.rs` — the PDS client: `createSession`
-  (identifier + app password → `accessJwt` + the account `did`) and
-  `getServiceAuth(aud, lxm, exp)` → the service-auth JWT (`token`). Shapes per D4.
-- [ ] `crates/ciss-cli/src/client.rs` — Bearer-JWT auth mode against CISS; `--aud`
-  (default the CISS service DID, discovered via `/.well-known/did.json`), `lxm` per
-  method.
-- [ ] `crates/ciss-cli/src/config.rs` — a `did:` **credential** profile (PDS host +
-  handle/identifier + app password at `0600`); **no signing key** is stored.
+- [x] `crates/ciss-cli/src/atproto.rs` — the PDS client: `create_session`
+  (identifier + app password → `accessJwt` + account `did`), `get_service_auth(aud,
+  lxm, exp)` → the service-auth JWT (`token`), and `mint_service_auth` (the full
+  login+mint relay). `PdsCredential` with a **password-redacting `Debug`**. Shapes
+  per D4.
+- [x] `crates/ciss-cli/src/client.rs` — `upload_blob_bearer` (Bearer-JWT auth mode)
+  and `discover_service_did` (reads `/.well-known/did.json` for the default `aud`);
+  `--aud` override.
+- [x] `crates/ciss-cli/src/config.rs` — `credential_path()` (`pds.json`, 0600);
+  `atproto::load_credential` reads env (`CISS_PDS_HOST/IDENTIFIER/APP_PASSWORD`,
+  the D4/demo form) then the profile file. **No signing key** is stored.
+- [x] `main.rs` — `--identity did` dispatch: `did put --via pds` relays a token and
+  Bearer-uploads; `did get --via pds` resolves the account DID via login then reads
+  public; **`--via s3` under a `did:` identity fails loudly** (no local key).
+
+**Executed:** RED-first offline `tests/cli_did.rs` — the authoritative code-path
+test — builds an App with a `StaticResolver` mapping the caller DID → its
+`did:key`, mints a stand-in token via the Phase-6 helper, and proves a valid token
+uploads+reads back while **expired / wrong-`aud` / wrong-`lxm` tokens are each
+refused 401** (uploadBlob → `PutObject` → owner-gated, so a rejected token is
+Anonymous → 401). GREEN. The **live relay wire was re-confirmed against
+`bsky.social`** with the `.env` account: `createSession` → `{accessJwt, did:
+did:plc:xyfhca…}`, `getServiceAuth` → `{token}` (3-segment JWS) — the exact fields
+`atproto.rs` reads. The full live end-to-end (relay → CISS upload with
+plc.directory resolution) is Phase 9's opt-in demo. Clippy clean; full suite green.
 **Call chain:** `main` → `Put{identity:did}` → `atproto::get_service_auth()` (login
 + getServiceAuth against the PDS) → `client` sends `Authorization: Bearer <jwt>` to
 CISS `uploadBlob` → server resolves the `iss` `did:plc` → verifies.

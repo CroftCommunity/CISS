@@ -204,12 +204,55 @@ impl Client {
             )
             .await?;
         let resp = self.ensure_success(resp, "upload").await?;
+        Self::parse_blob_upload(resp, body.len() as u64).await
+    }
+
+    /// `POST /xrpc/com.atproto.repo.uploadBlob` presenting a **service-auth JWT**
+    /// as the bearer (Model R, the `did:` plane). The token is relayed from the
+    /// caller's PDS (`getServiceAuth`); CISS resolves its `iss` and verifies it.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error, a non-2xx status (a rejected token is 401), or a
+    /// malformed blob ref.
+    pub async fn upload_blob_bearer(&self, token: &str, body: &[u8]) -> Result<BlobUpload> {
+        let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", self.base);
+        let resp = self
+            .send(
+                self.http.post(&url).bearer_auth(token).body(body.to_vec()),
+                "upload",
+            )
+            .await?;
+        let resp = self.ensure_success(resp, "upload").await?;
+        Self::parse_blob_upload(resp, body.len() as u64).await
+    }
+
+    /// The service DID this server advertises at `/.well-known/did.json` — the
+    /// `aud` a `did:` caller must target when minting a service-auth JWT.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error, a non-2xx status, or a missing `id`.
+    pub async fn discover_service_did(&self) -> Result<String> {
+        let url = format!("{}/.well-known/did.json", self.base);
+        let resp = self.send(self.http.get(&url), "discover service DID").await?;
+        let resp = self.ensure_success(resp, "discover service DID").await?;
+        let v: serde_json::Value = resp.json().await.context("parse did.json")?;
+        v["id"]
+            .as_str()
+            .context("did.json missing id")
+            .map(str::to_owned)
+    }
+
+    /// Parse a `uploadBlob` response into a [`BlobUpload`], bridging its CIDv1 to
+    /// the sha256 hex the S3 plane uses.
+    async fn parse_blob_upload(resp: reqwest::Response, fallback_len: u64) -> Result<BlobUpload> {
         let v: serde_json::Value = resp.json().await.context("parse uploadBlob response")?;
         let cidv1 = v["blob"]["ref"]["$link"]
             .as_str()
             .context("uploadBlob response missing blob.ref.$link")?
             .to_owned();
-        let bytes = v["blob"]["size"].as_u64().unwrap_or(body.len() as u64);
+        let bytes = v["blob"]["size"].as_u64().unwrap_or(fallback_len);
         let cid = ciss::cidv1::to_sha256_hex(&cidv1)
             .map_err(|e| anyhow!("bridge CIDv1 -> sha256 hex failed for {cidv1:?}: {e}"))?;
         Ok(BlobUpload { cid, cidv1, bytes })
@@ -305,8 +348,9 @@ impl Client {
 
 /// Percent-encode a query-string *value* (path segments interpolate `id:`/`did:`
 /// directly against the server's routes, so only query values need this — e.g.
-/// the `did`/`cid` params of getBlob/listBlobs). Mirrors the test harness's `enc`.
-fn enc(value: &str) -> String {
+/// the `did`/`cid` params of getBlob/listBlobs, and the atproto relay's
+/// `aud`/`lxm`). Mirrors the test harness's `enc`.
+pub(crate) fn enc(value: &str) -> String {
     value
         .bytes()
         .map(|b| match b {

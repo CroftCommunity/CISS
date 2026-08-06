@@ -47,6 +47,13 @@ impl Config {
     pub fn key_path(&self) -> PathBuf {
         self.profile_dir().join("identity.key")
     }
+
+    /// The `did:` PDS credential file (host + identifier + app password; no
+    /// signing key — the repo key stays at the PDS, Model R). JSON, mode 0600.
+    #[must_use]
+    pub fn credential_path(&self) -> PathBuf {
+        self.profile_dir().join("pds.json")
+    }
 }
 
 /// `$XDG_CONFIG_HOME/ciss-ctl`, or `$HOME/.config/ciss-ctl` as the XDG-default
