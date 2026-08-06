@@ -511,14 +511,26 @@ confirm the meter increments and bytes round-trip.
 
 ---
 
-### Phase 5: atproto plane + interchangeability — `put/get --via pds`, `ls`
+### Phase 5: atproto plane + interchangeability — `put/get --via pds`, `ls` ✅ COMPLETE (2026-08-06)
 
 **Goal:** The same identity uploads/fetches over `uploadBlob`/`getBlob`
 interchangeably with S3, via the CIDv1 bridge; `ls` lists blobs.
 **Changes:**
-- [ ] `crates/ciss-cli/src/client.rs` — `uploadBlob` (POST, `x-croft-*` session),
-  `getBlob?did=&cid=`, `listBlobs?did=`; CIDv1↔hex via `ciss::cidv1`.
-- [ ] `crates/ciss-cli/src/commands/object.rs` — `--via s3|pds` on put/get; `ls`.
+- [x] `crates/ciss-cli/src/client.rs` — `uploadBlob` (POST, `x-croft-*` session),
+  `getBlob?did=&cid=`, `listBlobs?did=`; CIDv1↔hex via `ciss::cidv1`. `Plane` enum
+  moved into the lib (clap `ValueEnum`); a query-value percent-encoder for the
+  `did`/`cid` params.
+- [x] `crates/ciss-cli/src/commands/object.rs` — `--via s3|pds` on put/get; `ls`.
+
+**Executed:** RED-first `tests/cli_atproto.rs` drives the library `Client` against
+an in-process App and proves the load-bearing property — **cross-plane fetch**:
+`put_s3` then `get_blob` is byte-identical, and `upload_blob` then `get_s3` is
+byte-identical, with `uploadBlob`'s CIDv1 bridging back to the *same* sha256 hex
+the S3 plane reports; `list_blobs` returns both cids as hex. GREEN. `get_blob`
+takes the hex cid, bridges to CIDv1, and re-verifies bytes against the hex cid
+(same guard as `get_s3`). The `id:` `x-croft-*` session drives both planes, so one
+key demonstrates interchangeability. Manually validated against a local server
+(S3→PDS and PDS→S3 both identical; `ls` lists both). Clippy clean; full suite green.
 **Call chain:** `main` → `Put{via:pds}` → `client::upload_blob()` → server
 `upload_blob` → `$link`; `Get{via:pds}` → `client::get_blob()`.
 **Wiring test:** `tests/cli_atproto.rs` — a file `put --via s3` is fetchable via

@@ -66,6 +66,27 @@ pub struct GetResult {
     pub etag: Option<String>,
 }
 
+/// Which byte-path a transfer uses. Both land at the same backend digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Plane {
+    /// S3-compatible metered plane (`PUT/GET /{did}/objects/{key}`).
+    S3,
+    /// atproto blob plane (`uploadBlob`/`getBlob`).
+    Pds,
+}
+
+/// The result of an atproto `uploadBlob`: the content address (bridged to the
+/// same sha256 hex the S3 plane uses) plus the raw CIDv1 the network speaks.
+#[derive(Debug, Clone)]
+pub struct BlobUpload {
+    /// Content id as sha256 hex — identical to the S3 plane's `cid`.
+    pub cid: String,
+    /// The CIDv1 (`ref.$link`) the atproto network addresses the blob by.
+    pub cidv1: String,
+    /// The blob size in bytes.
+    pub bytes: u64,
+}
+
 /// The billing meter for a namespace.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Meter {
@@ -163,6 +184,87 @@ impl Client {
         resp.json::<Meter>().await.context("parse meter response")
     }
 
+    /// `POST /xrpc/com.atproto.repo.uploadBlob` under a signed session (the
+    /// `x-croft-*` session is accepted as the atproto-plane credential). Returns
+    /// the CIDv1 bridged back to the sha256 hex the S3 plane uses.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error, a non-2xx status, or a malformed blob ref.
+    pub async fn upload_blob(&self, session: &Session, body: &[u8]) -> Result<BlobUpload> {
+        let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", self.base);
+        let resp = self
+            .send(
+                self.http
+                    .post(&url)
+                    .header("x-croft-pubkey", &session.pubkey)
+                    .header("x-croft-session", &session.signature)
+                    .body(body.to_vec()),
+                "upload",
+            )
+            .await?;
+        let resp = self.ensure_success(resp, "upload").await?;
+        let v: serde_json::Value = resp.json().await.context("parse uploadBlob response")?;
+        let cidv1 = v["blob"]["ref"]["$link"]
+            .as_str()
+            .context("uploadBlob response missing blob.ref.$link")?
+            .to_owned();
+        let bytes = v["blob"]["size"].as_u64().unwrap_or(body.len() as u64);
+        let cid = ciss::cidv1::to_sha256_hex(&cidv1)
+            .map_err(|e| anyhow!("bridge CIDv1 -> sha256 hex failed for {cidv1:?}: {e}"))?;
+        Ok(BlobUpload { cid, cidv1, bytes })
+    }
+
+    /// `GET /xrpc/com.atproto.sync.getBlob?did=&cid=` (public). Takes the sha256
+    /// hex `cid` (as the S3 plane uses), bridges it to the CIDv1 the network
+    /// speaks, and verifies the returned bytes against the hex cid before trusting.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a bad cid, a connect error, a non-2xx status, or a cid mismatch.
+    pub async fn get_blob(&self, did: &str, cid: &str) -> Result<GetResult> {
+        let cidv1 = ciss::cidv1::from_sha256_hex(cid)
+            .map_err(|e| anyhow!("bridge sha256 hex -> CIDv1 failed for {cid:?}: {e}"))?;
+        let url = format!(
+            "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+            self.base,
+            enc(did),
+            enc(&cidv1),
+        );
+        let resp = self.send(self.http.get(&url), "download").await?;
+        let resp = self.ensure_success(resp, "download").await?;
+        let bytes = resp.bytes().await.context("read getBlob body")?.to_vec();
+        verify_cid(cid, &bytes)?;
+        Ok(GetResult { bytes, etag: None })
+    }
+
+    /// `GET /xrpc/com.atproto.sync.listBlobs?did=` (public). Returns the stored
+    /// cids as sha256 hex (bridged from CIDv1), matching the S3 addressing.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error, a non-2xx status, or a malformed cid entry.
+    pub async fn list_blobs(&self, did: &str) -> Result<Vec<String>> {
+        let url = format!(
+            "{}/xrpc/com.atproto.sync.listBlobs?did={}",
+            self.base,
+            enc(did),
+        );
+        let resp = self.send(self.http.get(&url), "list").await?;
+        let resp = self.ensure_success(resp, "list").await?;
+        let v: serde_json::Value = resp.json().await.context("parse listBlobs response")?;
+        v["cids"]
+            .as_array()
+            .context("listBlobs response missing cids array")?
+            .iter()
+            .map(|c| {
+                let link = c.as_str().context("cid entry is not a string")?;
+                ciss::cidv1::to_sha256_hex(link)
+                    .map_err(|e| anyhow!("bridge CIDv1 -> sha256 hex failed for {link:?}: {e}"))
+            })
+            .collect()
+    }
+
     /// Send a request, translating a connect/timeout failure into an actionable
     /// "server unreachable" error rather than a raw reqwest string.
     async fn send(
@@ -199,6 +301,21 @@ impl Client {
         };
         bail!("{action} failed: HTTP {code} — {}{detail}", status_hint(code));
     }
+}
+
+/// Percent-encode a query-string *value* (path segments interpolate `id:`/`did:`
+/// directly against the server's routes, so only query values need this — e.g.
+/// the `did`/`cid` params of getBlob/listBlobs). Mirrors the test harness's `enc`.
+fn enc(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 fn header_owned(resp: &reqwest::Response, name: &str) -> Option<String> {

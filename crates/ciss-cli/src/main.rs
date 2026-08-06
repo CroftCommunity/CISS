@@ -24,14 +24,7 @@ enum IdentityKind {
     Did,
 }
 
-/// Which byte-path a transfer uses. Both land at the same backend digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum Plane {
-    /// S3-compatible metered plane (`PUT/GET /{did}/objects/{key}`).
-    S3,
-    /// atproto blob plane (`uploadBlob`/`getBlob`).
-    Pds,
-}
+use ciss_cli::client::Plane;
 
 /// Flags shared by every subcommand. Parsed once at the root, threaded down.
 #[derive(Args, Debug)]
@@ -192,35 +185,34 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             print_did(&did, cli.global.json);
             Ok(())
         }
-        Commands::Put { file, via } => match via {
-            Plane::S3 => {
-                let session = client::session_for(&identity::load_keypair(&config)?);
-                let http = client::Client::new(&cli.global.server);
-                commands::object::put(&http, &session, Path::new(&file), cli.global.json).await
-            }
-            Plane::Pds => Err(not_yet_implemented("put --via pds", "Phase 5")),
-        },
-        Commands::Get { cid, output, via } => match via {
-            Plane::S3 => {
-                let did = identity::whoami(&config)?;
-                let http = client::Client::new(&cli.global.server);
-                commands::object::get(
-                    &http,
-                    &did,
-                    &cid,
-                    output.as_deref().map(Path::new),
-                    cli.global.json,
-                )
-                .await
-            }
-            Plane::Pds => Err(not_yet_implemented("get --via pds", "Phase 5")),
-        },
+        Commands::Put { file, via } => {
+            let session = client::session_for(&identity::load_keypair(&config)?);
+            let http = client::Client::new(&cli.global.server);
+            commands::object::put(&http, &session, Path::new(&file), via, cli.global.json).await
+        }
+        Commands::Get { cid, output, via } => {
+            let did = identity::whoami(&config)?;
+            let http = client::Client::new(&cli.global.server);
+            commands::object::get(
+                &http,
+                &did,
+                &cid,
+                output.as_deref().map(Path::new),
+                via,
+                cli.global.json,
+            )
+            .await
+        }
         Commands::Meter => {
             let session = client::session_for(&identity::load_keypair(&config)?);
             let http = client::Client::new(&cli.global.server);
             commands::object::meter(&http, &session, cli.global.json).await
         }
-        Commands::Ls => Err(not_yet_implemented("ls", "Phase 5")),
+        Commands::Ls => {
+            let did = identity::whoami(&config)?;
+            let http = client::Client::new(&cli.global.server);
+            commands::object::ls(&http, &did, cli.global.json).await
+        }
         Commands::Acl(AclCommand::Set { .. }) => Err(not_yet_implemented("acl set", "Phase 8a")),
         Commands::Acl(AclCommand::Get { .. }) => Err(not_yet_implemented("acl get", "Phase 8a")),
     }
