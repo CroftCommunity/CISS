@@ -165,17 +165,22 @@ pub async fn ls(
     did: &str,
     json_out: bool,
 ) -> Result<()> {
-    let cids = client.list_blobs(session, did).await?;
+    print_cids(&client.list_blobs(session, did).await?, json_out);
+    Ok(())
+}
+
+/// Print a list of cids as one-per-line, or `{"cids":[…]}` under `--json`. Shared
+/// by the `id:` and `did:` `ls` paths.
+pub fn print_cids(cids: &[String], json_out: bool) {
     if json_out {
         println!("{}", serde_json::json!({ "cids": cids }));
     } else if cids.is_empty() {
         println!("(no objects stored)");
     } else {
-        for cid in &cids {
+        for cid in cids {
             println!("{cid}");
         }
     }
-    Ok(())
 }
 
 /// Write `bytes` to `path` via a temp file + rename, so a partial write never

@@ -297,6 +297,16 @@ cctl --identity did -v put blob.txt --via pds
 # [ciss-ctl] upload: HTTP 200
 ```
 
+List your account's blobs under the `did:` identity (it relays a `listBlobs`
+service-auth JWT):
+
+```bash
+cctl --identity did ls        # the cids stored under your did:plc
+```
+
+(`meter`, by contrast, is `id:`-only — the server's meter endpoint authenticates
+an `id:` session, so `did:` metering would need a server change.)
+
 Under a `did:` identity, `--via s3` is refused (there is no local signing key). A
 `did:` owner can also set an object policy (Model C — CISS provider-attests it
 from your JWT):
@@ -472,7 +482,7 @@ SEAMs you cannot exercise with `ciss-ctl` today.
 | **Manifest & rent** (`PUT/GET /{did}/manifest`) | The customer-signed manifest that is the *rent* base is not exposed. `meter` shows bytes transferred + postage, not rent or the manifest. |
 | **Bilateral (client co-signed) receipts** | The server is unilateral-only (`receipt: unilateral`); there is no `--bilateral`. The `sigs` map in a receipt carries only the provider signature. |
 | **S3 DELETE / bucket LIST / HEAD / multipart** | Server answers these `501` (SEAMs); the client doesn't expose verbs the server doesn't implement. (`ls` uses atproto `listBlobs`, not S3 LIST.) |
-| **`did:` metering / listing** | `meter` and `ls` are `id:`-plane only (they refuse under `--identity did`); a `did:` account can't read its meter or list via the CLI. |
+| **`did:` metering (`meter`)** | `meter` is `id:`-plane only (the server's meter endpoint authenticates an `id:` session); a `did:` account can't read its meter via the CLI without a server change. (`ls` **does** work under `--identity did` — it relays a `listBlobs` service-auth JWT.) |
 | **`did:` grantee reading a *gated* blob** | `--identity did get --via pds` is a public/world read. A `did:` reader fetching an object it was *granted* needs a `getBlob` bearer the `did:` `get` command doesn't send — so Model-C **grantee reads** aren't wired in the CLI (only Model-C policy *set*, and Model-A `id:` grantee reads, are). |
 | **Operational endpoints** (`/healthz`, `/.well-known/did.json`) | The CLI reads `did.json` internally to discover the service DID but exposes no command; use `curl` (as in §0). |
 | **Full atproto OAuth** (PAR / DPoP / PKCE) | The `did:` path uses an app password for `createSession`; full OAuth is a tracked follow-on. |
