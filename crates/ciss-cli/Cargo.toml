@@ -1,0 +1,49 @@
+[package]
+name = "ciss-cli"
+version = "0.4.0"
+edition = "2021"
+publish = false
+description = "ciss-ctl — the CISS client CLI. Owns a client identity keypair, drives the S3 + atproto blob planes over one metered byte-path, and manages gated-read ACLs. Links the server's own crates so client crypto cannot drift from the wire."
+
+[[bin]]
+name = "ciss-ctl"
+path = "src/main.rs"
+
+[dependencies]
+# The client links the server's crates so its crypto (session challenge, DID
+# derivation, CIDv1 bridge, policy preimage) is byte-identical to the wire — drift
+# becomes a compile error, not a silent 403.
+ciss = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+thiserror = "2"
+# CSPRNG for native key generation. getrandom (already in the ciss dep tree) is a
+# thin, audited wrapper over the OS entropy source — the seed is real randomness,
+# not the deterministic simulation RNG (`ciss::rng`).
+getrandom = "0.2"
+# Seed <-> hex for the on-disk key file (matches the server's hex key encoding).
+hex = "0.4"
+# Wipe the transient seed buffer after the keypair is built; the secret should
+# live only on disk (0600) and inside the zeroize-on-drop signing key.
+zeroize = "1"
+# Import existing ssh-keygen ed25519 keys via a maintained OpenSSH parser (D1),
+# rather than shelling to ssh-keygen or hand-rolling the OpenSSH wrapper.
+ssh-key = { version = "0.6", features = ["ed25519"] }
+# Async HTTP to the CISS server. Mirrors the workspace's reqwest config (rustls,
+# no OpenSSL) plus `json` for the metering/receipt bodies.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "charset", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Serve the real `ciss` App in-process on an ephemeral port, so integration tests
+# drive the CLI's own client against the actual server (not mocked HTTP).
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+# `did:` offline test: mint a service-auth JWT (Phase 6 helper) standing in for
+# the PDS, and inject its did:key via a StaticResolver. `ciss` does not re-export
+# ciss-auth/ciss-resolve, so the test depends on them directly.
+ciss-auth = { path = "../ciss-auth" }
+ciss-resolve = { path = "../ciss-resolve" }
+k256 = { version = "0.13", features = ["ecdsa"] }
