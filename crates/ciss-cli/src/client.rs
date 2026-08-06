@@ -8,8 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use ciss::crypto::{sha256_hex, Keypair};
 
 /// The domain-separated session-challenge prefix. Mirrors the server's private
-/// `SESSION_CHALLENGE_PREFIX` (`src/server.rs:66`); the wiring tests keep it in
-/// sync — a drift here makes every authenticated call 401.
+/// `SESSION_CHALLENGE_PREFIX`; the wiring tests keep it in sync — a drift here
+/// makes every authenticated call 401.
 const SESSION_CHALLENGE_PREFIX: &str = "ciss-session/v1/";
 
 /// A signed session credential for the `id:` plane: the public key plus a
@@ -117,6 +117,7 @@ pub struct Meter {
 pub struct Client {
     base: String,
     http: reqwest::Client,
+    verbose: u8,
 }
 
 impl Client {
@@ -124,9 +125,18 @@ impl Client {
     #[must_use]
     pub fn new(base: impl Into<String>) -> Self {
         Self {
+            verbose: 0,
             base: base.into().trim_end_matches('/').to_owned(),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Set the verbosity level (from `-v`): at ≥1, each request's outcome is
+    /// logged to stderr. Secrets are never logged.
+    #[must_use]
+    pub fn with_verbose(mut self, verbose: u8) -> Self {
+        self.verbose = verbose;
+        self
     }
 
     /// `PUT /{did}/objects/{key}` under a signed session.
@@ -276,14 +286,22 @@ impl Client {
         Ok(BlobUpload { cid, cidv1, bytes })
     }
 
-    /// `GET /xrpc/com.atproto.sync.getBlob?did=&cid=` (public). Takes the sha256
-    /// hex `cid` (as the S3 plane uses), bridges it to the CIDv1 the network
-    /// speaks, and verifies the returned bytes against the hex cid before trusting.
+    /// `GET /xrpc/com.atproto.sync.getBlob?did=&cid=`. Pass a `session` so a
+    /// gated blob recognizes the caller as owner/grantee (`getBlob` authenticates
+    /// an `id:` session server-side); `None` is an anonymous world read. Takes the
+    /// sha256 hex `cid`, bridges it to the CIDv1 the network speaks, and verifies
+    /// the returned bytes against the hex cid before trusting.
     ///
     /// # Errors
     ///
-    /// Fails on a bad cid, a connect error, a non-2xx status, or a cid mismatch.
-    pub async fn get_blob(&self, did: &str, cid: &str) -> Result<GetResult> {
+    /// Fails on a bad cid, a connect error, a non-2xx status (a gated denial is
+    /// 404), or a cid mismatch.
+    pub async fn get_blob(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        cid: &str,
+    ) -> Result<GetResult> {
         let cidv1 = ciss::cidv1::from_sha256_hex(cid)
             .map_err(|e| anyhow!("bridge sha256 hex -> CIDv1 failed for {cid:?}: {e}"))?;
         let url = format!(
@@ -292,7 +310,7 @@ impl Client {
             enc(did),
             enc(&cidv1),
         );
-        let resp = self.send(self.http.get(&url), "download").await?;
+        let resp = self.send(with_session(self.http.get(&url), session), "download").await?;
         let resp = self.ensure_success(resp, "download").await?;
         let bytes = resp.bytes().await.context("read getBlob body")?.to_vec();
         verify_cid(cid, &bytes)?;
@@ -453,13 +471,18 @@ impl Client {
         builder: reqwest::RequestBuilder,
         action: &str,
     ) -> Result<reqwest::Response> {
-        builder.send().await.map_err(|e| {
+        let resp = builder.send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
                 anyhow!("{action} failed: server unreachable at {}", self.base)
             } else {
                 anyhow!("{action} failed: {e}")
             }
-        })
+        })?;
+        if self.verbose > 0 {
+            // Outcome only — never a header, body, or credential.
+            eprintln!("[ciss-ctl] {action}: HTTP {}", resp.status().as_u16());
+        }
+        Ok(resp)
     }
 
     /// Turn a non-2xx response into an actionable error; pass a 2xx through.
@@ -512,7 +535,7 @@ fn header_owned(resp: &reqwest::Response, name: &str) -> Option<String> {
 /// returning 404, so "not found" and "not visible to you" are indistinguishable.
 fn status_hint(code: u16) -> &'static str {
     match code {
-        401 => "no or invalid session — run under an authenticated profile (ciss-ctl key gen)",
+        401 => "no or invalid credential — check your id: key (`ciss-ctl key gen`) or your did: credential/token",
         403 => "forbidden — bad signature or wrong signer for this namespace",
         404 => "not found, or not visible to you — a gated object denies reads without disclosing whether it exists",
         409 => "conflict — the policy seq is not newer than the stored one",
@@ -558,7 +581,9 @@ mod tests {
 
     #[test]
     fn status_hint_is_actionable_per_code() {
-        assert!(status_hint(401).contains("session"), "401 points at the session");
+        // 401 is plane-neutral (an id: session or a did: token can both be missing
+        // or invalid), so it points at the credential, not specifically `key gen`.
+        assert!(status_hint(401).contains("credential"), "401 points at the credential");
         let h403 = status_hint(403);
         assert!(
             h403.contains("forbidden") || h403.contains("signer"),

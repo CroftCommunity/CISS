@@ -32,6 +32,9 @@ Or from source in this workspace:
 cargo build -p ciss-cli --release   # target/release/ciss-ctl
 ```
 
+A man page is installed by the formula (`man ciss-ctl`); from source it can be
+generated with `ciss-ctl man > ciss-ctl.1`.
+
 ## Identity
 
 `ciss-ctl` keeps a raw ed25519 seed per profile at

@@ -1,6 +1,6 @@
 [package]
 name = "ciss-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 publish = false
 description = "ciss-ctl — the CISS client CLI. Owns a client identity keypair, drives the S3 + atproto blob planes over one metered byte-path, and manages gated-read ACLs. Links the server's own crates so client crypto cannot drift from the wire."
@@ -15,6 +15,8 @@ path = "src/main.rs"
 # becomes a compile error, not a silent 403.
 ciss = { path = "../.." }
 clap = { version = "4", features = ["derive"] }
+# Render the clap command tree to a roff man page (the hidden `man` subcommand).
+clap_mangen = "0.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 thiserror = "2"

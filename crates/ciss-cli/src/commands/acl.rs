@@ -56,7 +56,10 @@ pub async fn set(
     let seq = client.put_object_policy(&did, cid, &body).await?;
 
     if json_out {
-        println!("{}", serde_json::json!({"cid": cid, "read_class": class, "seq": seq}));
+        println!(
+            "{}",
+            serde_json::json!({"cid": cid, "read_class": class, "seq": seq, "model": "A"})
+        );
     } else {
         println!("policy set: {cid} class={class} seq={seq}");
     }

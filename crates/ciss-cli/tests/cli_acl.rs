@@ -93,6 +93,20 @@ async fn model_a_three_party_gate_is_oracle_free_and_leak_free() {
         .expect_err("anonymous is denied");
     assert!(anon_err.to_string().contains("404"), "anonymous read is 404, not 403");
 
+    // The same gate must hold over the atproto (pds) plane: `get_blob` has to
+    // thread the caller's session, or a grantee's gated read silently 404s while
+    // the s3 fetch succeeds (a bug caught in review). Regression guard.
+    assert_eq!(
+        client.get_blob(Some(&grantee.session), &owner.did, &cid).await.expect("grantee pds read").bytes,
+        payload,
+        "a grantee reads the gated object over the pds plane too",
+    );
+    let pds_stranger = client
+        .get_blob(Some(&stranger.session), &owner.did, &cid)
+        .await
+        .expect_err("stranger denied on pds plane");
+    assert!(pds_stranger.to_string().contains("404"), "stranger pds read is 404");
+
     // ls: owner and grantee see the cid; stranger and anonymous omit it.
     assert!(
         client.list_blobs(Some(&owner.session), &owner.did).await.unwrap().contains(&cid),
