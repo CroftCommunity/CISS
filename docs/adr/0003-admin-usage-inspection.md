@@ -1,80 +1,74 @@
-# ADR 0003 — Usage inspection (`du`): self by default, admin store-wide behind a flag
+# ADR 0003 — Usage inspection (`du`): self-only over the wire, optionally admin-locked
 
 - **Status:** Accepted
 - **Date:** 2026-08-06
 - **Context:** the `ciss-ctl` client wanted a `du` — "how big are the objects I
-  stored?" — and, optionally, an operator view of usage across DIDs. Sizes are
+  stored?" — and, separately, an operator view of usage across DIDs. Sizes are
   already maintained in the ledger (`receipt.bytes`, `did_total.stored_bytes`), so
-  the cost is not the question; the **authorization** is.
+  the cost is not the question; the **authorization surface** is.
 
 ---
 
 ## Problem statement
 
-Two distinct capabilities hide under "du":
+Two capabilities hid under "du":
 
 1. **Self usage** — a caller sees the per-object sizes (and total) of **its own**
-   namespace. This is just the caller's own data; the existing owner authorization
-   already covers it. No new trust decision.
-2. **Store-wide / cross-DID usage** — an operator sees usage for **another** DID
-   (or the whole store). This reveals the **sizes** (not the content) of objects
-   the operator does not own — including **gated** objects. That is a new
-   authorization role and a deliberate exception to the gated-read visibility
-   invariants (Z-series, `docs/SECURITY-POSTURE.md` §5), so it must be a design
-   decision, not an incidental feature.
+   namespace.
+2. **Cross-DID / store-wide usage** — someone sees usage for **another** DID (or
+   the whole store). This exposes the sizes of objects the viewer does not own,
+   including **gated** ones.
 
-The admin **pin set** (`CISS_ADMIN_PINS_FILE`, ADR 0001 §5) exists today only for
-**break-glass DID resolution** — it is not an authorization role. Reusing it to
-authorize usage inspection overloads it, but is pragmatic (the set already names
-the operators) and is what the operator chose.
+The design question is what to put **on the wire**. Exposing (2) over HTTP — even
+to admins — means a network-reachable endpoint that reads *other users'* storage:
+a standing privacy surface and a target. The alternative is to keep cross-DID
+inspection **on the box**, where an operator already has `ciss usage` (a
+read-only, per-DID/store-wide report) under normal host access controls.
 
 ## Decision
 
-### 1. `GET /{did}/du` — per-object sizes + total
+### 1. Remote `du` is **self-only**
 
-A new read endpoint returns `{"objects":[{"cid":"<hex>","bytes":N},…],
-"total_bytes":T}` for `{did}`. Sizes come from the maintained receipt ledger (the
-same receipts `listBlobs` already scans); **no filesystem walk**.
+`GET /{did}/du` returns `{"objects":[{"cid":"<hex>","bytes":N},…],
+"total_bytes":T}` — but **only** when the authenticated caller **owns** `{did}`. A
+cross-DID query is refused `403`, **for everyone, including admins**. No one reads
+another user's storage over the wire. Sizes come from the maintained receipt
+ledger (no filesystem walk). The `403` does not vary by whether `{did}` exists (no
+existence oracle).
 
-### 2. Self usage is always allowed; cross-DID is off by default
+### 2. Cross-DID / store-wide inspection stays on the box
 
-Authorization for `du` on `{did}`:
+An operator uses the existing on-box **`ciss usage --data-dir <dir> [--did <did>]`**
+report for cross-DID and whole-store usage. It is not exposed over HTTP; access is
+governed by who can run a command on the host.
 
-- **caller == `{did}`** → allowed (self usage; the caller owns the namespace).
-- **caller ∈ admin pin set AND `CISS_ADMIN_USAGE` is enabled** → allowed for any
-  `{did}` (mode-2, store-wide/audit).
-- **otherwise** → `403 Forbidden`, with a response that does **not** vary by
-  whether `{did}` exists (no existence oracle).
+### 3. `CISS_ADMIN_ONLY_DU` — an optional lockdown of remote `du` to admins
 
-`CISS_ADMIN_USAGE` is a server-side flag, **off by default**. With it off, `du` is
-purely self-scoped and introduces **no** change to the authorization or
-gated-read invariants — the endpoint behaves like any other owner-only read.
+`du` may be something an operator does not want self-serve (a nonzero read an
+attacker could hammer, or simply a capability to gate). The flag lets an operator
+**restrict who may run `du` at all**:
 
-### 3. Mode-2 is a documented admin/break-glass exception
+- **unset (default):** any authenticated caller may `du` **its own** namespace.
+- **set (`1`/`true`):** only a DID in the break-glass admin-pin set (ADR 0001 §5)
+  may run `du` — **still only for its own namespace** (cross-DID stays `403`).
 
-When the flag is on, an admin sees the **sizes** of a target DID's objects,
-including gated ones. This is a deliberate, narrow exception:
-
-- **Sizes, never content.** `du` returns byte counts and cids, never object bytes.
-- **Admins only, flag-gated.** Two independent conditions (admin membership *and*
-  the operator having enabled the flag) must both hold.
-- **Break-glass-aligned.** The admins already hold break-glass powers (local key
-  pinning, ADR 0001 §5); adding "inspect store usage" to that operator role is
-  consistent with their purpose.
+The flag never *expands* access — it only narrows it. It reuses the admin-pin set
+as the "who may run `du`" list; a deployment that never sets it is unaffected.
 
 ## Consequences
 
-- **Posture update.** `docs/SECURITY-POSTURE.md` §5 gains an invariant: `du` is
-  self-only unless `CISS_ADMIN_USAGE` is set, in which case an admin-pin DID may
-  read cross-DID **sizes** (not content). The default deployment (flag unset)
-  keeps the gated-read visibility invariants intact.
-- **Admin set becomes (optionally) an authz role.** The pin set is still primarily
-  a resolution concept; the flag is what activates its authorization use, so a
-  deployment that never sets the flag is unaffected.
-- **Rejected alternatives.** (a) A separate admin-authz list distinct from the
-  break-glass pins — cleaner separation, but more config for a capability the same
-  operators need; deferred, can be added later without a wire change. (b) Making
-  cross-DID usage always-on for admins — rejected; an operator must opt in, so the
-  gated-size exception is never silently active. (c) Extending the atproto
-  `listBlobs` lexicon with sizes — rejected; keep the standard method standard and
-  put the CISS-specific view on a CISS endpoint.
+- **Posture (invariant Z9).** Remote `du` is a self-only read; cross-DID is never
+  served over the wire. The gated-read visibility invariants (Z5) are **not**
+  weakened — there is no admin-sees-others'-sizes exception.
+  `CISS_ADMIN_ONLY_DU` can only *restrict* `du` further (to admins), never broaden
+  it.
+- **No new authz role over the wire.** The admin-pin set gains at most a
+  *restrict-to* use (the lockdown); it never authorizes reading another DID's data
+  remotely. Cross-DID inspection is an on-box operator action.
+- **Rejected alternatives.** (a) An admin-gated *cross-DID* HTTP endpoint (an
+  earlier draft of this ADR) — rejected: it puts other users' storage on the
+  network even if admin-only; `ciss usage` on the box is the right place. (b)
+  Extending the atproto `listBlobs` lexicon with sizes — rejected; keep the
+  standard method standard and put the CISS-specific view on a CISS endpoint. (c) A
+  separate admin-authz list distinct from the break-glass pins — unnecessary once
+  cross-DID is off the wire; the flag only needs a "who may self-`du`" set.

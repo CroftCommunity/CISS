@@ -166,10 +166,12 @@ cctl du          # per-object sizes + total for your namespace
 #           12  total (2 objects)   (--json for machine output)
 ```
 
-`du` reports sizes from the receipt ledger (no disk scan). By default it is
-**self-only** — `du --did <other>` is refused `403` unless the *server* sets
-`CISS_ADMIN_USAGE` **and** your DID is in its admin-pin set (ADR 0003; the audit
-view). **Server support required:** `du` is a v0.5.5 **server** endpoint; an older
+`du` reports sizes from the receipt ledger (no disk scan) and is **self-only** —
+it only ever reports **your own** namespace. There is no cross-DID `du` over the
+wire (for anyone, including admins); an operator inspects other DIDs / the whole
+store on the box with `ciss usage`. An operator can further lock remote `du` to
+admins with the server flag `CISS_ADMIN_ONLY_DU` (ADR 0003 / invariant Z9).
+**Server support required:** `du` is a v0.5.5 **server** endpoint; an older
 deployment returns `501`, so it works only against a server built at v0.5.5+ (a
 local build, or the VPS once redeployed).
 

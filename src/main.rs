@@ -110,11 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolve_cfg = ciss::did_resolver::ResolveConfig::from_env()?;
     let service_did = resolve_cfg.service_did.clone();
     let admin_pin_count = resolve_cfg.admin_pins.len();
-    // Cross-DID admin usage inspection (`du`, ADR 0003): the authorized set is the
-    // break-glass admin pins; it activates only when CISS_ADMIN_USAGE is set.
+    // `du` lockdown (ADR 0003): `du` is always self-only; when CISS_ADMIN_ONLY_DU
+    // is set, only a break-glass admin-pin DID may run it (still self-only).
     let admin_dids: std::collections::HashSet<String> =
         resolve_cfg.admin_pins.keys().cloned().collect();
-    let admin_usage = std::env::var("CISS_ADMIN_USAGE")
+    let admin_only_du = std::env::var("CISS_ADMIN_ONLY_DU")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let resolver = ciss::did_resolver::build_resolver(&resolve_cfg);
@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver_for_heartbeat = resolver.clone();
     let app = App::with_provider_from_secret(Blobs::Fs(config.data_dir.clone()), Db::File(db_path))?
         .with_did_resolver(resolver, service_did.clone())
-        .with_admin_usage(admin_dids, admin_usage);
+        .with_admin_only_du(admin_dids, admin_only_du);
 
     // Resolver-cache heartbeat: a periodic INFO sample of cache condition for
     // ongoing monitoring via journald (not DEBUG — production stays out of debug).

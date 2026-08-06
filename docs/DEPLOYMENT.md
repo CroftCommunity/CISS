@@ -62,7 +62,7 @@ optional with safe defaults:
 | `CISS_DID_RESOLVE_TIMEOUT_MS` | `3000` | hard resolve timeout (fails closed) |
 | `CISS_DID_CACHE_TTL_S` | `300` | resolution cache TTL |
 | `CISS_ADMIN_PINS_FILE` | — | pinned-admin-DID file (break-glass) |
-| `CISS_ADMIN_USAGE` | unset (off) | when set (`1`/`true`), an admin-pin DID may run **cross-DID** `du` (usage inspection: object sizes, not content — ADR 0003 / invariant Z9). Off by default; `du` is then self-only. |
+| `CISS_ADMIN_ONLY_DU` | unset (off) | Lock the remote `du` (self usage report) to admins. `du` is **always self-only** — cross-DID is never served over the wire (use the on-box `ciss usage` for other DIDs). Unset ⇒ any authenticated caller may `du` its own namespace. Set (`1`/`true`) ⇒ only an admin-pin DID may run `du`, still only for its own namespace (ADR 0003 / invariant Z9). |
 
 The admin-pin file (lines `<did> <did:key>`) is security-sensitive break-glass
 material; provision it like `provider-seed` (a systemd credential / mode-0400

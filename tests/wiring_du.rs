@@ -1,7 +1,7 @@
-//! Wiring test for usage inspection (`du`, ADR 0003 / invariant Z9): self usage is
-//! allowed, cross-DID is forbidden unless `CISS_ADMIN_USAGE` is on AND the caller
-//! is an admin-pin DID. Sizes come from the ledger; the endpoint reports
-//! `{objects:[{cid,bytes}], total_bytes}`.
+//! Wiring test for usage inspection (`du`, ADR 0003 / invariant Z9). `du` is
+//! **self-only**: a caller reports on its own namespace; cross-DID is never served
+//! (not even to admins). `CISS_ADMIN_ONLY_DU` is a lockdown: when set, only an
+//! admin-pin DID may run `du` at all — still only for its own namespace.
 
 mod common;
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use common::TestServer;
 
-use ciss::crypto::{derive_keypair, sha256_hex};
+use ciss::crypto::{derive_keypair, sha256_hex, Keypair};
 use ciss::identity::derive_id;
 use ciss::server::{App, Blobs, Db};
 use ciss_auth::{did_key_secp256k1, mint_service_auth_jwt};
@@ -26,8 +26,8 @@ async fn json(resp: reqwest::Response) -> serde_json::Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("json {text:?}: {e}"))
 }
 
-/// Upload `bytes` under `did`'s session (S3 plane) and return the cid.
-async fn put(client: &reqwest::Client, server: &TestServer, kp: &ciss::crypto::Keypair, did: &str, key: &str, bytes: &[u8]) -> String {
+/// Upload under an `id:` session; returns the cid.
+async fn put_id(client: &reqwest::Client, server: &TestServer, kp: &Keypair, did: &str, key: &str, bytes: &[u8]) -> String {
     let (pubkey, session) = common::session_headers(kp, did);
     let r = client
         .put(server.url(&format!("/{did}/objects/{key}")))
@@ -41,20 +41,38 @@ async fn put(client: &reqwest::Client, server: &TestServer, kp: &ciss::crypto::K
     sha256_hex(bytes)
 }
 
-/// Self `du` reports each object's size + the total; a stranger's cross-DID `du`
-/// is forbidden with the flag off (the default).
+fn du_token(sk: &SigningKey, did: &str) -> String {
+    mint_service_auth_jwt(sk, did, SERVICE_DID, DU_LXM, FAR_FUTURE, Some("jti-du"))
+}
+
+/// Status of a `du` under an `id:` session for `caller` querying `target`.
+async fn du_id_status(client: &reqwest::Client, server: &TestServer, kp: &Keypair, caller_did: &str, target: &str) -> u16 {
+    let (pk, sess) = common::session_headers(kp, caller_did);
+    client
+        .get(server.url(&format!("/{target}/du")))
+        .header("x-croft-pubkey", pk)
+        .header("x-croft-session", sess)
+        .send()
+        .await
+        .expect("du")
+        .status()
+        .as_u16()
+}
+
+/// Default (flag off): any authenticated caller may `du` its **own** namespace;
+/// a cross-DID query (or an anonymous one) is refused 403.
 #[tokio::test]
-async fn self_du_reports_sizes_and_a_stranger_is_forbidden() {
+async fn du_is_self_only_by_default() {
     let app = App::new("provider-master", Blobs::Memory, Db::Memory).expect("app");
     let server = TestServer::spawn(app).await;
     let client = reqwest::Client::new();
 
     let owner = derive_keypair("du-owner", "owner");
     let owner_did = derive_id(&owner.verifying_key());
-    let a = put(&client, &server, &owner, &owner_did, "a", b"hello").await; // 5
-    let b = put(&client, &server, &owner, &owner_did, "b", b"world!!").await; // 7
+    put_id(&client, &server, &owner, &owner_did, "a", b"hello").await; // 5
+    put_id(&client, &server, &owner, &owner_did, "b", b"world!!").await; // 7
 
-    // Self du: both objects with correct sizes + total.
+    // Self du → sizes + total.
     let (pk, sess) = common::session_headers(&owner, &owner_did);
     let body = json(
         client
@@ -66,89 +84,78 @@ async fn self_du_reports_sizes_and_a_stranger_is_forbidden() {
             .expect("self du"),
     )
     .await;
-    assert_eq!(body["total_bytes"], 12, "total is 5 + 7");
-    let objs = body["objects"].as_array().expect("objects");
-    let size_of = |cid: &str| {
-        objs.iter()
-            .find(|o| o["cid"] == cid)
-            .and_then(|o| o["bytes"].as_u64())
-            .unwrap_or_else(|| panic!("cid {cid} not in du"))
-    };
-    assert_eq!(size_of(&a), 5);
-    assert_eq!(size_of(&b), 7);
+    assert_eq!(body["total_bytes"], 12);
+    assert_eq!(body["objects"].as_array().expect("objects").len(), 2);
 
-    // A stranger (different id:) querying the owner's du → 403 (flag off).
+    // A stranger querying the owner's du → 403 (cross-DID never served).
     let stranger = derive_keypair("du-stranger", "stranger");
     let stranger_did = derive_id(&stranger.verifying_key());
-    let (spk, ssess) = common::session_headers(&stranger, &stranger_did);
-    let r = client
-        .get(server.url(&format!("/{owner_did}/du")))
-        .header("x-croft-pubkey", spk)
-        .header("x-croft-session", ssess)
-        .send()
-        .await
-        .expect("stranger du");
-    assert_eq!(r.status().as_u16(), 403, "cross-DID du forbidden with the flag off");
+    assert_eq!(
+        du_id_status(&client, &server, &stranger, &stranger_did, &owner_did).await,
+        403,
+        "cross-DID du is 403",
+    );
+
+    // Anonymous du → 403.
+    let anon = client.get(server.url(&format!("/{owner_did}/du"))).send().await.expect("anon du");
+    assert_eq!(anon.status().as_u16(), 403, "anonymous du is 403");
 }
 
-fn mint_du(sk: &SigningKey, did: &str) -> String {
-    mint_service_auth_jwt(sk, did, SERVICE_DID, DU_LXM, FAR_FUTURE, Some("jti-du"))
-}
-
-/// Cross-DID admin `du` requires BOTH the flag on and admin-set membership.
+/// `CISS_ADMIN_ONLY_DU` lockdown: only admin-pin DIDs may run `du` — still only for
+/// their own namespace (cross-DID stays 403 even for an admin).
 #[tokio::test]
-async fn admin_cross_did_du_requires_flag_and_membership() {
+async fn admin_only_lockdown_restricts_du_to_admins_still_self_only() {
     let admin_sk = SigningKey::from_slice(&[0x51u8; 32]).expect("scalar");
     let admin_did = "did:web:admin.test";
-    let outsider_sk = SigningKey::from_slice(&[0x52u8; 32]).expect("scalar");
-    let outsider_did = "did:web:outsider.test";
 
-    let build = |enabled: bool| {
-        let resolver: Arc<dyn DidResolver> = Arc::new(
-            StaticResolver::default()
-                .with(admin_did, did_key_secp256k1(admin_sk.verifying_key()))
-                .with(outsider_did, did_key_secp256k1(outsider_sk.verifying_key())),
-        );
+    let build = |locked: bool| {
+        let resolver: Arc<dyn DidResolver> =
+            Arc::new(StaticResolver::default().with(admin_did, did_key_secp256k1(admin_sk.verifying_key())));
         App::new("provider-master", Blobs::Memory, Db::Memory)
             .expect("app")
             .with_did_resolver(resolver, SERVICE_DID)
-            .with_admin_usage(HashSet::from([admin_did.to_owned()]), enabled)
+            .with_admin_only_du(HashSet::from([admin_did.to_owned()]), locked)
     };
 
-    // Owner uploads one object (id: session) into a fresh world.
     let owner = derive_keypair("du-owner2", "owner");
     let owner_did = derive_id(&owner.verifying_key());
 
-    // --- flag ON: admin may read cross-DID; a non-admin did: may not. ---
+    // --- lockdown ON ---
     let server = TestServer::spawn(build(true)).await;
     let client = reqwest::Client::new();
-    put(&client, &server, &owner, &owner_did, "x", b"twelve bytes").await; // 12
+    put_id(&client, &server, &owner, &owner_did, "x", b"twelve bytes").await;
 
-    let admin_ok = client
-        .get(server.url(&format!("/{owner_did}/du")))
-        .bearer_auth(mint_du(&admin_sk, admin_did))
+    // Non-admin owner, self du → 403 (locked to admins).
+    assert_eq!(
+        du_id_status(&client, &server, &owner, &owner_did, &owner_did).await,
+        403,
+        "with the lockdown on, a non-admin cannot du even its own namespace",
+    );
+
+    // Admin, self du → 200 (admin, own namespace — empty is fine).
+    let admin_self = client
+        .get(server.url(&format!("/{admin_did}/du")))
+        .bearer_auth(du_token(&admin_sk, admin_did))
         .send()
         .await
-        .expect("admin du");
-    assert_eq!(admin_ok.status().as_u16(), 200, "admin cross-DID du allowed with flag on");
-    assert_eq!(json(admin_ok).await["total_bytes"], 12);
+        .expect("admin self du");
+    assert_eq!(admin_self.status().as_u16(), 200, "an admin may du its own namespace under the lockdown");
 
-    let outsider = client
+    // Admin, cross-DID (the owner's namespace) → 403 (self-only always).
+    let admin_cross = client
         .get(server.url(&format!("/{owner_did}/du")))
-        .bearer_auth(mint_du(&outsider_sk, outsider_did))
+        .bearer_auth(du_token(&admin_sk, admin_did))
         .send()
         .await
-        .expect("outsider du");
-    assert_eq!(outsider.status().as_u16(), 403, "a non-admin did: is forbidden even with the flag on");
+        .expect("admin cross du");
+    assert_eq!(admin_cross.status().as_u16(), 403, "even an admin cannot du another DID");
 
-    // --- flag OFF: even the admin is forbidden cross-DID. ---
+    // --- lockdown OFF: the same non-admin owner may du its own namespace. ---
     let server_off = TestServer::spawn(build(false)).await;
-    put(&client, &server_off, &owner, &owner_did, "x", b"twelve bytes").await;
-    let admin_off = client
-        .get(server_off.url(&format!("/{owner_did}/du")))
-        .bearer_auth(mint_du(&admin_sk, admin_did))
-        .send()
-        .await
-        .expect("admin du flag off");
-    assert_eq!(admin_off.status().as_u16(), 403, "cross-DID du forbidden when the flag is off");
+    put_id(&client, &server_off, &owner, &owner_did, "x", b"twelve bytes").await;
+    assert_eq!(
+        du_id_status(&client, &server_off, &owner, &owner_did, &owner_did).await,
+        200,
+        "with the lockdown off, any authenticated caller may du its own namespace",
+    );
 }
