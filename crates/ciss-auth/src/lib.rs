@@ -31,7 +31,10 @@ mod service_jwt;
 
 pub use did_key::AtprotoKey;
 pub use replay::ReplayGuard;
-pub use service_jwt::{peek_iss, verify_service_auth_jwt, ServiceAuthParams, Verified};
+pub use service_jwt::{
+    did_key_secp256k1, mint_service_auth_jwt, peek_iss, verify_service_auth_jwt, ServiceAuthParams,
+    Verified,
+};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};

@@ -551,23 +551,34 @@ server.
 
 ---
 
-### Phase 6: Promote the service-auth JWT mint helper (`ciss-auth`) — test-side stand-in for the PDS
+### Phase 6: Promote the service-auth JWT mint helper (`ciss-auth`) — test-side stand-in for the PDS ✅ COMPLETE (2026-08-06)
 
 **Goal:** A public `ciss-auth` function mints a service-auth JWT CISS's verify path
 accepts, so **in-process tests can simulate a PDS's `getServiceAuth`** (they cannot
 call bsky). This is a test/dev helper, **not** the CLI's production path (the CLI
 fetches its JWT from the real PDS — Phase 7).
 **Changes:**
-- [ ] `crates/ciss-auth/src/service_jwt.rs` — promote the `#[cfg(test)]` `mint` +
-  `did_key_of` (`:171-198`) to public helpers. Per D2: header
-  `{"typ":"JWT","alg":"ES256K"}` (or `ES256` for P-256), claims
-  `{iss,aud,lxm,exp,jti}` (`lxm` required), sig = raw 64-byte `r‖s` base64url over
-  `header.payload`. Signing key is **secp256k1 (`k256`)** or **P-256 (`p256`)** —
-  **not ed25519** (D2 corollary). Suggested shape:
-  `pub fn mint_service_auth_jwt(sk: &k256::ecdsa::SigningKey, iss, aud, lxm,
-  exp, jti) -> String` plus `pub fn did_key_secp256k1(vk) -> String`.
-- [ ] `crates/ciss-auth/src/lib.rs` — export them. `k256`/`p256`/`base64`/
-  `multibase` are already deps (no new crate).
+- [x] `crates/ciss-auth/src/service_jwt.rs` — promoted `mint_service_auth_jwt(sk:
+  &k256::ecdsa::SigningKey, iss, aud, lxm, exp_unix_s, jti: Option<&str>) -> String`
+  and `did_key_secp256k1(vk: &k256::ecdsa::VerifyingKey) -> String`. Exact verify
+  shape: header `{"typ":"JWT","alg":"ES256K"}`, claims `{iss,aud,lxm,exp[,jti]}`,
+  sig = raw 64-byte `r‖s` base64url over `header.payload`. secp256k1 (`k256`), not
+  ed25519 (D2 corollary). Doc-commented as a **test/dev stand-in, not an issuer**.
+- [x] `crates/ciss-auth/src/lib.rs` — export both. No new deps (`k256`/`base64`/
+  `multibase` already present).
+
+**Executed:** RED-first (`promoted_mint_helper_round_trips_and_rejects_claim_edges`
+referenced the absent public fns → compile fail) → GREEN. The new test mints via
+the public helper and asserts valid→`Authenticated(iss)` plus each edge with its
+distinct error (wrong aud→`WrongAudience`, wrong lxm→`WrongMethod`,
+expired→`Expired`, forged→`SignatureInvalid`). The existing `#[cfg(test)]`
+`did_key_of` now delegates to `did_key_secp256k1`, so all prior edge tests exercise
+the promoted encoding. Chosen **plain `pub`** over a `testing` feature so
+`cargo test --workspace` keeps the guard active without extra feature plumbing.
+28 ciss-auth tests green; clippy clean.
+
+*Note for Phase 7:* `ciss` does not re-export `ciss-auth`, so ciss-cli's `did:`
+offline test will add `ciss-auth` (+ `k256`) as dev-deps to mint the stand-in JWT.
 **Call chain:** (library, test path) test harness → `ciss_auth::mint_service_auth_jwt`
 → compact JWS; server `verify_service_auth_jwt` accepts it against a
 `StaticResolver`-provided `did:key`.

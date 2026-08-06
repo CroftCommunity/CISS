@@ -155,6 +155,51 @@ fn decode_json<T: for<'de> Deserialize<'de>>(segment: &str) -> Result<T, ()> {
     serde_json::from_slice(&bytes).map_err(|_| ())
 }
 
+/// The secp256k1 `did:key:` string for a verifying key — the form a
+/// [`crate::ResolvedKeys`] carries, so a test/dev caller can register a minted
+/// token's signer with a `StaticResolver` and have CISS verify it offline.
+#[must_use]
+pub fn did_key_secp256k1(vk: &k256::ecdsa::VerifyingKey) -> String {
+    // Multicodec prefix 0xe7 0x01 = secp256k1-pub, over the compressed SEC1 point.
+    let point = vk.to_encoded_point(true);
+    let bytes = [&[0xe7u8, 0x01], point.as_bytes()].concat();
+    format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, bytes))
+}
+
+/// Mint an ES256K service-auth JWT — **a test/dev stand-in for a PDS's
+/// `com.atproto.server.getServiceAuth`**, not a production issuer. CISS is
+/// verify-only; a real `did:` caller relays a token its PDS minted (Model R).
+/// This exists so an in-process test (which cannot call bsky) can produce a token
+/// [`verify_service_auth_jwt`] accepts against a resolver-provided `did:key`.
+///
+/// Produces the exact shape the verify path checks: header
+/// `{"typ":"JWT","alg":"ES256K"}`, claims `{iss,aud,lxm,exp[,jti]}`, signature =
+/// raw 64-byte `r‖s` ECDSA over `header.payload`, base64url. The claim strings are
+/// interpolated verbatim (callers pass clean DIDs/method NSIDs, as in a test).
+#[must_use]
+pub fn mint_service_auth_jwt(
+    sk: &k256::ecdsa::SigningKey,
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+    exp_unix_s: u64,
+    jti: Option<&str>,
+) -> String {
+    use k256::ecdsa::{signature::Signer, Signature};
+
+    let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ES256K"}"#);
+    let claims = match jti {
+        Some(j) => format!(
+            r#"{{"iss":"{iss}","aud":"{aud}","lxm":"{lxm}","exp":{exp_unix_s},"jti":"{j}"}}"#
+        ),
+        None => format!(r#"{{"iss":"{iss}","aud":"{aud}","lxm":"{lxm}","exp":{exp_unix_s}}}"#),
+    };
+    let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let sig: Signature = sk.sign(signing_input.as_bytes());
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{verify_service_auth_jwt, ServiceAuthParams};
@@ -173,9 +218,9 @@ mod tests {
     }
 
     fn did_key_of(sk: &SigningKey) -> String {
-        let point = sk.verifying_key().to_encoded_point(true);
-        let bytes = [&[0xe7u8, 0x01], point.as_bytes()].concat();
-        format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, bytes))
+        // Delegate to the promoted helper, so every existing edge test exercises
+        // the public `did:key` encoding rather than a parallel copy.
+        super::did_key_secp256k1(sk.verifying_key())
     }
 
     /// Mint a compact JWS with the given header/claims JSON, signed by `sk`.
@@ -315,5 +360,54 @@ mod tests {
         let sk = signer();
         assert_eq!(super::peek_iss(&valid_token(&sk)).as_deref(), Ok(ISS));
         assert_eq!(super::peek_iss("garbage"), Err(JwtError::BadJwtStructure));
+    }
+
+    /// The promoted, public mint helper (a test/dev stand-in for a PDS's
+    /// `getServiceAuth`) produces tokens the verify path accepts, and each claim
+    /// edge is refused with its distinct error — so an in-process test can drive
+    /// the `did:` path without calling bsky, and the helper cannot silently
+    /// regress the verify contract.
+    #[test]
+    fn promoted_mint_helper_round_trips_and_rejects_claim_edges() {
+        use super::{did_key_secp256k1, mint_service_auth_jwt};
+
+        let sk = signer();
+        let keys = ResolvedKeys::new(did_key_secp256k1(sk.verifying_key()));
+
+        // Valid -> Authenticated(iss).
+        let good = mint_service_auth_jwt(&sk, ISS, AUD, LXM, NOW + 60, Some("n1"));
+        let verified = verify_service_auth_jwt(&good, &keys, &params()).expect("valid");
+        assert_eq!(verified.principal(), Principal::Authenticated(ISS.to_owned()));
+        assert_eq!(verified.jti.as_deref(), Some("n1"));
+
+        // Wrong aud.
+        let wrong_aud = mint_service_auth_jwt(&sk, ISS, "did:web:evil.example", LXM, NOW + 60, None);
+        assert_eq!(
+            verify_service_auth_jwt(&wrong_aud, &keys, &params()),
+            Err(JwtError::WrongAudience),
+        );
+
+        // Wrong lxm.
+        let wrong_lxm = mint_service_auth_jwt(&sk, ISS, AUD, "com.atproto.sync.getBlob", NOW + 60, None);
+        assert_eq!(
+            verify_service_auth_jwt(&wrong_lxm, &keys, &params()),
+            Err(JwtError::WrongMethod),
+        );
+
+        // Expired.
+        let expired = mint_service_auth_jwt(&sk, ISS, AUD, LXM, NOW - 1, None);
+        assert_eq!(
+            verify_service_auth_jwt(&expired, &keys, &params()),
+            Err(JwtError::Expired),
+        );
+
+        // Forged: attacker signs a token naming the victim iss; resolved against
+        // the victim key, the signature cannot verify.
+        let attacker = SigningKey::from_slice(&[0x99u8; 32]).unwrap();
+        let forged = mint_service_auth_jwt(&attacker, ISS, AUD, LXM, NOW + 60, None);
+        assert_eq!(
+            verify_service_auth_jwt(&forged, &keys, &params()),
+            Err(JwtError::SignatureInvalid),
+        );
     }
 }
