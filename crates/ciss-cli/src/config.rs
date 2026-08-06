@@ -52,6 +52,44 @@ impl Config {
     pub fn credential_path(&self) -> PathBuf {
         self.profile_dir().join("pds.json")
     }
+
+    /// The active profile name.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// The same config root, addressing a different profile.
+    #[must_use]
+    pub fn for_profile(&self, profile: &str) -> Self {
+        Self {
+            root: self.root.clone(),
+            profile: profile.to_owned(),
+        }
+    }
+
+    /// The names of all profiles that exist on disk (sorted). Empty if none.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the profiles directory exists but cannot be read.
+    pub fn profiles(&self) -> Result<Vec<String>> {
+        let dir = self.root.join("profiles");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 /// `$XDG_CONFIG_HOME/ciss-ctl`, or `$HOME/.config/ciss-ctl` as the XDG-default

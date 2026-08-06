@@ -180,6 +180,40 @@ fn key_import_refuses_to_clobber_an_existing_identity() {
     assert_eq!(before, after, "the original seed must be untouched");
 }
 
+/// `key list` orients you before key work: with no identities it says so; after
+/// creating some, it names each profile and its DID, and `--json` is a machine
+/// array. It never errors on an empty/partial store (unlike `whoami`/`key show`).
+#[test]
+fn key_list_enumerates_profiles_and_identities() {
+    let home = tmp_home("key-list");
+
+    // Empty store: succeeds (does not error like whoami), and says nothing exists.
+    let empty = ciss(&home).args(["key", "list"]).output().expect("run key list");
+    assert!(empty.status.success(), "key list on an empty store succeeds");
+
+    // Two id: identities under distinct profiles.
+    let a = ciss(&home).args(["--profile", "alice", "key", "gen"]).output().expect("alice gen");
+    let alice_did = String::from_utf8(a.stdout).unwrap().trim().to_owned();
+    ciss(&home).args(["--profile", "bob", "key", "gen"]).output().expect("bob gen");
+
+    let out = ciss(&home).args(["key", "list"]).output().expect("run key list");
+    assert!(out.status.success(), "key list succeeds: {out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("alice") && text.contains(&alice_did), "lists alice + her DID:\n{text}");
+    assert!(text.contains("bob"), "lists bob:\n{text}");
+
+    // JSON form is a machine array carrying each profile.
+    let j = ciss(&home).args(["--json", "key", "list"]).output().expect("json key list");
+    let v: serde_json::Value = serde_json::from_slice(&j.stdout).expect("json array");
+    let profiles: Vec<&str> = v
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|p| p["profile"].as_str())
+        .collect();
+    assert!(profiles.contains(&"alice") && profiles.contains(&"bob"), "json profiles: {profiles:?}");
+}
+
 /// `whoami` with no identity yet must fail loudly, pointing at `key gen`.
 #[test]
 fn whoami_without_an_identity_errors() {

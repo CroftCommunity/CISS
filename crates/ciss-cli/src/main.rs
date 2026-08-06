@@ -169,6 +169,9 @@ enum Commands {
 enum KeyCommand {
     /// Generate a fresh native ed25519 identity.
     Gen,
+    /// List every profile that has an identity, with its DID/account (orient
+    /// before key work). Read-only.
+    List,
     /// Show the active identity's DID and public key.
     Show,
     /// Import an existing OpenSSH ed25519 private key as a CISS identity.
@@ -388,6 +391,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let did = identity::generate(&config)?;
             print_did(&did, cli.global.json);
             Ok(())
+        }
+        Commands::Key(KeyCommand::List) => {
+            commands::key::list(&config, &cli.global.profile, cli.global.json)
         }
         Commands::Key(KeyCommand::Show) => {
             let (did, public_key) = identity::show(&config)?;
