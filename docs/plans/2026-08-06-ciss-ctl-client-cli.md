@@ -1,6 +1,6 @@
 # Plan — `ciss-ctl`, the CISS client CLI
 
-- **Date:** 2026-08-06 · **Status:** ✅ **DELIVERED — all phases (0–10) complete, merged to `main` (PR #6) + tap (PR #1); live-validated end-to-end against bsky.social; `brew install --HEAD` works** · **TDD-first** · Follow-on: versioned Homebrew formula once a release ships `ciss-ctl`.
+- **Date:** 2026-08-06 · **Status:** ✅ **SHIPPED v0.5.0 — all phases (0–10) complete + polish/review pass (PR #7); released with an immutable source asset and a pinned Homebrew formula (`brew install croftcommunity/tap/ciss-ctl` → `ciss-ctl 0.5.0`, man page, `brew test` green); live-validated end-to-end against bsky.social** · **TDD-first**
 - **Owns:** a new workspace member `crates/ciss-cli` producing the `ciss-ctl`
   binary. Homebrew-installable from the same tap as the server.
 - **Contracts spoken to:** `README.md` API surface, `docs/spec/gated-reads.md`
@@ -838,13 +838,17 @@ so it is a real test, not prose.
   tagged CISS release ships `ciss-ctl` yet. `brew test` covers `--version` +
   `key gen` + `whoami`. Git identity: `chasemp` / `github-personal`.
 
-**Executed:** CISS PR #6 merged Phases 1–9 to `main`; tap PR #1 added the formula.
-`brew style` clean; `brew install --HEAD` compiled and installed
-`/opt/homebrew/bin/ciss-ctl` (0.4.0); `brew test` exits 0; the Homebrew-installed
-binary generates a `0600` identity. **Follow-on (release-gated):** replace the
-HEAD-only stanza with a versioned `url` + verified `sha256` once a CISS release
-(e.g. `v0.5.0`) includes `ciss-ctl` — per the CLAUDE.md Homebrew workflow (prefer
-the uploaded release asset for a deterministic hash). Tracked, not blocking.
+**Executed:** CISS PR #6 merged Phases 1–9 to `main`; tap PR #1 added the HEAD
+formula. **Versioned release (2026-08-06):** a polish/review pass (PR #7) added a
+`man` subcommand, validated `acl set --class`, wired `-v`, fixed three review
+correctness items (gated `get --via pds` session, `did: get --owner`, verbose
+no-op), and bumped `ciss`/`ciss-cli` to **0.5.0**. Tag `v0.5.0` + a GitHub release
+carry an uploaded, immutable source asset `ciss-0.5.0.tar.gz`
+(`sha256 f91e793c34a3e4efdee4385a3643a5c399e914672179f9e94f76c20dafcebf1a`,
+verified against the downloaded asset). Tap PR #2 pinned the formula to that
+`url`+`sha256` and installs the man page. Verified end-to-end:
+`brew install croftcommunity/tap/ciss-ctl` → `ciss-ctl 0.5.0`, `man ciss-ctl`
+renders, `brew test` exits 0. `brew install --HEAD` still works.
 **Call chain:** n/a (packaging).
 **Wiring test:** `brew install` from the tap on a clean machine → `ciss-ctl
 --version` works; `brew test` runs `key gen` + `whoami`.
