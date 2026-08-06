@@ -65,8 +65,13 @@ ciss-ctl put note.txt --via s3              # S3-compat plane → same cid, + re
 ciss-ctl get <cid> -o out.txt               # fetch via pds (re-verified against the cid)
 ciss-ctl get <cid> --via s3 -o out.txt      # fetch the other way — same bytes
 ciss-ctl ls                                 # cids stored under your identity
+ciss-ctl du                                 # per-object sizes + total (self; --did <did> is admin-only)
 ciss-ctl meter                              # receipts + bytes + postage (server-side, per DID)
 ```
+
+`du` is self-only by default; cross-DID (`--did`) requires the server's
+`CISS_ADMIN_USAGE` flag + an admin-pin caller (ADR 0003). It needs a v0.5.5+
+server (older deployments return `501`).
 
 `get` verifies `sha256(bytes) == cid` **before** writing (temp-then-rename), so
 a corrupted or substituted body never lands on disk.

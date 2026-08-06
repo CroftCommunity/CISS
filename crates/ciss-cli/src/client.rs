@@ -98,6 +98,24 @@ pub struct BlobUpload {
     pub bytes: u64,
 }
 
+/// One object in a usage (`du`) report: its content id and stored size.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UsageObject {
+    /// Content id (sha256 hex).
+    pub cid: String,
+    /// Stored size in bytes.
+    pub bytes: u64,
+}
+
+/// A usage (`du`) report for a namespace: per-object sizes + total.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Usage {
+    /// The objects and their sizes.
+    pub objects: Vec<UsageObject>,
+    /// Total bytes across the listed objects.
+    pub total_bytes: u64,
+}
+
 /// The billing meter for a namespace.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Meter {
@@ -479,6 +497,34 @@ impl Client {
         }
         let resp = self.ensure_success(resp, "get policy").await?;
         Ok(Some(resp.json().await.context("parse policy body")?))
+    }
+
+    /// `GET /{did}/du` under an `id:` session — per-object sizes + total. Self
+    /// usage (querying your own DID) always works; a cross-DID query needs the
+    /// server's admin flag + admin membership, else 403.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status (cross-DID unauthorized is 403).
+    pub async fn du(&self, session: Option<&Session>, did: &str) -> Result<Usage> {
+        let url = format!("{}/{}/du", self.base, did);
+        let resp = self.send(with_session(self.http.get(&url), session), "du").await?;
+        let resp = self.ensure_success(resp, "du").await?;
+        resp.json::<Usage>().await.context("parse du response")
+    }
+
+    /// `GET /{did}/du` as a `did:` caller, presenting a service-auth JWT
+    /// (`lxm=ing.croft.ciss.du`). Self usage for your account; cross-DID only if
+    /// you are an admin and the server's flag is on.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status.
+    pub async fn du_bearer(&self, token: &str, did: &str) -> Result<Usage> {
+        let url = format!("{}/{}/du", self.base, did);
+        let resp = self.send(self.http.get(&url).bearer_auth(token), "du").await?;
+        let resp = self.ensure_success(resp, "du").await?;
+        resp.json::<Usage>().await.context("parse du response")
     }
 
     /// Send a request, translating a connect/timeout failure into an actionable

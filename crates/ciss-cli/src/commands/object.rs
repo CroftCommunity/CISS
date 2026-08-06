@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::client::{Client, Plane, Session};
+use crate::client::{Client, Plane, Session, Usage};
 
 /// `ciss-ctl put <file> --via s3|pds`: upload over the chosen plane and report
 /// the content address + bytes transferred.
@@ -167,6 +167,32 @@ pub async fn ls(
 ) -> Result<()> {
     print_cids(&client.list_blobs(session, did).await?, json_out);
     Ok(())
+}
+
+/// Print a usage report: `bytes  cid` per object + a total line, or the JSON
+/// `{objects,total_bytes}` under `--json`. Shared by the `id:`/`did:` `du` paths.
+pub fn print_usage(usage: &Usage, json_out: bool) {
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({
+                "objects": usage.objects.iter()
+                    .map(|o| serde_json::json!({ "cid": o.cid, "bytes": o.bytes }))
+                    .collect::<Vec<_>>(),
+                "total_bytes": usage.total_bytes,
+            })
+        );
+        return;
+    }
+    if usage.objects.is_empty() {
+        println!("(no objects stored)");
+        return;
+    }
+    for o in &usage.objects {
+        println!("{:>12}  {}", o.bytes, o.cid);
+    }
+    let n = usage.objects.len();
+    println!("{:>12}  total ({n} object{})", usage.total_bytes, if n == 1 { "" } else { "s" });
 }
 
 /// Print a list of cids as one-per-line, or `{"cids":[…]}` under `--json`. Shared

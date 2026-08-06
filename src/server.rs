@@ -76,6 +76,10 @@ pub(crate) const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
 /// session) read its own policy back over the `did:` auth path.
 pub(crate) const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
 
+/// The lexicon method a `did:` caller's usage-inspection (`du`) service-auth JWT
+/// must bind to (ADR 0003).
+pub(crate) const DU_LXM: &str = "ing.croft.ciss.du";
+
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -212,6 +216,12 @@ pub(crate) struct AppState {
     replay: Arc<ReplayGuard>,
     /// This service's atproto DID — the `aud` a service-auth JWT must name.
     service_did: Arc<str>,
+    /// DIDs authorized for **cross-DID** usage inspection (`du`, ADR 0003) — the
+    /// break-glass admin pins, at deploy. Empty by default (self-only `du`).
+    admin_dids: Arc<std::collections::HashSet<String>>,
+    /// The `CISS_ADMIN_USAGE` flag: cross-DID admin `du` is allowed only when this
+    /// is set **and** the caller is in `admin_dids`. Off by default.
+    admin_usage: bool,
 }
 
 /// The cooperative metered-storage server.
@@ -293,8 +303,28 @@ impl App {
                 resolver: Arc::new(StaticResolver::default()),
                 replay: Arc::new(ReplayGuard::new()),
                 service_did: Arc::from(default_service_did().as_str()),
+                // Usage inspection (ADR 0003): self-only by default. An operator
+                // opts into cross-DID admin `du` via `with_admin_usage`.
+                admin_dids: Arc::new(std::collections::HashSet::new()),
+                admin_usage: false,
             },
         }
+    }
+
+    /// Enable cross-DID admin usage inspection (`du`, ADR 0003 / invariant Z9).
+    /// `admin_dids` is the set authorized to read *other* DIDs' object sizes
+    /// (the break-glass admin pins, at deploy); `enabled` is the `CISS_ADMIN_USAGE`
+    /// flag. Both must hold for a cross-DID `du` to succeed; self `du` is always
+    /// allowed regardless. Off by default (self-only).
+    #[must_use]
+    pub fn with_admin_usage(
+        mut self,
+        admin_dids: std::collections::HashSet<String>,
+        enabled: bool,
+    ) -> Self {
+        self.state.admin_dids = Arc::new(admin_dids);
+        self.state.admin_usage = enabled;
+        self
     }
 
     /// Wire the atproto DID resolver and this service's `aud` DID (Model R). The
@@ -344,6 +374,7 @@ impl App {
                 put(put_object_policy_handler).get(get_object_policy_handler),
             )
             .route("/{did}/meter", get(get_meter_handler))
+            .route("/{did}/du", get(du_handler))
             // The atproto PDS blob surface (Phase 8) — a thin layer over the
             // same metered byte-path, mounted at its XRPC paths.
             .merge(crate::pds_api::routes())
@@ -551,6 +582,11 @@ pub(crate) enum Op {
         did: String,
         cid: Option<String>,
     },
+    /// Usage report for a DID: per-object sizes + total (ADR 0003). Self-only
+    /// unless `CISS_ADMIN_USAGE` + an admin-pin caller (checked in-handler).
+    Du {
+        did: String,
+    },
 }
 
 impl Op {
@@ -571,7 +607,8 @@ impl Op {
             | Op::GetMeter { .. }
             | Op::ListBlobs { .. }
             | Op::PutPolicy { .. }
-            | Op::GetPolicy { .. } => false,
+            | Op::GetPolicy { .. }
+            | Op::Du { .. } => false,
         }
     }
 }
@@ -613,6 +650,11 @@ pub(crate) enum OpOutcome {
     /// A policy read-back body — either the full signed record (owner) or the
     /// grantee's limited `{read_class, may_read}` view (Q4). Pre-serialized JSON.
     PolicyBody {
+        json: String,
+    },
+    /// A usage report body: `{objects:[{cid,bytes},…], total_bytes}` (ADR 0003).
+    /// Pre-serialized JSON.
+    UsageBody {
         json: String,
     },
 }
@@ -825,9 +867,11 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         | Op::ListBlobs { .. }
         // PutPolicy is self-authorizing (the signed record proves owner authority
         // in op_put_policy, like PutManifest); GetPolicy applies owner-only
-        // reader-set visibility inside op_get_policy. Both are checked in-handler.
+        // reader-set visibility inside op_get_policy. Du checks self-or-admin
+        // (ADR 0003) inside op_du. All checked in-handler.
         | Op::PutPolicy { .. }
-        | Op::GetPolicy { .. } => Ok(()),
+        | Op::GetPolicy { .. }
+        | Op::Du { .. } => Ok(()),
     }
 }
 
@@ -904,6 +948,7 @@ pub(crate) fn dispatch(
             authed,
         } => op_put_policy(state, &did, cid.as_deref(), &body, authed.as_ref()),
         Op::GetPolicy { did, cid } => op_get_policy(state, principal, &did, cid.as_deref()),
+        Op::Du { did } => op_du(state, principal, &did),
     }
 }
 
@@ -1211,6 +1256,48 @@ fn op_list_blobs(
     }
     tracing::debug!(%did, shown = cids.len(), hidden, "listBlobs filtered");
     Ok(OpOutcome::BlobList { cids })
+}
+
+/// Usage report for `did` (ADR 0003, invariant Z9): per-object sizes (upload bytes
+/// summed per distinct cid, in first-upload order) + total. Reads the maintained
+/// receipt ledger — no filesystem walk.
+///
+/// Authorization: the caller must **own** `did` (self usage), or — **only** when
+/// `CISS_ADMIN_USAGE` is enabled — be an **admin-pin** DID (cross-DID audit; sees
+/// sizes, never content). Otherwise `403`, with a response that does not vary by
+/// whether `did` exists (no existence oracle).
+fn op_du(state: &AppState, principal: &Principal, did: &str) -> Result<OpOutcome, ServerError> {
+    let caller = principal.did();
+    let is_self = caller == Some(did);
+    let is_admin = state.admin_usage && caller.is_some_and(|c| state.admin_dids.contains(c));
+    if !is_self && !is_admin {
+        tracing::info!(resource = %did, actor = ?caller, reason = "not self or admin", "du denied");
+        return Err(ServerError::Forbidden);
+    }
+
+    let store = lock_store(&state.store);
+    let receipts = store.load_receipts(did)?;
+    let mut order: Vec<String> = Vec::new();
+    let mut sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for receipt in &receipts {
+        if receipt.core().direction == Direction::Upload {
+            let cid = &receipt.core().cid;
+            let bytes = receipt.core().bytes as u64;
+            if let Some(v) = sizes.get_mut(cid) {
+                *v += bytes;
+            } else {
+                order.push(cid.clone());
+                sizes.insert(cid.clone(), bytes);
+            }
+        }
+    }
+    let objects: Vec<serde_json::Value> = order
+        .iter()
+        .map(|cid| serde_json::json!({ "cid": cid, "bytes": sizes[cid] }))
+        .collect();
+    let total: u64 = sizes.values().sum();
+    let json = serde_json::json!({ "objects": objects, "total_bytes": total }).to_string();
+    Ok(OpOutcome::UsageBody { json })
 }
 
 /// Set/replace a target's read policy from an owner-authorized record (Model A:
@@ -1544,6 +1631,19 @@ async fn get_meter_handler(
     dispatch_blocking(&state, principal, Op::GetMeter { did: did.into_string() }).await
 }
 
+/// `GET /{did}/du` — per-object sizes + total for `did` (ADR 0003). Self usage for
+/// the owner; cross-DID only for an admin-pin caller when `CISS_ADMIN_USAGE` is
+/// on. Accepts an `id:` session or a `did:` service-auth JWT bound to `du`.
+async fn du_handler(
+    State(state): State<AppState>,
+    Path(did): Path<String>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, DU_LXM).await;
+    dispatch_blocking(&state, principal, Op::Du { did: did.into_string() }).await
+}
+
 /// Liveness/readiness: `200 ok`. Side-effect-free — it neither reads the store
 /// nor the backend, so it stays fast under load (croft-stack contract §2).
 async fn healthz_handler() -> Response {
@@ -1609,7 +1709,9 @@ impl IntoResponse for OpOutcome {
                 "total_bytes": total_bytes,
             }))
             .into_response(),
-            OpOutcome::ManifestBody { json } | OpOutcome::PolicyBody { json } => {
+            OpOutcome::ManifestBody { json }
+            | OpOutcome::PolicyBody { json }
+            | OpOutcome::UsageBody { json } => {
                 ([("content-type", "application/json")], json).into_response()
             }
             OpOutcome::Meter {

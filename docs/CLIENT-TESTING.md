@@ -159,7 +159,19 @@ cctl meter
 
 cctl ls          # content ids stored under your identity
 # f2c13d14…
+
+cctl du          # per-object sizes + total for your namespace
+#            5  2cf24dba…
+#            7  42a19f77…
+#           12  total (2 objects)   (--json for machine output)
 ```
+
+`du` reports sizes from the receipt ledger (no disk scan). By default it is
+**self-only** — `du --did <other>` is refused `403` unless the *server* sets
+`CISS_ADMIN_USAGE` **and** your DID is in its admin-pin set (ADR 0003; the audit
+view). **Server support required:** `du` is a v0.5.5 **server** endpoint; an older
+deployment returns `501`, so it works only against a server built at v0.5.5+ (a
+local build, or the VPS once redeployed).
 
 ---
 
