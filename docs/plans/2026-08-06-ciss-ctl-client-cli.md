@@ -1,6 +1,6 @@
 # Plan — `ciss-ctl`, the CISS client CLI
 
-- **Date:** 2026-08-06 · **Status:** ✅ **SHIPPED v0.5.1 — all phases (0–10) complete + polish/review pass (PR #7) + `ciss-ctl login` for the `did:` app-password credential (PR #8); released with immutable source assets and a pinned Homebrew formula (`brew install croftcommunity/tap/ciss-ctl` → `ciss-ctl 0.5.1`, man page incl. `ciss-ctl-login(1)`, `brew test` green); the full `did:` e2e (login → getServiceAuth → CISS resolves the real `did:plc`) validated against the live VPS with the shipped binary** · **TDD-first**
+- **Date:** 2026-08-06 · **Status:** ✅ **SHIPPED v0.5.2 — all phases (0–10) complete + polish/review pass (PR #7); post-ship follow-ons: `ciss-ctl login` for the `did:` app-password credential (PR #8, v0.5.1) and `ciss-ctl key list` for pre-key-work orientation (PR #9, v0.5.2). Released with immutable source assets and a pinned Homebrew formula (`brew install croftcommunity/tap/ciss-ctl` → `ciss-ctl 0.5.2`, man page, `brew test` green); the full `did:` e2e (login → getServiceAuth → CISS resolves the real `did:plc`) validated against the live VPS with the shipped binary. Testing guide: `docs/CLIENT-TESTING.md` (both-sides, against the VPS)** · **TDD-first**
 - **Owns:** a new workspace member `crates/ciss-cli` producing the `ciss-ctl`
   binary. Homebrew-installable from the same tap as the server.
 - **Contracts spoken to:** `README.md` API surface, `docs/spec/gated-reads.md`
