@@ -1,7 +1,16 @@
 # CISS file-sync — M2 execution plan (bounded local footprint)
 
 date: 2026-08-07
-status: **Planned (condensed three-pass, single context — moderate scope on settled M1 ground). EXECUTING.**
+status: **CLOSED (2026-08-07). All three phases shipped; M2 delivered:** *local footprint is bounded
+regardless of logical tree size* — `ciss-ctl sync evict|hydrate|status`.
+
+## Outcome Summary
+
+| Phase | Outcome | Commit | Note |
+|---|---|---|---|
+| 1 state/cache/placeholder | ✅ | `941d0f9` | primitives; mutants 41 caught / 0 missed (1 timeout = kill) |
+| 2 evict + logical-tree backup | ✅ | `f721203` | no-data-loss guard (identical fs-manifest cid across evict); live drill green |
+| 3 hydrate | ✅ | `2d022bd` | cache read-through (0 metered gets on hit); shared materializer; live drills green |
 parent: `docs/plans/2026-08-07-file-sync-client.md` (milestone ladder; this doc executes **M2**).
 skill: authored under the `phase-plan` workflow (abbreviated passes — see Review Log).
 
@@ -58,7 +67,7 @@ the tree (M1 learning: scanning your own mutating sqlite poisons the manifest).
 
 ## Phases
 
-### Phase 1: state root + chunk cache + placeholder store (pure)
+### Phase 1: state root + chunk cache + placeholder store (pure) — ✅ SHIPPED (`941d0f9`)
 **Goal:** the three storage primitives, fully unit-tested offline.
 **Changes:**
 - [ ] `state.rs`: `SyncState::open(state_dir)` — one sqlite (`state.sqlite`: scan_index [reuse `Index`
@@ -80,7 +89,7 @@ tables persist).
 **Validation:** Narrow — unit + crate-integration sufficient. Mutation audit: `cargo mutants` scoped to
 `cache.rs` (the LRU/budget boundary logic) once green.
 
-### Phase 2: evict + placeholder-aware backup (`sync evict`, `sync status`)
+### Phase 2: evict + placeholder-aware backup (`sync evict`, `sync status`) — ✅ SHIPPED (`f721203`)
 **Goal:** drop a file's local bytes safely; the logical tree survives every later backup.
 **Changes:**
 - [ ] `evict.rs`: `evict(dir, state, server, paths) -> EvictReport` — per file: entry from the current
@@ -107,7 +116,7 @@ bytes shrink, `sync status` shows the file as evicted, and a re-backup changes n
 **Validation:** Moderate — flow + unit + a live CLI pass (evict against the real server, `sync status`,
 re-backup, `du` unchanged).
 
-### Phase 3: hydrate (`sync hydrate`) + the footprint capability end-to-end
+### Phase 3: hydrate (`sync hydrate`) + the footprint capability end-to-end — ✅ SHIPPED (`2d022bd`)
 **Goal:** bytes come back on demand — from the cache when possible, the server when not — verified.
 **Changes:**
 - [ ] Refactor restore's per-file materializer (fetch chunks → verify each → assemble → verify size →
@@ -156,3 +165,22 @@ budget round-trips through evict → status → hydrate with every byte verified
   budget/LRU, corrupt-cache-is-miss, refuse-overwrite, cache-hit-zero-fetch); tracing spec'd per flow;
   validation calibrated (narrow/moderate/moderate); concurrency map all-sequential; docs scheduled in the
   phases that stale them; mutation target `cache.rs`+`placeholder.rs`.
+
+### Plan close-out — 2026-08-07
+**Shipped:** all three phases, one session, on the M1 spine. `941d0f9` (SyncState root + budgeted
+ChunkCache with deterministic counter-LRU/pin/verify-on-read + PlaceholderStore), `f721203` (evict with
+the both-sides backed gate; backup commits the logical tree = scanned ∪ placeholders; cache-recovery
+re-upload for server-lost chunks; CLI evict/status; backup state-wired by default — closing the M1
+follow-up), `2d022bd` (hydrate via cache read-through + the shared verify-before-rename materializer;
+CLI hydrate). Observable: a tree larger than the local budget round-trips evict → status → hydrate
+byte-identically (content+mode+mtime); an eviction can never change the committed tree (identical
+fs-manifest cid proven) nor lose data (cache wiped → server refetch, verified); a cache-hit hydrate
+performs zero metered fetches.
+**Stopped or skipped:** nothing. Pin *policies* (recent/starred/working-set) deferred as planned — the
+mechanism shipped.
+**Discoveries:** (1) the placeholder merge belongs inside `backup` (any wrapper would eventually be
+bypassed — the no-data-loss invariant must sit on the committed path); (2) an evicted file whose chunks
+the server loses is recoverable from the spill cache — that fallback turned the cache from a pure
+optimization into a second line of defense; (3) `backup --no-state` had to *refuse* when placeholders
+exist (a stateless backup would silently shrink the tree — caught at design time); (4) zsh's no-word-split
+default bit the live drill script (`$FLAGS` as one word), worth remembering for future drills.
