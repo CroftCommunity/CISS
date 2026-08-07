@@ -1,6 +1,6 @@
 # M4 — iroh peer-fetch: the same sync runs over iroh, and blobs can come from a peer
 
-**Status:** IN PROGRESS
+**Status:** CLOSED — all phases shipped
 **Parent plan:** `docs/plans/2026-08-07-file-sync-client.md` (M4 section)
 **Server change:** none — CISS becomes one blob source among peers.
 
@@ -161,8 +161,58 @@ green, merge, stamp milestone plan + memory.
 - RBSR set reconciliation, croft-group multi-lineage sync, bilateral receipts
   (parent plan "Future" section).
 - Persistent iroh blob store (`MemStore` now; the ChunkCache remains the
-  durable local layer — an fs-backed iroh store is an optimization).
+  durable local layer — an fs-backed iroh store is an optimization). This has
+  a concrete consequence worth naming: the sha256→blake3 alias index and the
+  blob store are **process-lifetime**, so a *serverless* converge whose 3-way
+  base predates the current processes (round 2+ across restarts, with edits
+  on both sides) fails loud on the base fetch ("no mapping"). Recovery today:
+  converge via the server path (M3), or keep the sharing process alive across
+  rounds. A persistent store/alias layer is the follow-on that dissolves this.
 
 ## Outcome Summary
 
-(to be filled at close-out)
+All phases shipped on `ciss-m4`; server change: **none** (as planned).
+
+- **Phase 0 (discovery)** — `1322781` (plan incl. verified-assumptions
+  ledger). Probes pinned iroh 1.0.3 / iroh-blobs 0.103.0 / iroh-gossip
+  0.101.0 (MSRV 1.91 ≤ toolchain 1.97.1) and the exact API surface; the
+  key fact: `add_bytes`' hash IS `blake3(bytes)`, so every `ChunkRef.blake3`
+  is directly the iroh address.
+- **Phase 1 (`IrohPeer` + `PeerFirst`)** — `11da13b`. New crate
+  `crates/ciss-iroh`. Flow test: a restore through `PeerFirst` served every
+  chunk from the peer; the origin's blob egress was exactly **one get** (the
+  fs-manifest). Poisoned-alias and lying-cid guards RED-first; sha-256
+  re-verified on receipt (C1 never delegated to Bao).
+- **Phase 2 (`MeshPeer` serverless converge)** — `4ee319c`. `converge()`
+  runs unchanged over gossip+blobs; flow test has **no `World` at all**.
+  CLI: `sync p2p share` (ticket = base64-JSON `EndpointAddr`) and
+  `sync p2p converge --ticket`.
+- **Live drill** — two real `ciss-ctl` processes, two profiles sharing the
+  account key, disjoint + same-path-conflict trees: both converged to
+  fs-manifest `1ceb3f7c…`, `diff -r` byte-identical, conflict preserved as
+  `notes.txt.conflict-6e63cebc` on both, **server never contacted**.
+- **Mutation audit** (`cargo mutants -p ciss-iroh`, close-out commit) —
+  baseline 98 mutants: 47 caught, 16 unviable, **35 missed**. Every survivor
+  was one of the two cheap patterns the CLAUDE.md guidance names (a
+  delegation-only trait impl no crate test called; a convenience API with no
+  behavioral assertion) — none was a logic gap in the fetch/verify/merge
+  paths. All 35 closed with kill tests: `PeerFirst` delegation round-trip,
+  shutdown-stops-serving (both types), hand-crafted-announcement wire-format
+  pin, mesh keep-set slot + `StaleSeq` refusal, and manifest-self-priming
+  chunk fetch. Targeted re-run: every family killed except the two
+  `shutdown → ()` mutants, which are **equivalent** — `shutdown(self)`
+  consumes self, so a no-op body still drops (and thereby closes) the
+  router/endpoint; the stops-serving tests pass under both bodies. Recorded
+  in `.cargo/mutants.toml` per the repo convention.
+
+Discoveries recorded along the way:
+
+- A raw gossip broadcast that races mesh formation is silently lost —
+  only *committed heads* are re-announced on `NeighborUp`. Tests (and any
+  future one-shot messaging) must rebroadcast-until-seen.
+- `presets::Empty` fails at bind with "missing rustls crypto provider";
+  `presets::Minimal` is the floor (matches the corpus's
+  `IROH-1.0.0-API-VERIFIED.md`).
+- The announcement only ever needs two hash-pairs: everything deeper
+  (chunks, base) is derivable because a fetched fs-manifest self-primes the
+  alias index — the closure walk needs no further introductions.

@@ -193,7 +193,9 @@ Server change: **one, additive** — the `Frontier.heads` map (below). Shared ac
   is refused (`409`, I5 holds); a valid `heads` update round-trips and a second device reads both heads.
 
 ### M4 — "The same sync runs over iroh, and blobs can come from a peer." (peer-fetch = less metered egress)
-Server change: **none** (CISS remains one blob source among peers).
+Server change: **none** (CISS remains one blob source among peers). — **✅ M4 SHIPPED 2026-08-07**
+(`ciss-ctl sync p2p share|converge` + `PeerFirst` peer-preferred reads; execution plan
+`docs/plans/2026-08-07-file-sync-m4-iroh-peer-fetch.md`)
 
 - **P4.1 iroh `BlobTransport` impl** (addresses by `blake3`; Bao verified streaming — resume/range free).
 - **P4.2 serverless path**: device↔device over iroh-gossip, `topic = derive(lineage_root)`, IP-free bootstrap

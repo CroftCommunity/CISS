@@ -180,6 +180,8 @@ ciss-ctl sync evict ~/notes big/video.mov         # drop local bytes (refused un
 ciss-ctl sync hydrate ~/notes                     # bring evicted bytes back (cache first, then server)
 ciss-ctl sync status ~/notes                      # present vs evicted, cache usage, keep-set seq
 ciss-ctl sync converge ~/notes                    # fold all devices' heads; conflicts preserved, never lost
+ciss-ctl sync p2p share ~/notes                   # serve this tree device↔device over iroh; prints a ticket
+ciss-ctl sync p2p converge ~/notes --ticket <t>   # same fold, no server: frontier over gossip, blobs over iroh
 ```
 
 Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`

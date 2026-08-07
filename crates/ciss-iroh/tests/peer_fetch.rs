@@ -85,11 +85,79 @@ async fn unknown_and_poisoned_mappings_fail_closed() {
     b.shutdown().await;
 }
 
+/// `shutdown` is real: a peer that shut down stops serving — a fetch that
+/// would have succeeded against it now fails instead of hanging onto a
+/// half-alive endpoint. (Mutation-audit kill: `shutdown` replaced with a
+/// no-op would leave the provider serving.)
+#[tokio::test]
+async fn a_shut_down_peer_stops_serving() {
+    let a = IrohPeer::spawn().await.expect("spawn a");
+    let b = IrohPeer::spawn().await.expect("spawn b");
+    let payload = b"bytes that die with the provider".to_vec();
+    let cid = cid_of(&payload);
+    a.put(&cid, &payload).await.expect("put");
+    let addr = a.addr();
+    a.shutdown().await;
+
+    b.learn(&cid, *blake3::hash(&payload).as_bytes(), &addr).expect("learn");
+    // Refused or unreachable — either is "stopped"; only success is failure.
+    let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), b.get(&cid)).await;
+    if let Ok(Ok(_)) = fetch {
+        panic!("a shut-down peer must not serve blobs");
+    }
+    b.shutdown().await;
+}
+
 /// An in-memory origin standing in for CISS in crate-level tests.
 #[derive(Default)]
 struct MemOrigin {
     blobs: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     gets: std::sync::atomic::AtomicU64,
+    slot: tokio::sync::Mutex<OriginSlot>,
+}
+
+#[derive(Default)]
+struct OriginSlot {
+    seq: Option<u64>,
+    leaves: Vec<(String, u64)>,
+    heads: std::collections::BTreeMap<String, String>,
+}
+
+#[async_trait::async_trait]
+impl ciss_sync::ManifestSlot for MemOrigin {
+    async fn current_seq(&self) -> Result<Option<u64>, SyncError> {
+        Ok(self.slot.lock().await.seq)
+    }
+    async fn keep_set(&self) -> Result<Option<Vec<(String, u64)>>, SyncError> {
+        let slot = self.slot.lock().await;
+        Ok(slot.seq.map(|_| slot.leaves.clone()))
+    }
+    async fn frontier(&self) -> Result<Option<ciss_sync::FrontierView>, SyncError> {
+        let slot = self.slot.lock().await;
+        Ok(slot.seq.map(|seq| ciss_sync::FrontierView {
+            seq,
+            heads: slot.heads.clone(),
+            leaves: slot.leaves.clone(),
+        }))
+    }
+    async fn commit_keep_set(&self, leaves: &[(String, u64)], seq: u64) -> Result<(), SyncError> {
+        let mut slot = self.slot.lock().await;
+        slot.seq = Some(seq);
+        slot.leaves = leaves.to_vec();
+        Ok(())
+    }
+    async fn commit_frontier(
+        &self,
+        leaves: &[(String, u64)],
+        seq: u64,
+        heads: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), SyncError> {
+        let mut slot = self.slot.lock().await;
+        slot.seq = Some(seq);
+        slot.leaves = leaves.to_vec();
+        slot.heads = heads.clone();
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -157,5 +225,44 @@ async fn peer_first_falls_back_per_blob() {
     assert!(!local.have().await.expect("have").contains(&cid_fresh));
 
     provider.shutdown().await;
+    local.shutdown().await;
+}
+
+/// Every `PeerFirst` slot/have delegation really reaches the origin — the
+/// have-set is the origin's, and a keep-set/frontier committed through the
+/// composite reads back with the exact values the origin stored. (Mutation
+/// audit: a delegation stubbed to a constant would answer differently.)
+#[tokio::test]
+async fn peer_first_delegates_slot_and_have_to_origin() {
+    use ciss_sync::ManifestSlot;
+
+    let local = IrohPeer::spawn().await.expect("spawn local");
+    let origin = MemOrigin::default();
+    let t = PeerFirst { peer: &local, origin: &origin };
+
+    let blob = b"origin-held blob".to_vec();
+    let cid = cid_of(&blob);
+    origin.put(&cid, &blob).await.expect("origin put");
+    assert_eq!(
+        t.have().await.expect("have"),
+        HashSet::from([cid.clone()]),
+        "have() is the origin's set, verbatim"
+    );
+
+    assert_eq!(t.current_seq().await.expect("seq"), None, "no slot committed yet");
+    assert_eq!(t.keep_set().await.expect("keep"), None);
+    assert!(t.frontier().await.expect("frontier").is_none());
+
+    t.commit_keep_set(&[(cid.clone(), 16)], 3).await.expect("commit keep");
+    assert_eq!(t.current_seq().await.expect("seq"), Some(3));
+    assert_eq!(t.keep_set().await.expect("keep"), Some(vec![(cid.clone(), 16)]));
+
+    let heads = std::collections::BTreeMap::from([("dev-z".to_owned(), cid.clone())]);
+    t.commit_frontier(&[(cid.clone(), 16)], 7, &heads).await.expect("commit frontier");
+    let f = t.frontier().await.expect("frontier").expect("exists");
+    assert_eq!(f.seq, 7);
+    assert_eq!(f.heads, heads);
+    assert_eq!(f.leaves, vec![(cid, 16)]);
+
     local.shutdown().await;
 }
