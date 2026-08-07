@@ -98,8 +98,8 @@ async fn restore_pulls_chunks_from_peer_not_origin() {
         .bytes;
     let decoded = DagCbor.decode(&manifest_bytes).expect("decode");
 
-    let provider = IrohPeer::spawn().await.expect("spawn provider");
-    let local = IrohPeer::spawn().await.expect("spawn local");
+    let provider = IrohPeer::spawn(None).await.expect("spawn provider");
+    let local = IrohPeer::spawn(None).await.expect("spawn local");
     let mut chunk_cids = HashSet::new();
     for entry in decoded.entries.values() {
         for chunk in &entry.chunks {

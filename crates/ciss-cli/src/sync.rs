@@ -66,6 +66,36 @@ pub fn default_state_dir(profile: &str, tree: &Path) -> anyhow::Result<PathBuf> 
         .join(SyncState::tree_id(profile, &canonical)))
 }
 
+/// Resolve which relay the p2p endpoints use. Precedence: `--no-relay` >
+/// `--relay <url>` > the profile's `relay` file (`disabled` opts out) >
+/// [`ciss_iroh::DEFAULT_RELAY_URL`]. An unreachable relay degrades to
+/// direct paths, so the default never breaks LAN-only use.
+#[must_use]
+pub fn resolve_relay(
+    no_relay: bool,
+    flag: Option<&str>,
+    profile_setting: Option<&str>,
+) -> Option<String> {
+    if no_relay {
+        return None;
+    }
+    if let Some(url) = flag {
+        return Some(url.to_owned());
+    }
+    match profile_setting.map(str::trim) {
+        Some("disabled") => None,
+        Some(url) if !url.is_empty() => Some(url.to_owned()),
+        _ => Some(ciss_iroh::DEFAULT_RELAY_URL.to_owned()),
+    }
+}
+
+/// The profile's persisted relay setting (`<profile_dir>/relay`, one line:
+/// a URL or `disabled`), if the file exists.
+#[must_use]
+pub fn profile_relay_setting(config: &crate::config::Config) -> Option<String> {
+    std::fs::read_to_string(config.profile_dir().join("relay")).ok()
+}
+
 /// The per-profile aggregate spend ledger:
 /// `$XDG_DATA_HOME/ciss-ctl/profiles/<profile>/ledger.sqlite` — one ledger
 /// for the account, spanning every synced tree.
@@ -231,4 +261,36 @@ fn to_leaves(leaves: &[(String, u64)]) -> Vec<ManifestLeaf> {
             ManifestLeaf::new(cid, usize::try_from(*size).expect("blob sizes are far below usize::MAX"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_relay;
+
+    /// The relay precedence chain: --no-relay beats everything; an explicit
+    /// --relay beats the profile setting; the profile setting ("disabled"
+    /// opts out) beats the default; the default is relay.croft.ing.
+    #[test]
+    fn relay_precedence() {
+        let d = ciss_iroh::DEFAULT_RELAY_URL;
+        assert_eq!(resolve_relay(false, None, None), Some(d.to_owned()));
+        assert_eq!(resolve_relay(true, None, None), None, "--no-relay wins");
+        assert_eq!(
+            resolve_relay(true, Some("https://x"), Some("https://y")),
+            None,
+            "--no-relay beats everything"
+        );
+        assert_eq!(
+            resolve_relay(false, Some("https://flag"), Some("https://profile")),
+            Some("https://flag".to_owned()),
+            "the flag beats the profile setting"
+        );
+        assert_eq!(
+            resolve_relay(false, None, Some("https://profile")),
+            Some("https://profile".to_owned())
+        );
+        assert_eq!(resolve_relay(false, None, Some("disabled")), None, "profile opt-out");
+        assert_eq!(resolve_relay(false, None, Some("  disabled \n")), None, "trimmed");
+        assert_eq!(resolve_relay(false, None, Some("")), Some(d.to_owned()), "empty = unset");
+    }
 }

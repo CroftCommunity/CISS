@@ -21,7 +21,7 @@ fn hex_of(bytes: &[u8]) -> String {
 /// a cid that does not match the bytes (fail closed, same contract as CISS).
 #[tokio::test]
 async fn local_roundtrip_is_sha256_keyed_and_put_verifies() {
-    let peer = IrohPeer::spawn().await.expect("spawn");
+    let peer = IrohPeer::spawn(None).await.expect("spawn");
     let payload = b"m4: the blake3 half was waiting for this".to_vec();
     let cid = cid_of(&payload);
 
@@ -43,8 +43,8 @@ async fn local_roundtrip_is_sha256_keyed_and_put_verifies() {
 /// the blob over iroh — byte-identical, sha-256 verified on receipt.
 #[tokio::test]
 async fn peer_served_blob_is_byte_identical() {
-    let a = IrohPeer::spawn().await.expect("spawn a");
-    let b = IrohPeer::spawn().await.expect("spawn b");
+    let a = IrohPeer::spawn(None).await.expect("spawn a");
+    let b = IrohPeer::spawn(None).await.expect("spawn b");
     let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let cid = cid_of(&payload);
     a.put(&cid, &payload).await.expect("put");
@@ -63,8 +63,8 @@ async fn peer_served_blob_is_byte_identical() {
 /// the cid; wrong bytes are never returned.
 #[tokio::test]
 async fn unknown_and_poisoned_mappings_fail_closed() {
-    let a = IrohPeer::spawn().await.expect("spawn a");
-    let b = IrohPeer::spawn().await.expect("spawn b");
+    let a = IrohPeer::spawn(None).await.expect("spawn a");
+    let b = IrohPeer::spawn(None).await.expect("spawn b");
     let payload = b"the real content".to_vec();
     let decoy = b"a different blob entirely".to_vec();
     let cid = cid_of(&payload);
@@ -91,8 +91,8 @@ async fn unknown_and_poisoned_mappings_fail_closed() {
 /// no-op would leave the provider serving.)
 #[tokio::test]
 async fn a_shut_down_peer_stops_serving() {
-    let a = IrohPeer::spawn().await.expect("spawn a");
-    let b = IrohPeer::spawn().await.expect("spawn b");
+    let a = IrohPeer::spawn(None).await.expect("spawn a");
+    let b = IrohPeer::spawn(None).await.expect("spawn b");
     let payload = b"bytes that die with the provider".to_vec();
     let cid = cid_of(&payload);
     a.put(&cid, &payload).await.expect("put");
@@ -105,6 +105,50 @@ async fn a_shut_down_peer_stops_serving() {
     if let Ok(Ok(_)) = fetch {
         panic!("a shut-down peer must not serve blobs");
     }
+    b.shutdown().await;
+}
+
+/// The degradation guarantee, hermetic: peers configured with an
+/// UNREACHABLE relay still serve blobs over direct paths — the deployment
+/// default (relay.croft.ing) can never break LAN-only or offline use.
+/// (The provider's advertised addr is rewritten to loopback: a
+/// relay-configured peer binds all interfaces, and same-host LAN-IP dialing
+/// trips macOS local-network permission — the loopback socket is the same
+/// socket.)
+#[tokio::test]
+async fn unreachable_relay_never_breaks_direct_paths() {
+    let bad = "https://relay-unreachable.invalid";
+    let a = IrohPeer::spawn(Some(bad)).await.expect("spawn a");
+    let b = IrohPeer::spawn(Some(bad)).await.expect("spawn b");
+    let payload = b"bytes that need no relay".to_vec();
+    let cid = cid_of(&payload);
+    a.put(&cid, &payload).await.expect("put");
+
+    let a_addr = a.addr();
+    let port = a_addr
+        .addrs
+        .iter()
+        .find_map(|t| match t {
+            iroh::TransportAddr::Ip(sa) => Some(sa.port()),
+            _ => None,
+        })
+        .expect("a bound socket");
+    let loopback = iroh::EndpointAddr::from_parts(
+        a_addr.id,
+        [iroh::TransportAddr::Ip((std::net::Ipv4Addr::LOCALHOST, port).into())],
+    );
+    b.learn(&cid, *blake3::hash(&payload).as_bytes(), &loopback).expect("learn");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(30), b.get(&cid))
+        .await
+        .expect("a dead relay must not stall the direct path")
+        .expect("fetch");
+    assert_eq!(got, payload);
+
+    // And a malformed relay URL fails loud at spawn, not mysteriously later.
+    let err = IrohPeer::spawn(Some("not a url")).await.expect_err("bad url refused");
+    assert!(err.to_string().contains("relay url"), "named: {err}");
+
+    a.shutdown().await;
     b.shutdown().await;
 }
 
@@ -185,8 +229,8 @@ impl BlobTransport for MemOrigin {
 /// correct origin fetch — never to wrong bytes, never to an error.
 #[tokio::test]
 async fn peer_first_falls_back_per_blob() {
-    let provider = IrohPeer::spawn().await.expect("spawn provider");
-    let local = IrohPeer::spawn().await.expect("spawn local");
+    let provider = IrohPeer::spawn(None).await.expect("spawn provider");
+    let local = IrohPeer::spawn(None).await.expect("spawn local");
     let origin = MemOrigin::default();
 
     let on_peer = b"blob the peer can serve".to_vec();
@@ -236,7 +280,7 @@ async fn peer_first_falls_back_per_blob() {
 async fn peer_first_delegates_slot_and_have_to_origin() {
     use ciss_sync::ManifestSlot;
 
-    let local = IrohPeer::spawn().await.expect("spawn local");
+    let local = IrohPeer::spawn(None).await.expect("spawn local");
     let origin = MemOrigin::default();
     let t = PeerFirst { peer: &local, origin: &origin };
 

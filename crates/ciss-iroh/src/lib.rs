@@ -93,14 +93,45 @@ pub struct IrohPeer {
     index: MappingIndex,
 }
 
+/// The relay this deployment runs (croft-stack: `relay.croft.ing`, mode B).
+/// The relay is one transport among several — an unreachable relay degrades
+/// to direct paths (probe-verified, and pinned by a hermetic test), so this
+/// default never breaks LAN-only use.
+pub const DEFAULT_RELAY_URL: &str = "https://relay.croft.ing:8443";
+
+/// Resolve an optional relay URL string into a [`RelayMode`].
+fn relay_mode(relay: Option<&str>) -> Result<RelayMode, SyncError> {
+    match relay {
+        None => Ok(RelayMode::Disabled),
+        Some(url) => {
+            let parsed: iroh::RelayUrl = url
+                .parse()
+                .map_err(|e| SyncError::Decode(format!("relay url {url:?}: {e}")))?;
+            Ok(RelayMode::Custom(parsed.into()))
+        }
+    }
+}
+
 impl IrohPeer {
-    /// Bind a loopback endpoint (`presets::Minimal`, relay disabled) — the
-    /// probe-verified recipe shared by [`IrohPeer::spawn`] and the mesh.
-    pub(crate) async fn bind_endpoint(lookup: &MemoryLookup) -> Result<Endpoint, SyncError> {
+    /// Bind an endpoint (`presets::Minimal`) — the probe-verified recipe
+    /// shared by [`IrohPeer::spawn`] and the mesh. The bind posture follows
+    /// the relay choice: relay-less peers bind loopback (the hermetic
+    /// test/LAN-drill posture), relay-configured peers bind all interfaces
+    /// (a peer that expects to be dialed from elsewhere must be reachable
+    /// on more than 127.0.0.1).
+    pub(crate) async fn bind_endpoint(
+        lookup: &MemoryLookup,
+        relay: Option<&str>,
+    ) -> Result<Endpoint, SyncError> {
+        let bind_ip = if relay.is_some() {
+            std::net::Ipv4Addr::UNSPECIFIED
+        } else {
+            std::net::Ipv4Addr::LOCALHOST
+        };
         Endpoint::builder(presets::Minimal)
             .address_lookup(lookup.clone())
-            .relay_mode(RelayMode::Disabled)
-            .bind_addr(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0))
+            .relay_mode(relay_mode(relay)?)
+            .bind_addr(std::net::SocketAddrV4::new(bind_ip, 0))
             .map_err(|e| transport_err("bind_addr", e))?
             .bind()
             .await
@@ -119,21 +150,30 @@ impl IrohPeer {
         Self { endpoint, router, store, downloader, lookup, index: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    /// Bind a loopback endpoint, spawn the blobs protocol behind a router,
-    /// and return a ready peer.
+    /// Bind an endpoint (relay per `relay`; `None` = loopback-only), spawn
+    /// the blobs protocol behind a router, and return a ready peer.
     ///
     /// # Errors
     ///
-    /// Endpoint bind failures surface as [`SyncError::Transport`].
-    pub async fn spawn() -> Result<Self, SyncError> {
+    /// Endpoint bind failures and an unparseable relay URL surface as
+    /// [`SyncError::Transport`] / [`SyncError::Decode`].
+    pub async fn spawn(relay: Option<&str>) -> Result<Self, SyncError> {
         let lookup = MemoryLookup::new();
-        let endpoint = Self::bind_endpoint(&lookup).await?;
+        let endpoint = Self::bind_endpoint(&lookup, relay).await?;
         let store = MemStore::new();
         let blobs = BlobsProtocol::new(&store, None);
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
             .spawn();
         Ok(Self::from_parts(endpoint, router, store, lookup))
+    }
+
+    /// Wait (bounded) until this peer has attached to its home relay — a
+    /// peer is only dialable *through* the relay after this. Returns `true`
+    /// on attach, `false` on timeout (direct paths still work; callers log
+    /// and continue — an unreachable relay must never wedge LAN use).
+    pub async fn await_online(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, self.endpoint.online()).await.is_ok()
     }
 
     pub(crate) fn index_handle(&self) -> MappingIndex {

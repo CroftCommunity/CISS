@@ -182,6 +182,8 @@ ciss-ctl sync status ~/notes                      # present vs evicted, cache us
 ciss-ctl sync converge ~/notes                    # fold all devices' heads; conflicts preserved, never lost
 ciss-ctl sync p2p share ~/notes                   # serve this tree device↔device over iroh; prints a ticket
 ciss-ctl sync p2p converge ~/notes --ticket <t>   # same fold, no server: frontier over gossip, blobs over iroh
+                                                  # p2p rides relay.croft.ing by default (NAT traversal);
+                                                  # --relay <url> / --no-relay, or a profile `relay` file
 ciss-ctl sync price ~/notes                       # pre-flight quote in the server's own tariff; nothing moves
 ciss-ctl sync ceiling ~/notes --cents 500         # spend stops here: over-ceiling syncs defer whole, never bill
 ```
