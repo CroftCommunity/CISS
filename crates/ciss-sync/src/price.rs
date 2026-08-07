@@ -9,9 +9,12 @@ use std::path::Path;
 use crate::backup::plan_push;
 use crate::error::SyncError;
 use crate::state::SyncState;
-use crate::transport::BlobTransport;
+use crate::transport::{BlobTransport, ManifestSlot};
 
-/// What a sync would cost, computed without transferring anything.
+/// The complete cost picture of a sync, computed without transferring
+/// anything: at-rest now, the transfer priced, and at-rest after — the
+/// three numbers stack (the ceiling caps the *transfer*; at-rest is
+/// always queryable and reasoned about separately).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceQuote {
     /// Files in the logical tree.
@@ -22,12 +25,22 @@ pub struct PriceQuote {
     pub chunks_skipped: u64,
     /// Bytes a backup would transfer (chunks + fs-manifest if missing).
     pub bytes: u64,
-    /// Postage in integer cents, by the server's own tariff.
+    /// Transfer postage in integer cents, by the server's own tariff —
+    /// the number the spending ceiling caps.
     pub postage_cents: u64,
+    /// Bytes currently at rest (the committed keep-set — the rent base).
+    pub at_rest_bytes: u64,
+    /// The rent base after this sync commits (this tree's own closure;
+    /// a multi-device keep-set also retains the other heads' closures).
+    pub at_rest_bytes_after: u64,
+    /// Rent run-rate for the post-sync rent base, in integer cents per
+    /// day, by the server's own tariff.
+    pub rent_cents_per_day: u64,
 }
 
-/// Price backing up `dir` to `server`: the have/want diff in bytes and
-/// cents. Read-only on the server; nothing is uploaded or committed.
+/// Price backing up `dir` to `server`: the have/want transfer diff in bytes
+/// and cents, plus the at-rest (rent-base) picture before and after.
+/// Read-only on the server; nothing is uploaded or committed.
 ///
 /// # Errors
 ///
@@ -38,15 +51,23 @@ pub async fn price_backup<S>(
     state: Option<&mut SyncState>,
 ) -> Result<PriceQuote, SyncError>
 where
-    S: BlobTransport + Sync,
+    S: BlobTransport + ManifestSlot + Sync,
 {
     let plan = plan_push(dir, server, state).await?;
+    let at_rest_bytes: u64 = server
+        .keep_set()
+        .await?
+        .map_or(0, |leaves| leaves.iter().map(|(_, size)| size).sum());
+    let at_rest_bytes_after: u64 = plan.needed.iter().map(|(_, size)| size).sum();
     let quote = PriceQuote {
         files: plan.manifest.entries.len() as u64,
         chunks_to_upload: plan.chunks_to_upload,
         chunks_skipped: plan.chunks_total - plan.chunks_to_upload,
         bytes: plan.want_bytes,
         postage_cents: ciss::pricing::postage_cents(plan.want_bytes),
+        at_rest_bytes,
+        at_rest_bytes_after,
+        rent_cents_per_day: ciss::pricing::rent_cents(at_rest_bytes_after),
     };
     tracing::info!(
         files = quote.files,
@@ -54,6 +75,9 @@ where
         skipped = quote.chunks_skipped,
         bytes = quote.bytes,
         postage_cents = quote.postage_cents,
+        at_rest_bytes = quote.at_rest_bytes,
+        at_rest_bytes_after = quote.at_rest_bytes_after,
+        rent_cents_per_day = quote.rent_cents_per_day,
         "priced (pre-flight)"
     );
     Ok(quote)
@@ -76,6 +100,9 @@ mod tests {
                 chunks_skipped: 0,
                 bytes,
                 postage_cents: ciss::pricing::postage_cents(bytes),
+                at_rest_bytes: 0,
+                at_rest_bytes_after: bytes,
+                rent_cents_per_day: ciss::pricing::rent_cents(bytes),
             };
             assert_eq!(quote.postage_cents, cents);
         }
@@ -95,6 +122,30 @@ mod tests {
         }
         async fn get(&self, _cid: &str) -> Result<Vec<u8>, SyncError> {
             unreachable!("pricing must never download")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManifestSlot for Holding {
+        async fn current_seq(&self) -> Result<Option<u64>, SyncError> {
+            Ok(None)
+        }
+        async fn keep_set(&self) -> Result<Option<Vec<(String, u64)>>, SyncError> {
+            Ok(None)
+        }
+        async fn frontier(&self) -> Result<Option<crate::transport::FrontierView>, SyncError> {
+            Ok(None)
+        }
+        async fn commit_keep_set(&self, _: &[(String, u64)], _: u64) -> Result<(), SyncError> {
+            unreachable!("pricing must never commit")
+        }
+        async fn commit_frontier(
+            &self,
+            _: &[(String, u64)],
+            _: u64,
+            _: &std::collections::BTreeMap<String, String>,
+        ) -> Result<(), SyncError> {
+            unreachable!("pricing must never commit")
         }
     }
 

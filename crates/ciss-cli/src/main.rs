@@ -1052,6 +1052,9 @@ async fn sync_price(
                 "chunks_skipped": quote.chunks_skipped,
                 "bytes": quote.bytes,
                 "postage_cents": quote.postage_cents,
+                "at_rest_bytes": quote.at_rest_bytes,
+                "at_rest_bytes_after": quote.at_rest_bytes_after,
+                "rent_cents_per_day": quote.rent_cents_per_day,
             })
         );
     } else {
@@ -1059,6 +1062,10 @@ async fn sync_price(
             "quote: {} file(s), {} chunk(s) to upload ({} already held), {} bytes = {}¢ postage",
             quote.files, quote.chunks_to_upload, quote.chunks_skipped, quote.bytes,
             quote.postage_cents,
+        );
+        println!(
+            "at rest: {} bytes now → {} bytes after this sync (rent {}¢/day)",
+            quote.at_rest_bytes, quote.at_rest_bytes_after, quote.rent_cents_per_day,
         );
     }
     Ok(())
@@ -1182,7 +1189,13 @@ async fn sync_status(
     let placeholders = state.placeholders.all()?;
     let present = count_files(std::path::Path::new(dir))?;
     let cache_bytes = state.cache.total_bytes()?;
-    let seq = server.client().get_manifest(server.did()).await?.map(|m| m.seq());
+    let manifest = server.client().get_manifest(server.did()).await?;
+    let seq = manifest.as_ref().map(ciss::manifest::Manifest::seq);
+    let at_rest: u64 = manifest
+        .as_ref()
+        .map(|m| m.leaves().iter().map(|l| l.size() as u64).sum())
+        .unwrap_or(0);
+    let rent_per_day = ciss::pricing::rent_cents(at_rest);
     if global.json {
         println!(
             "{}",
@@ -1193,6 +1206,8 @@ async fn sync_status(
                 "cache_bytes": cache_bytes,
                 "cache_budget": state.cache.budget(),
                 "keep_set_seq": seq,
+                "at_rest_bytes": at_rest,
+                "rent_cents_per_day": rent_per_day,
             })
         );
     } else {
@@ -1202,6 +1217,7 @@ async fn sync_status(
             state.cache.budget(),
             seq.map_or_else(|| "none".to_owned(), |s| s.to_string()),
         );
+        println!("at rest: {at_rest} bytes (rent {rent_per_day}¢/day)");
         for path in placeholders.keys() {
             println!("  evicted: {path}");
         }

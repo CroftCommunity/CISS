@@ -27,7 +27,8 @@ async fn quote_moves_nothing_and_matches_the_backup() {
     let big: Vec<u8> = (0..2 * 1024 * 1024 + 321).map(|i| (i % 251) as u8).collect();
     fs::write(dir.path().join("big.bin"), big).expect("write");
 
-    // The quote: bytes > 0, cents = the server's own floor tariff.
+    // The quote: bytes > 0, cents = the server's own floor tariff — and the
+    // complete cost picture: at-rest now, transfer priced, at-rest after.
     let quote = price_backup(dir.path(), &server, None).await.expect("price");
     assert_eq!(quote.files, 2);
     assert!(quote.chunks_to_upload >= 3, "the 2 MiB file chunks");
@@ -39,6 +40,16 @@ async fn quote_moves_nothing_and_matches_the_backup() {
         "the twin IS the server's tariff"
     );
     assert!(quote.postage_cents >= 2097, "2 MiB+ is at least 2097¢ at 1¢/KB");
+    assert_eq!(quote.at_rest_bytes, 0, "cold server: nothing at rest yet");
+    assert_eq!(
+        quote.at_rest_bytes_after, quote.bytes,
+        "cold server: everything transferred becomes the rent base — they stack exactly"
+    );
+    assert_eq!(
+        quote.rent_cents_per_day,
+        ciss::pricing::rent_cents(quote.at_rest_bytes_after),
+        "the rent run-rate is the server's own tariff over the post-sync rent base"
+    );
 
     // Pricing moved nothing: no blobs, no keep-set.
     let keypair = ciss::crypto::derive_keypair("flow-master", "pricer");
@@ -55,11 +66,14 @@ async fn quote_moves_nothing_and_matches_the_backup() {
     assert_eq!(report.bytes_uploaded, quote.bytes, "quote == actual transfer");
     assert_eq!(report.chunks_uploaded, quote.chunks_to_upload);
 
-    // Re-price: dedup is priced in — an unchanged tree costs zero.
+    // Re-price: dedup is priced in — an unchanged tree costs zero transfer,
+    // and the at-rest picture stacks: now == after == what the backup put up.
     let again = price_backup(dir.path(), &server, None).await.expect("re-price");
     assert_eq!(again.bytes, 0);
     assert_eq!(again.postage_cents, 0);
     assert_eq!(again.chunks_skipped, quote.chunks_to_upload, "everything already held");
+    assert_eq!(again.at_rest_bytes, quote.at_rest_bytes_after, "at-rest now = last after");
+    assert_eq!(again.at_rest_bytes_after, again.at_rest_bytes, "no change: after == now");
 
     world.shutdown().await;
 }
