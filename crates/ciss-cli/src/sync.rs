@@ -84,6 +84,17 @@ impl ManifestSlot for HttpCiss {
         Ok(manifest.map(|m| m.seq()))
     }
 
+    async fn keep_set(&self) -> Result<Option<Vec<(String, u64)>>, SyncError> {
+        let manifest =
+            self.client.get_manifest(&self.session.did).await.map_err(transport_err)?;
+        Ok(manifest.map(|m| {
+            m.leaves()
+                .iter()
+                .map(|l| (l.cid().to_owned(), l.size() as u64))
+                .collect()
+        }))
+    }
+
     async fn commit_keep_set(
         &self,
         leaves: &[(String, u64)],

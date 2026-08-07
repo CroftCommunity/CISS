@@ -186,6 +186,17 @@ enum SyncCommand {
         /// The directory to back up.
         dir: String,
     },
+    /// Reconstruct a backed-up tree into `dir`, verifying every chunk against
+    /// its content address before it is written. With no `--manifest`, the
+    /// fs-manifest is discovered from the keep-set (cold restore).
+    Restore {
+        /// The directory to restore into.
+        dir: String,
+        /// The fs-manifest cid to restore from (from the backup report);
+        /// omitted = cold-restore discovery.
+        #[arg(long)]
+        manifest: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -496,6 +507,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
         },
+        Commands::Sync(SyncCommand::Restore { dir, manifest }) => match cli.global.identity {
+            IdentityKind::Id => sync_restore(&cli.global, &config, &dir, manifest.as_deref()).await,
+            IdentityKind::Did => anyhow::bail!(
+                "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+            ),
+        },
         Commands::Du => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
@@ -612,6 +629,35 @@ async fn sync_backup(global: &GlobalArgs, config: &config::Config, dir: &str) ->
             report.bytes_uploaded,
             report.fs_manifest_cid,
             report.manifest_seq,
+        );
+    }
+    Ok(())
+}
+
+/// Run a restore for the active `id:` identity and print the report.
+async fn sync_restore(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    manifest: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let report = ciss_sync::restore(std::path::Path::new(dir), &server, manifest).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "files": report.files,
+                "chunks_fetched": report.chunks_fetched,
+                "bytes_fetched": report.bytes_fetched,
+                "fs_manifest_cid": report.fs_manifest_cid,
+            })
+        );
+    } else {
+        println!(
+            "restored {} files: {} chunks fetched ({} bytes), fs-manifest {}",
+            report.files, report.chunks_fetched, report.bytes_fetched, report.fs_manifest_cid,
         );
     }
     Ok(())

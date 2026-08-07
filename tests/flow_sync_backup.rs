@@ -127,6 +127,9 @@ impl ManifestSlot for FailAfter<'_> {
     async fn current_seq(&self) -> Result<Option<u64>, SyncError> {
         self.inner.current_seq().await
     }
+    async fn keep_set(&self) -> Result<Option<Vec<(String, u64)>>, SyncError> {
+        self.inner.keep_set().await
+    }
     async fn commit_keep_set(
         &self,
         leaves: &[(String, u64)],

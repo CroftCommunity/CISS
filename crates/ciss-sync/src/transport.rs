@@ -35,6 +35,10 @@ pub trait ManifestSlot {
     /// The currently committed keep-set seq, if any manifest exists.
     async fn current_seq(&self) -> Result<Option<u64>, SyncError>;
 
+    /// The committed keep-set as `(cid, size)` leaves, if any manifest exists
+    /// (the cold-restore discovery surface: everything this namespace keeps).
+    async fn keep_set(&self) -> Result<Option<Vec<(String, u64)>>, SyncError>;
+
     /// Commit `(cid, size)` leaves as the keep-set at `seq`. A stale `seq`
     /// MUST surface as an error (the server refuses it under I5), never be
     /// retried silently — in M1's one-device world a conflict is an anomaly.
@@ -54,6 +58,19 @@ pub fn verify_server_cid(expected_hex: &str, server_cid: &str) -> Result<(), Syn
     } else {
         Err(SyncError::CidMismatch { expected: expected_hex.to_owned(), got: server_cid.to_owned() })
     }
+}
+
+/// Verify `bytes` content-address to `expected_hex` (sha-256). The engine
+/// runs this on every fetched blob regardless of what the transport promises
+/// — defense in depth that a future transport (iroh, M4) inherits for free.
+///
+/// # Errors
+///
+/// [`SyncError::CidMismatch`] naming the expected cid and the actual digest.
+pub fn verify_content(expected_hex: &str, bytes: &[u8]) -> Result<(), SyncError> {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    verify_server_cid(expected_hex, &crate::chunk::Hash32(digest).to_hex())
 }
 
 /// The want side of have/want: the `(cid, size)` blobs not yet on the server,

@@ -174,6 +174,8 @@ ciss-ctl put note.txt --via s3                    # S3-compat plane → same cid
 ciss-ctl get <cid> --via s3 -o out.txt            # cross-plane fetch (same bytes)
 ciss-ctl meter                                    # receipts + bytes + postage
 ciss-ctl acl set <cid> --class grantees --readers id:<did>   # gate a private object
+ciss-ctl sync backup ~/notes                      # chunked, dedup'd backup; only missing chunks transfer
+ciss-ctl sync restore ~/notes-restored            # byte-identical restore; every chunk verified on receipt
 ```
 
 Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`
