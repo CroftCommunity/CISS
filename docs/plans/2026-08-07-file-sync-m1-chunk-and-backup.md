@@ -9,7 +9,7 @@ status: **EXECUTING (2026-08-07).** Passes 1–3 + foundations review done; OQ1�
 |---|---|---|---|
 | 0 discovery | ✅ | `6515155` | fastcdc 4.0.1 / blake3 1.8.6 / serde_ipld_dagcbor 0.7.0 pinned; probes green |
 | 1 core | ✅ | `410fd9b` | `ciss-sync` crate; 17 tests RED→GREEN; mutants 34/0 missed (chunk+manifest) |
-| 2 backup | ⏳ | — | |
+| 2 backup | ✅ | `8348a58` | `sync backup` end-to-end; flow tests + I5/G3/resume guards; live smoke green |
 | 3 restore | ⏳ | — | |
 parent: `docs/plans/2026-08-07-file-sync-client.md` (milestone ladder; this doc executes **M1**).
 skill: authored under the `phase-plan` three-pass workflow (`coding-agents/skills/phase-plan.md`).
@@ -336,7 +336,19 @@ exactly where a green suite hides holes, per `CLAUDE.md`). Triage every survivor
 in the phase write-up; extend `.cargo/mutants.toml` `exclude_re` only with a per-entry justification
 comment, matching the repo's existing convention.
 
-### Phase 2: transport + backup (`sync backup <dir>`)
+### Phase 2: transport + backup (`sync backup <dir>`) — ✅ SHIPPED (`8348a58`)
+
+**Delivered notes (2026-08-07):** three deviations from the spec, all recorded here. (1) **`HttpCiss`
+lives in `ciss-cli`, not `ciss-sync`** — the CLI must depend on the engine to wire `sync backup`, so the
+engine depending back on `ciss-cli` (the OQ1 reading) would be a package cycle; the dependency points
+`ciss-cli → ciss-sync`, the Client stays single-sourced, and `HttpCiss` is glue beside it. (2) The
+transport addresses blobs by **expected sha-256 hex** rather than `&ChunkRef`, so the fs-manifest blob
+rides the same `put`/`get` path as chunks; `have()` takes no argument (du is whole-namespace, G4).
+(3) The backup **re-reads and re-chunks** each file that owns a wanted chunk (scan keeps refs, not
+ranges) and fails loud (`ChangedDuringBackup`) if the re-chunk no longer matches the scanned manifest —
+the TOCTOU seam made explicit. Also: an interrupted backup provably never commits a keep-set (asserted
+in the resume test). Live smoke against a real server binary: 10 chunks up, `skipped=10` on the re-run,
+seq 1→2, du shows all 11 objects, pricing line present.
 **Goal:** push a directory to CISS — upload only missing chunks + the fs-manifest, commit the keep-set Manifest.
 **Changes:**
 - [ ] `trait BlobTransport { async have(&[sha256])->HaveSet; async put(&ChunkRef,&[u8]); async get(&ChunkRef)->Bytes }`.
