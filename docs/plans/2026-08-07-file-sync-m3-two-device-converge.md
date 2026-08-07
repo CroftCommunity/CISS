@@ -1,7 +1,16 @@
 # CISS file-sync — M3 execution plan (two-device converge, the frontier made real)
 
 date: 2026-08-07
-status: **Planned (condensed passes; the server phase is security-relevant and reasoned in full). EXECUTING.**
+status: **CLOSED (2026-08-07). All three phases shipped; M3 delivered:** *a second device converges,
+and a real conflict is preserved, not lost* — `ciss-ctl sync converge`, the frontier real.
+
+## Outcome Summary
+
+| Phase | Outcome | Commit | Note |
+|---|---|---|---|
+| 1 server `heads` field | ✅ | `a1b2673` | preimage-bound, back-compat proven; manifest mutants: survivor closed, 0 missed |
+| 2 DeviceHead + frontier commit | ✅ | `9e8c8c5` | race-injected retry lands; keep-set covers every head's closure |
+| 3 fold + converge | ✅ | `e4c5a98` | deterministic clock-free fold; fold mutants 9/0; live two-device drill: same cid, diff clean |
 parent: `docs/plans/2026-08-07-file-sync-client.md` (milestone ladder; this doc executes **M3**).
 
 ## Problem Statement
@@ -74,7 +83,7 @@ chain) live in the per-tree SyncState.
 
 ## Phases
 
-### Phase 1: CISS server — additive owner-signed `Manifest.heads` under I5
+### Phase 1: CISS server — additive owner-signed `Manifest.heads` under I5 — ✅ SHIPPED (`a1b2673`)
 **Changes:** `heads: Option<BTreeMap<String, String>>` on `Manifest` (`default` + skip-if-none);
 preimage appends `:heads=<sha256 over "id=cid;"… sorted>` **only when present**; `build_manifest` gains
 the heads param (call sites updated); `verify()` covers it via the preimage; server handlers unchanged
@@ -86,7 +95,7 @@ back-compat guard); `tampered_heads_fails_verify` (add/remove/alter an entry aft
 **Validation:** server-side unit + wiring; this is a signing-surface change → mutation audit on
 `src/manifest.rs` after green.
 
-### Phase 2: engine — `DeviceHead` + the non-lossy frontier commit
+### Phase 2: engine — `DeviceHead` + the non-lossy frontier commit — ✅ SHIPPED (`9e8c8c5`)
 **Changes:** `device_head.rs` (record + kind tag + sign/verify over a domain-tagged preimage);
 `SyncState` gains `device_id()` (profile-level, generated once), `counter`/`last_head`/`base` columns;
 `backup` becomes frontier-aware behind the same API: upload DeviceHead blob, keep-set = ∪ all heads'
@@ -97,7 +106,7 @@ A's read and write; A's retry lands; both heads present; **neither device's chun
 `keep_set_covers_other_head` (the no-data-loss guard, distinct assert); `device_head_chain`
 (counter/parent advance; a bad signature or wrong kind is rejected on read).
 
-### Phase 3: engine + CLI — the fold, conflict-copy, `sync converge`
+### Phase 3: engine + CLI — the fold, conflict-copy, `sync converge` — ✅ SHIPPED (`e4c5a98`)
 **Changes:** `fold.rs` (3-way per-path vs base; the decision table above; deterministic conflict
 naming); `converge` flow (fetch heads' manifests → fold → materialize deltas via the shared
 materializer → commit folded tree as own head → record new base); CLI `sync converge <dir>`; docs.
@@ -122,3 +131,29 @@ roots/profiles, real conflict, verify both converge byte-identically).
   design. Pass-2/3 checks folded in: preimage back-compat guard named RED-first; keep-set-covers-all-heads
   as the phase-2 centerpiece; fold decision table written down before code; server phase carries the
   POSTURE doc update in-phase; mutation audit scoped to `manifest.rs` (signing surface) + `fold.rs`.
+
+### Plan close-out — 2026-08-07
+**Shipped:** the multi-writer frontier, all three phases. `a1b2673` (the ladder's one server change:
+`Manifest.heads` bound into the signing preimage with structural back-compat — absent heads = the legacy
+preimage byte-for-byte; POSTURE B1 extended; a real mutation-audit gap closed on `merkle_root`'s leaf
+binding). `9e8c8c5` (self-verifying `DeviceHead` records; `backup_frontier` with slot discipline +
+bounded stale-seq retry; the keep-set covers every head's closure — proven by a deterministic race
+injection where device B's whole backup lands between A's read and commit). `e4c5a98` (the pure
+clock-free fold with conflict-copy, `sync converge`, and the shared-key two-profile CLI path).
+Observable: two devices with divergent trees each run `sync converge` and land on the **same
+fs-manifest cid**, `diff -r` byte-identical, with a same-path conflict preserved as both contents on
+both devices. Gates: 58→59 suites green, clippy-pedantic 0; mutants — manifest 0 missed, fold 9/0,
+cache/placeholder 41/0 (M2).
+**Stopped or skipped:** rename detection (⏭️ as planned — dedup already moves zero bytes, tested);
+`base`-aware garbage collection of old head chains (each converge's keep-set already drops
+no-longer-referenced closures naturally — deeper history retention policy is an M4+/meer question).
+**Discoveries:** (1) `cargo mutants -p <crate>` runs only that crate's tests — guards living in root
+flow tests are invisible to a sub-crate audit, so the fold's decision table needed (and deserved) its
+own unit kills, including pinning the conflict tiebreak to the *digest*, not the device-name sort
+order the mutant would have silently substituted. (2) The converge algebra self-heals: after A folds,
+B's converge re-derives the identical tree (the winner/loser split re-computes the same way), so
+convergence needs no extra coordination round. (3) Committing local state before folding turns
+"materialize may overwrite" from a data-loss risk into a non-event — every replaced byte is already
+reachable through the device's own head chain. (4) The I5 stale-seq refusal is detected by matching
+the server's error text — our own server, pinned by flow tests, but a typed error code is a
+worthwhile future hardening (noted for the E82 seam work).
