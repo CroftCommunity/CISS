@@ -1,6 +1,6 @@
 [package]
 name = "ciss-cli"
-version = "0.5.6"
+version = "0.6.0"
 edition = "2021"
 publish = false
 description = "ciss-ctl — the CISS client CLI. Owns a client identity keypair, drives the S3 + atproto blob planes over one metered byte-path, and manages gated-read ACLs. Links the server's own crates so client crypto cannot drift from the wire."
