@@ -20,6 +20,7 @@ pub mod backup;
 pub mod cache;
 pub mod chunk;
 pub mod error;
+pub mod evict;
 pub mod index;
 pub mod manifest;
 pub mod placeholder;
@@ -30,6 +31,7 @@ pub mod transport;
 
 pub use backup::{backup, BackupReport};
 pub use cache::ChunkCache;
+pub use evict::{evict, EvictReport};
 pub use placeholder::PlaceholderStore;
 pub use restore::{restore, RestoreReport};
 pub use state::{SyncState, DEFAULT_CACHE_BUDGET};

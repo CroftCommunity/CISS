@@ -9,10 +9,68 @@ use std::path::Path;
 
 use crate::chunk::{chunk_file, ChunkRef};
 use crate::error::SyncError;
-use crate::index::Index;
 use crate::manifest::{DagCbor, ManifestCodec};
 use crate::scan::{scan_tree, scan_tree_indexed};
+use crate::state::SyncState;
 use crate::transport::{missing_blobs, BlobTransport, ManifestSlot};
+
+/// The logical tree a backup commits: the scanned files ∪ the placeholder
+/// entries (evicted files are still part of the tree — dropping them would
+/// let the next keep-set orphan their chunks server-side). A file that
+/// reappeared on disk wins over, and drops, its placeholder.
+fn logical_tree(
+    dir: &Path,
+    state: Option<&mut SyncState>,
+) -> Result<crate::manifest::FsManifest, SyncError> {
+    let Some(s) = state else {
+        return scan_tree(dir);
+    };
+    let mut scanned = scan_tree_indexed(dir, &mut s.index)?;
+    for (path, entry) in s.placeholders.all()? {
+        if scanned.entries.contains_key(&path) {
+            tracing::debug!(path = %path, "file reappeared on disk; dropping placeholder");
+            s.placeholders.remove(&path)?;
+        } else {
+            tracing::debug!(path = %path, "placeholder fills in for evicted file");
+            scanned.insert(&path, entry);
+        }
+    }
+    Ok(scanned)
+}
+
+/// An evicted entry whose chunks the server no longer holds: the local cache
+/// is the only remaining source. Recover from it or fail loud — never commit
+/// a keep-set naming bytes nobody has. Returns (chunks, bytes) re-uploaded.
+async fn recover_evicted_from_cache<S: BlobTransport + Sync>(
+    path: &str,
+    entry_cids: &[String],
+    want_cids: &HashSet<&str>,
+    state: Option<&mut SyncState>,
+    server: &S,
+) -> Result<(u64, u64), SyncError> {
+    let s = state.ok_or_else(|| {
+        SyncError::Transport(format!(
+            "evicted file {path} has chunks the server lost and no state/cache to recover from"
+        ))
+    })?;
+    let (mut chunks, mut bytes_total) = (0u64, 0u64);
+    for cid in entry_cids {
+        if !want_cids.contains(cid.as_str()) {
+            continue;
+        }
+        let bytes = s.cache.get(cid)?.ok_or_else(|| {
+            SyncError::Transport(format!(
+                "evicted file {path}: chunk {} lost server-side and not in the local cache",
+                &cid[..cid.len().min(12)]
+            ))
+        })?;
+        server.put(cid, &bytes).await?;
+        chunks += 1;
+        bytes_total += bytes.len() as u64;
+        tracing::debug!(cid = %&cid[..12], len = bytes.len(), "re-uploaded from cache");
+    }
+    Ok((chunks, bytes_total))
+}
 
 /// What a backup did — the numbers the CLI prints and the flow tests assert.
 #[derive(Debug, Clone)]
@@ -33,8 +91,11 @@ pub struct BackupReport {
 
 /// Back up `dir` to `server`: upload the chunks and fs-manifest the server
 /// lacks, then commit the keep-set (∪ chunk cids + fs-manifest cid) at
-/// `last_seq + 1`. Pass an [`Index`] to skip re-chunking probably-unchanged
-/// files (the index must live *outside* `dir`).
+/// `last_seq + 1`. Pass a [`SyncState`] to use the scan fast-path index and
+/// to merge placeholders: **the logical tree = scanned files ∪ evicted
+/// entries** — an eviction never shrinks the committed tree, and a file that
+/// reappeared on disk wins over (and drops) its placeholder. The state root
+/// must live *outside* `dir`.
 ///
 /// # Errors
 ///
@@ -43,16 +104,14 @@ pub struct BackupReport {
 pub async fn backup<S>(
     dir: &Path,
     server: &S,
-    index: Option<&mut Index>,
+    state: Option<&mut SyncState>,
 ) -> Result<BackupReport, SyncError>
 where
     S: BlobTransport + ManifestSlot + Sync,
 {
-    // 1. Scan.
-    let manifest = match index {
-        Some(idx) => scan_tree_indexed(dir, idx)?,
-        None => scan_tree(dir)?,
-    };
+    // 1. The logical tree: scanned files ∪ placeholder entries.
+    let mut state = state;
+    let manifest = logical_tree(dir, state.as_deref_mut())?;
     let manifest_bytes = DagCbor.encode(&manifest)?;
     let fs_manifest_cid = manifest.content_id()?;
 
@@ -100,6 +159,19 @@ where
             continue;
         }
         let file_path = dir.join(path);
+        if !file_path.exists() {
+            let (n, b) = recover_evicted_from_cache(
+                path,
+                &entry_cids,
+                &want_cids,
+                state.as_deref_mut(),
+                server,
+            )
+            .await?;
+            chunks_uploaded += n;
+            bytes_uploaded += b;
+            continue;
+        }
         let bytes = fs::read(&file_path)
             .map_err(|e| SyncError::Io { path: file_path.clone(), source: e })?;
         let rechunked = chunk_file(&bytes);

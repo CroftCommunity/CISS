@@ -66,4 +66,17 @@ pub enum SyncError {
         /// The manifest key of the file that moved underneath us.
         path: String,
     },
+
+    /// Eviction refused: the file's current bytes are not provably backed
+    /// (every chunk must be in the server's have-set AND the committed
+    /// keep-set). Dropping local bytes that exist nowhere else is data loss.
+    #[error("refusing to evict {path}: {} chunk(s) not backed (first: {})",
+            missing_cids.len(),
+            missing_cids.first().map_or("-", |c| &c[..c.len().min(12)]))]
+    EvictUnbacked {
+        /// The manifest key of the file that was refused.
+        path: String,
+        /// The chunk cids the server does not provably hold.
+        missing_cids: Vec<String>,
+    },
 }

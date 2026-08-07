@@ -181,10 +181,43 @@ enum Commands {
 enum SyncCommand {
     /// Chunk `dir`, upload only the chunks the server lacks plus the
     /// fs-manifest blob, then commit the keep-set manifest (strictly newer
-    /// seq). Set RUST_LOG=info to see the have/want and pricing lines.
+    /// seq). Uses a per-tree state root (scan fast-path + placeholders) so
+    /// evicted files stay part of the committed tree. Set RUST_LOG=info to
+    /// see the have/want and pricing lines.
     Backup {
         /// The directory to back up.
         dir: String,
+        /// Override the state root (default: $XDG_DATA_HOME/ciss-ctl/sync/<tree-id>).
+        #[arg(long)]
+        state_dir: Option<String>,
+        /// Run stateless: no scan index, no placeholder merge. An evicted
+        /// file would fall out of the committed tree — refuse to combine
+        /// with prior evictions.
+        #[arg(long)]
+        no_state: bool,
+    },
+    /// Drop a file's local bytes while keeping it in the backed-up tree.
+    /// Refused unless every chunk is already on the server AND in the
+    /// committed keep-set; chunks are spilled into the local cache (within
+    /// its budget) for cheap re-hydration.
+    Evict {
+        /// The synced directory.
+        dir: String,
+        /// Manifest-relative paths to evict (e.g. `docs/big.bin`).
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
+    /// Show the tree's sync state: present vs evicted files, cache usage
+    /// against its budget, and the committed keep-set seq.
+    Status {
+        /// The synced directory.
+        dir: String,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
     },
     /// Reconstruct a backed-up tree into `dir`, verifying every chunk against
     /// its content address before it is written. With no `--manifest`, the
@@ -501,8 +534,30 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_ls(&cli.global, &config).await,
         },
-        Commands::Sync(SyncCommand::Backup { dir }) => match cli.global.identity {
-            IdentityKind::Id => sync_backup(&cli.global, &config, &dir).await,
+        Commands::Sync(SyncCommand::Backup { dir, state_dir, no_state }) => {
+            match cli.global.identity {
+                IdentityKind::Id => {
+                    sync_backup(&cli.global, &config, &dir, state_dir.as_deref(), no_state).await
+                }
+                IdentityKind::Did => anyhow::bail!(
+                    "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+                ),
+            }
+        }
+        Commands::Sync(SyncCommand::Evict { dir, paths, state_dir }) => {
+            match cli.global.identity {
+                IdentityKind::Id => {
+                    sync_evict(&cli.global, &config, &dir, &paths, state_dir.as_deref()).await
+                }
+                IdentityKind::Did => anyhow::bail!(
+                    "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+                ),
+            }
+        }
+        Commands::Sync(SyncCommand::Status { dir, state_dir }) => match cli.global.identity {
+            IdentityKind::Id => {
+                sync_status(&cli.global, &config, &dir, state_dir.as_deref()).await
+            }
             IdentityKind::Did => anyhow::bail!(
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
@@ -603,11 +658,42 @@ fn emit_man_page() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the state root for a synced tree (explicit override, or the
+/// per-tree default under the user's data dir).
+fn resolve_state(
+    global: &GlobalArgs,
+    dir: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<ciss_sync::SyncState> {
+    let root = match state_dir {
+        Some(p) => std::path::PathBuf::from(p),
+        None => sync::default_state_dir(&global.profile, std::path::Path::new(dir))?,
+    };
+    Ok(ciss_sync::SyncState::open(root)?)
+}
+
 /// Run a backup for the active `id:` identity and print the report.
-async fn sync_backup(global: &GlobalArgs, config: &config::Config, dir: &str) -> anyhow::Result<()> {
+async fn sync_backup(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    state_dir: Option<&str>,
+    no_state: bool,
+) -> anyhow::Result<()> {
     let keypair = identity::load_keypair(config)?;
     let server = sync::HttpCiss::new(server_client(global), keypair);
-    let report = ciss_sync::backup(std::path::Path::new(dir), &server, None).await?;
+    let mut state = if no_state { None } else { Some(resolve_state(global, dir, state_dir)?) };
+    if no_state {
+        if let Ok(existing) = resolve_state(global, dir, state_dir) {
+            anyhow::ensure!(
+                existing.placeholders.all()?.is_empty(),
+                "--no-state refused: this tree has evicted files; a stateless backup would drop \
+                 them from the committed tree"
+            );
+        }
+    }
+    let report =
+        ciss_sync::backup(std::path::Path::new(dir), &server, state.as_mut()).await?;
     if global.json {
         println!(
             "{}",
@@ -630,6 +716,93 @@ async fn sync_backup(global: &GlobalArgs, config: &config::Config, dir: &str) ->
             report.fs_manifest_cid,
             report.manifest_seq,
         );
+    }
+    Ok(())
+}
+
+/// Evict files for the active `id:` identity and print the report.
+async fn sync_evict(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    paths: &[String],
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let report =
+        ciss_sync::evict(std::path::Path::new(dir), &mut state, &server, &path_refs).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "evicted": report.evicted,
+                "bytes_freed": report.bytes_freed,
+                "chunks_cached": report.chunks_cached,
+            })
+        );
+    } else {
+        println!(
+            "evicted {} file(s): {} bytes freed, {} chunk(s) kept in the local cache",
+            report.evicted, report.bytes_freed, report.chunks_cached,
+        );
+    }
+    Ok(())
+}
+
+/// Count regular files under `dir` (symlinks and other non-files skipped).
+fn count_files(dir: &std::path::Path) -> anyhow::Result<u64> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            n += count_files(&entry.path())?;
+        } else if ft.is_file() {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Show local sync state + the committed keep-set seq.
+async fn sync_status(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let state = resolve_state(global, dir, state_dir)?;
+    let placeholders = state.placeholders.all()?;
+    let present = count_files(std::path::Path::new(dir))?;
+    let cache_bytes = state.cache.total_bytes()?;
+    let seq = server.client().get_manifest(server.did()).await?.map(|m| m.seq());
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "present_files": present,
+                "evicted_files": placeholders.len(),
+                "evicted_paths": placeholders.keys().collect::<Vec<_>>(),
+                "cache_bytes": cache_bytes,
+                "cache_budget": state.cache.budget(),
+                "keep_set_seq": seq,
+            })
+        );
+    } else {
+        println!(
+            "{present} file(s) present, {} evicted; cache {cache_bytes}/{} bytes; keep-set seq {}",
+            placeholders.len(),
+            state.cache.budget(),
+            seq.map_or_else(|| "none".to_owned(), |s| s.to_string()),
+        );
+        for path in placeholders.keys() {
+            println!("  evicted: {path}");
+        }
     }
     Ok(())
 }

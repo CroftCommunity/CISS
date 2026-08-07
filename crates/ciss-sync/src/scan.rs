@@ -43,6 +43,20 @@ fn mtime_parts(meta: &fs::Metadata, path: &Path) -> Result<(i64, u32), SyncError
 
 fn entry_for(path: &Path, meta: &fs::Metadata) -> Result<FileEntry, SyncError> {
     let bytes = fs::read(path).map_err(|e| io_err(path, e))?;
+    file_entry_for(path, meta, &bytes)
+}
+
+/// Build the manifest entry for a file whose bytes are already in hand
+/// (shared by the scanner and the evict flow — one derivation, no drift).
+///
+/// # Errors
+///
+/// [`SyncError::Io`] if the mtime cannot be read or represented.
+pub fn file_entry_for(
+    path: &Path,
+    meta: &fs::Metadata,
+    bytes: &[u8],
+) -> Result<FileEntry, SyncError> {
     let (mtime_secs, mtime_nanos) = mtime_parts(meta, path)?;
     #[cfg(unix)]
     let mode = {
@@ -56,7 +70,7 @@ fn entry_for(path: &Path, meta: &fs::Metadata) -> Result<FileEntry, SyncError> {
         mtime_secs,
         mtime_nanos,
         size: bytes.len() as u64,
-        chunks: chunk_file(&bytes).into_iter().map(|c| c.chunk_ref).collect(),
+        chunks: chunk_file(bytes).into_iter().map(|c| c.chunk_ref).collect(),
     })
 }
 
