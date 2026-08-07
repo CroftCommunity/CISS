@@ -1,7 +1,16 @@
 # CISS file-sync — M1 execution plan (chunk core + one-device backup/restore)
 
 date: 2026-08-07
-status: **Pass 1 + 2 + 3 complete; OQ1–OQ6 all resolved; foundations/corpus review folded in (2026-08-07). Ready to execute.**
+status: **EXECUTING (2026-08-07).** Passes 1–3 + foundations review done; OQ1–OQ6 resolved.
+
+## Outcome Summary
+
+| Phase | Outcome | Commit | Note |
+|---|---|---|---|
+| 0 discovery | ✅ | `6515155` | fastcdc 4.0.1 / blake3 1.8.6 / serde_ipld_dagcbor 0.7.0 pinned; probes green |
+| 1 core | ✅ | `410fd9b` | `ciss-sync` crate; 17 tests RED→GREEN; mutants 34/0 missed (chunk+manifest) |
+| 2 backup | ⏳ | — | |
+| 3 restore | ⏳ | — | |
 parent: `docs/plans/2026-08-07-file-sync-client.md` (milestone ladder; this doc executes **M1**).
 skill: authored under the `phase-plan` three-pass workflow (`coding-agents/skills/phase-plan.md`).
 
@@ -254,7 +263,15 @@ worth isolating, and the phases share the `ciss-sync` crate write-set. No worktr
 at Pass 3); no BLOCKING unknown remains. **Met 2026-08-07 — no material plan change (version bump 3.x→4.0.1
 and `usize` params only).**
 
-### Phase 1: chunk + content-address core (`ciss-sync` crate, pure, no network)
+### Phase 1: chunk + content-address core (`ciss-sync` crate, pure, no network) — ✅ SHIPPED (`410fd9b`)
+
+**Delivered notes (2026-08-07):** as specced, plus: the golden test also pins a boundary+parameter digest
+(mutation audit found the tuning constants otherwise unpinned — a min-size drift is invisible in any one
+corpus's cuts, so the params are folded into the digest); `ipld-core` is not a direct dep (nothing uses its
+types — `serde_ipld_dagcbor` pulls it transitively); the index API is `scan_tree_indexed(dir, &mut Index)`
+with hit/miss counters, and the index file must live *outside* the scanned tree (scanning your own mutating
+sqlite poisons the manifest — learned from a RED test). Mutation audit: 39 mutants → 34 caught, 5 unviable,
+0 missed after closing the survivors (boundary/param pin + Debug/expecting diagnostic-contract asserts).
 **Goal:** deterministic chunking + dual-hash + a canonical filesystem manifest, fully unit-tested offline.
 **Changes:**
 - [ ] new `crates/ciss-sync` (lib); workspace member; deps `fastcdc`, `blake3`, `ciss`, `serde`, `rusqlite`,
