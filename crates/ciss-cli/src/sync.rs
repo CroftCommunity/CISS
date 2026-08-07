@@ -7,12 +7,37 @@
 //! OQ1 decision), and `HttpCiss` is the only glue.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use ciss::crypto::Keypair;
 use ciss::manifest::{build_manifest, ManifestLeaf};
-use ciss_sync::{verify_server_cid, BlobTransport, ManifestSlot, SyncError};
+use ciss_sync::{verify_server_cid, BlobTransport, ManifestSlot, SyncError, SyncState};
 
 use crate::client::{session_for, Client, Session};
+
+/// The default state root for (profile, tree): `$XDG_DATA_HOME` (or
+/// `$HOME/.local/share`) `/ciss-ctl/sync/<tree-id>/`. The tree path is
+/// canonicalized first so `./notes` and `/home/u/notes` share state.
+///
+/// # Errors
+///
+/// If the tree path cannot be canonicalized or no home directory is set.
+pub fn default_state_dir(profile: &str, tree: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = tree
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot resolve {}: {e}", tree.display()))?;
+    let data_home = match std::env::var("XDG_DATA_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME")
+                .map_err(|_| anyhow::anyhow!("neither XDG_DATA_HOME nor HOME is set"))?;
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    Ok(data_home
+        .join("ciss-ctl/sync")
+        .join(SyncState::tree_id(profile, &canonical)))
+}
 
 /// A CISS server as the sync engine sees it: blobs over the metered S3 plane,
 /// the keep-set over the signed manifest slot, all as one identity.

@@ -165,7 +165,8 @@ Server change: **none** (runs against v0.5.6 as-is). Frontier is trivial (one he
   byte-identical.
 
 ### M2 — "Local footprint is bounded regardless of logical tree size." (storage optimizer)
-Server change: **none.**
+Server change: **none.** — **✅ M2 SHIPPED 2026-08-07** (`ciss-ctl sync evict|hydrate|status`; execution
+plan `docs/plans/2026-08-07-file-sync-m2-bounded-footprint.md`).
 
 - **P2.1 content-addressed local cache** with a size budget; a chunk is always safe to evict (re-fetchable
   by hash). LRU + pin policy (recent / starred / working-set).
