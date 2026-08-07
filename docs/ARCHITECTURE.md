@@ -166,7 +166,11 @@ The split by crate is deliberate: **`ciss-auth`** is pure crypto (no network) �
 verifies a signature against a key it is handed; **`ciss-resolve`** owns all
 network/cache/timeout (did:plc via `plc.directory`, did:web via `.well-known`)
 behind a `DidResolver` trait, resolving fail-closed with a TTL cache and a pinned
-admin-DID break-glass set. CISS serves its own did:web document at
+admin-DID break-glass set. On the client side, **`ciss-cli`** is the reference
+client (`ciss-ctl`), and **`ciss-sync`** is the file-sync engine (content-defined
+chunking, dual sha-256/blake3 chunk refs, the canonical DAG-CBOR fs-manifest) —
+pure core, no network; the sync transport rides `ciss-cli`'s `Client`
+(plan: `docs/plans/2026-08-07-file-sync-m1-chunk-and-backup.md`). CISS serves its own did:web document at
 `GET /.well-known/did.json`. Full trust model + invariants: `SECURITY-POSTURE.md`
 §4 (A1–A7); design: `docs/notes/atproto-integration-model.md`; decision: ADR 0001.
 

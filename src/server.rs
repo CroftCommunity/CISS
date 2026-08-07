@@ -796,8 +796,7 @@ async fn verify_service_auth_full(
 fn now_unix_s() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// This service's atproto DID (the `aud` a service-auth JWT must name) — from

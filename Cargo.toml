@@ -12,7 +12,7 @@ description = "CISS — Croft Item Storage Server: a PDS-like cooperative metere
 # authentication crate (ADR 0001): it holds the verified-session/`Principal`
 # boundary so authentication can evolve (interim signed session -> atproto
 # OAuth/DPoP) without touching the metering core.
-members = ["crates/ciss-auth", "crates/ciss-resolve", "crates/ciss-cli"]
+members = ["crates/ciss-auth", "crates/ciss-resolve", "crates/ciss-cli", "crates/ciss-sync"]
 resolver = "2"
 
 [dependencies]
@@ -46,6 +46,12 @@ async-trait = "0.1"
 k256 = { version = "0.13", features = ["ecdsa"] }
 multibase = "0.9"
 base64 = "0.22"
+# The sync flow tests (tests/flow_sync_*.rs) drive the real client engine
+# against the in-process server. Dev-dep cycles are fine in cargo.
+ciss-sync = { path = "crates/ciss-sync" }
+ciss-cli = { path = "crates/ciss-cli" }
+async-trait = "0.1"
+tempfile = "3"
 
 [profile.release]
 # Metering arithmetic must never silently wrap: a wrapped byte count corrupts a

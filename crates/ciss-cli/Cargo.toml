@@ -39,6 +39,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Prompt for the bsky app password without echoing it (`ciss-ctl login`).
 rpassword = "7"
+ciss-sync = { version = "0.1.0", path = "../ciss-sync" }
+async-trait = "0.1.91"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 # Serve the real `ciss` App in-process on an ephemeral port, so integration tests
