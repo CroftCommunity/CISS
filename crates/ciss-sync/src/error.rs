@@ -104,4 +104,22 @@ pub enum SyncError {
         /// The seq the refused commit carried.
         attempted: u64,
     },
+
+    /// The sync would take total postage past the configured ceiling, so it
+    /// was deferred **whole** before any byte moved — no partial upload, no
+    /// keep-set commit, nothing billed (E89: throttle/defer, never mint
+    /// debt). Egress of your own data is never gated by this (POSTURE B6).
+    #[error(
+        "sync deferred: total postage would reach {needed_cents}¢ \
+         (spent {spent_cents}¢, ceiling {ceiling_cents}¢) — nothing was transferred; \
+         raise the ceiling or reset the spend ledger to proceed"
+    )]
+    CeilingDeferred {
+        /// The total cents the ledger would reach if this sync ran.
+        needed_cents: u64,
+        /// Cents already on the spend ledger.
+        spent_cents: u64,
+        /// The configured ceiling.
+        ceiling_cents: u64,
+    },
 }

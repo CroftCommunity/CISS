@@ -263,6 +263,25 @@ enum SyncCommand {
         #[arg(long)]
         state_dir: Option<String>,
     },
+    /// Show or set this tree's spending ceiling. A sync that would take
+    /// total postage past the ceiling defers whole — no partial upload,
+    /// nothing billed. Restore/hydrate are never gated (exit-exempt, B6).
+    Ceiling {
+        /// The synced directory.
+        dir: String,
+        /// Set the ceiling to this many cents.
+        #[arg(long, conflicts_with = "clear")]
+        cents: Option<u64>,
+        /// Remove the ceiling.
+        #[arg(long)]
+        clear: bool,
+        /// Clear the spend ledger (start a new period).
+        #[arg(long)]
+        reset_spend: bool,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
     /// Serverless device↔device sync over iroh — no CISS involved: the
     /// frontier rides gossip on a topic derived from the account key, blobs
     /// ride iroh-blobs (blake3/Bao), and the fold is exactly `converge`'s.
@@ -656,6 +675,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
         },
+        Commands::Sync(SyncCommand::Ceiling { dir, cents, clear, reset_spend, state_dir }) => {
+            sync_ceiling(&cli.global, &dir, cents, clear, reset_spend, state_dir.as_deref())
+        }
         Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
             IdentityKind::Id => match cmd {
                 P2pCommand::Share { dir, state_dir } => {
@@ -922,6 +944,45 @@ fn print_converge_report(global: &GlobalArgs, report: &ciss_sync::ConvergeReport
             println!("  conflict preserved: {c}");
         }
     }
+}
+
+/// Show or adjust the tree's spending ceiling and spend ledger.
+fn sync_ceiling(
+    global: &GlobalArgs,
+    dir: &str,
+    cents: Option<u64>,
+    clear: bool,
+    reset_spend: bool,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut state = resolve_state(global, dir, state_dir)?;
+    if let Some(c) = cents {
+        state.set_ceiling_cents(Some(c))?;
+    } else if clear {
+        state.set_ceiling_cents(None)?;
+    }
+    if reset_spend {
+        state.reset_spend()?;
+    }
+    let ceiling = state.ceiling_cents()?;
+    let spent_bytes = state.spent_bytes()?;
+    let spent_cents = state.spent_cents()?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ceiling_cents": ceiling,
+                "spent_bytes": spent_bytes,
+                "spent_cents": spent_cents,
+            })
+        );
+    } else {
+        match ceiling {
+            Some(c) => println!("ceiling: {c}¢ — spent {spent_cents}¢ ({spent_bytes} bytes)"),
+            None => println!("ceiling: none — spent {spent_cents}¢ ({spent_bytes} bytes)"),
+        }
+    }
+    Ok(())
 }
 
 /// Price a backup pre-flight and print the quote — nothing moves.
