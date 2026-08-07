@@ -101,6 +101,70 @@ pub(crate) struct PushedTree {
     pub needed: Vec<(String, u64)>,
 }
 
+/// The transfer plan a push would execute: the tree, its full blob set, and
+/// the have/want complement — everything a pre-flight price or a ceiling
+/// check needs, computed without moving a byte.
+pub(crate) struct PushPlan {
+    pub manifest: crate::manifest::FsManifest,
+    pub manifest_bytes: Vec<u8>,
+    pub fs_manifest_cid: String,
+    /// The full blob set this tree needs, `(cid, size)`.
+    pub needed: Vec<(String, u64)>,
+    /// The subset the server lacks, `(cid, size)`.
+    pub want: Vec<(String, u64)>,
+    pub want_bytes: u64,
+    pub chunks_total: u64,
+    pub chunks_to_upload: u64,
+}
+
+/// Steps 1–3 of a push (logical tree → needed set → have/want), shared by
+/// [`push_tree`] and the M5 pre-flight pricer. Read-only against the server.
+pub(crate) async fn plan_push<S>(
+    dir: &Path,
+    server: &S,
+    state: Option<&mut SyncState>,
+) -> Result<PushPlan, SyncError>
+where
+    S: BlobTransport + Sync,
+{
+    // 1. The logical tree: scanned files ∪ placeholder entries.
+    let manifest = logical_tree(dir, state)?;
+    let manifest_bytes = DagCbor.encode(&manifest)?;
+    let fs_manifest_cid = manifest.content_id()?;
+
+    // 2. The full blob set this tree needs: every distinct chunk + the
+    // fs-manifest blob itself (first-seen order; dedup within the tree).
+    let mut needed: Vec<(String, u64)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for entry in manifest.entries.values() {
+        for c in &entry.chunks {
+            let cid = c.sha256_hex();
+            if seen.insert(cid.clone()) {
+                needed.push((cid, u64::from(c.len)));
+            }
+        }
+    }
+    let chunks_total = needed.len() as u64;
+    needed.push((fs_manifest_cid.clone(), manifest_bytes.len() as u64));
+
+    // 3. have/want.
+    let have = server.have().await?;
+    let want = missing_blobs(needed.clone(), &have);
+    let want_bytes: u64 = want.iter().map(|(_, b)| b).sum();
+    let chunks_to_upload =
+        want.iter().filter(|(c, _)| c != &fs_manifest_cid).count() as u64;
+    Ok(PushPlan {
+        manifest,
+        manifest_bytes,
+        fs_manifest_cid,
+        needed,
+        want,
+        want_bytes,
+        chunks_total,
+        chunks_to_upload,
+    })
+}
+
 /// Back up `dir` to `server`: upload the chunks and fs-manifest the server
 /// lacks, then commit the keep-set (∪ chunk cids + fs-manifest cid) at
 /// `last_seq + 1`. Pass a [`SyncState`] to use the scan fast-path index and
@@ -159,42 +223,51 @@ pub(crate) async fn push_tree<S>(
 where
     S: BlobTransport + Sync,
 {
-    // 1. The logical tree: scanned files ∪ placeholder entries.
     let mut state = state;
-    let manifest = logical_tree(dir, state.as_deref_mut())?;
-    let manifest_bytes = DagCbor.encode(&manifest)?;
-    let fs_manifest_cid = manifest.content_id()?;
-
-    // 2. The full blob set this tree needs: every distinct chunk + the
-    // fs-manifest blob itself (first-seen order; dedup within the tree).
-    let mut needed: Vec<(String, u64)> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for entry in manifest.entries.values() {
-        for c in &entry.chunks {
-            let cid = c.sha256_hex();
-            if seen.insert(cid.clone()) {
-                needed.push((cid, u64::from(c.len)));
-            }
-        }
-    }
-    let chunks_total = needed.len() as u64;
-    needed.push((fs_manifest_cid.clone(), manifest_bytes.len() as u64));
-
-    // 3. have/want.
-    let have = server.have().await?;
-    let want = missing_blobs(needed.clone(), &have);
-    let want_bytes: u64 = want.iter().map(|(_, b)| b).sum();
+    let PushPlan {
+        manifest,
+        manifest_bytes,
+        fs_manifest_cid,
+        needed,
+        want,
+        want_bytes,
+        chunks_total,
+        chunks_to_upload,
+    } = plan_push(dir, server, state.as_deref_mut()).await?;
     let want_cids: HashSet<&str> = want.iter().map(|(c, _)| c.as_str()).collect();
-    let chunks_to_upload =
-        want.iter().filter(|(c, _)| c != &fs_manifest_cid).count() as u64;
-    // The pre-transfer pricing line: the exact number a cost ceiling will
-    // compare against, logged before any byte moves (the M5 cost-twin embryo).
+    // The pre-transfer pricing line (M5): the exact numbers the cost ceiling
+    // compares against, logged before any byte moves.
     tracing::info!(
         chunks = chunks_to_upload,
         bytes = want_bytes,
+        postage_cents = ciss::pricing::postage_cents(want_bytes),
         skipped = chunks_total - chunks_to_upload,
         "will upload"
     );
+
+    // The ceiling (M5): compare the ledger-plus-this-sync total — priced as
+    // a server statement prices it, cents over total bytes — BEFORE any byte
+    // moves. Over means the whole sync defers: no partial tree, no commit,
+    // nothing billed. Reads (restore/hydrate) never pass through here — a
+    // ceiling can throttle spending, never hold data hostage (POSTURE B6).
+    if let Some(state) = state.as_deref_mut() {
+        if let Some(ceiling_cents) = state.ceiling_cents()? {
+            let spent_bytes = state.spent_bytes()?;
+            let spent_cents = ciss::pricing::postage_cents(spent_bytes);
+            let needed_cents = ciss::pricing::postage_cents(spent_bytes + want_bytes);
+            // Defer only a sync that would *add* priced spend past the
+            // ceiling. A 0¢-marginal sync spends nothing and is never
+            // blocked — the ceiling stops new spending, it does not
+            // retroactively freeze free operations.
+            if needed_cents > ceiling_cents && needed_cents > spent_cents {
+                return Err(SyncError::CeilingDeferred {
+                    needed_cents,
+                    spent_cents,
+                    ceiling_cents,
+                });
+            }
+        }
+    }
 
     // 4. Upload missing chunks, re-reading each file that owns one. The
     // re-chunk must reproduce the scanned refs — a file that changed since
@@ -252,6 +325,14 @@ where
         server.put(&fs_manifest_cid, &manifest_bytes).await?;
         bytes_uploaded += manifest_bytes.len() as u64;
         tracing::debug!(cid = %&fs_manifest_cid[..12], len = manifest_bytes.len(), "fs-manifest uploaded");
+    }
+
+    // Ledger the transfer (M5): bytes, not per-sync cents — spent_cents
+    // prices the running total exactly as a server statement would.
+    if bytes_uploaded > 0 {
+        if let Some(state) = state {
+            state.record_spend_bytes(bytes_uploaded)?;
+        }
     }
 
     Ok(PushedTree {

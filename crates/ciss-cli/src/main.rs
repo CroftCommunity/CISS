@@ -253,6 +253,35 @@ enum SyncCommand {
         #[arg(long)]
         manifest: Option<String>,
     },
+    /// Price a backup before sending it: the have/want diff in bytes and
+    /// integer cents, by the server's own linked tariff. Reads only —
+    /// nothing is uploaded, nothing is committed.
+    Price {
+        /// The directory a backup would push.
+        dir: String,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
+    /// Show or set this tree's spending ceiling. A sync that would take
+    /// total postage past the ceiling defers whole — no partial upload,
+    /// nothing billed. Restore/hydrate are never gated (exit-exempt, B6).
+    Ceiling {
+        /// The synced directory.
+        dir: String,
+        /// Set the ceiling to this many cents.
+        #[arg(long, conflicts_with = "clear")]
+        cents: Option<u64>,
+        /// Remove the ceiling.
+        #[arg(long)]
+        clear: bool,
+        /// Clear the spend ledger (start a new period).
+        #[arg(long)]
+        reset_spend: bool,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
     /// Serverless device↔device sync over iroh — no CISS involved: the
     /// frontier rides gossip on a topic derived from the account key, blobs
     /// ride iroh-blobs (blake3/Bao), and the fold is exactly `converge`'s.
@@ -640,6 +669,15 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
         },
+        Commands::Sync(SyncCommand::Price { dir, state_dir }) => match cli.global.identity {
+            IdentityKind::Id => sync_price(&cli.global, &config, &dir, state_dir.as_deref()).await,
+            IdentityKind::Did => anyhow::bail!(
+                "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+            ),
+        },
+        Commands::Sync(SyncCommand::Ceiling { dir, cents, clear, reset_spend, state_dir }) => {
+            sync_ceiling(&cli.global, &dir, cents, clear, reset_spend, state_dir.as_deref())
+        }
         Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
             IdentityKind::Id => match cmd {
                 P2pCommand::Share { dir, state_dir } => {
@@ -906,6 +944,78 @@ fn print_converge_report(global: &GlobalArgs, report: &ciss_sync::ConvergeReport
             println!("  conflict preserved: {c}");
         }
     }
+}
+
+/// Show or adjust the tree's spending ceiling and spend ledger.
+fn sync_ceiling(
+    global: &GlobalArgs,
+    dir: &str,
+    cents: Option<u64>,
+    clear: bool,
+    reset_spend: bool,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut state = resolve_state(global, dir, state_dir)?;
+    if let Some(c) = cents {
+        state.set_ceiling_cents(Some(c))?;
+    } else if clear {
+        state.set_ceiling_cents(None)?;
+    }
+    if reset_spend {
+        state.reset_spend()?;
+    }
+    let ceiling = state.ceiling_cents()?;
+    let spent_bytes = state.spent_bytes()?;
+    let spent_cents = state.spent_cents()?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ceiling_cents": ceiling,
+                "spent_bytes": spent_bytes,
+                "spent_cents": spent_cents,
+            })
+        );
+    } else {
+        match ceiling {
+            Some(c) => println!("ceiling: {c}¢ — spent {spent_cents}¢ ({spent_bytes} bytes)"),
+            None => println!("ceiling: none — spent {spent_cents}¢ ({spent_bytes} bytes)"),
+        }
+    }
+    Ok(())
+}
+
+/// Price a backup pre-flight and print the quote — nothing moves.
+async fn sync_price(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let quote =
+        ciss_sync::price_backup(std::path::Path::new(dir), &server, Some(&mut state)).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "files": quote.files,
+                "chunks_to_upload": quote.chunks_to_upload,
+                "chunks_skipped": quote.chunks_skipped,
+                "bytes": quote.bytes,
+                "postage_cents": quote.postage_cents,
+            })
+        );
+    } else {
+        println!(
+            "quote: {} file(s), {} chunk(s) to upload ({} already held), {} bytes = {}¢ postage",
+            quote.files, quote.chunks_to_upload, quote.chunks_skipped, quote.bytes,
+            quote.postage_cents,
+        );
+    }
+    Ok(())
 }
 
 /// Publish this device's tree into the lineage mesh and serve until ctrl-c.

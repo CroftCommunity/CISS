@@ -101,6 +101,80 @@ impl SyncState {
         Ok(())
     }
 
+    /// The configured spending ceiling in cents, if any (M5 cost twin).
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures; a non-numeric stored value.
+    pub fn ceiling_cents(&self) -> Result<Option<u64>, SyncError> {
+        read_config_u64(&self.dir.join("state.sqlite"), "ceiling_cents")
+    }
+
+    /// Set or clear the spending ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn set_ceiling_cents(&mut self, cents: Option<u64>) -> Result<(), SyncError> {
+        if let Some(c) = cents {
+            return write_config_u64(&self.dir.join("state.sqlite"), "ceiling_cents", c);
+        }
+        let conn = config_conn(&self.dir.join("state.sqlite"))?;
+        conn.execute("DELETE FROM config WHERE key = 'ceiling_cents'", [])?;
+        Ok(())
+    }
+
+    /// Ledger a completed transfer's bytes (M5). The ledger stores bytes and
+    /// derives cents over the *total*, exactly as a server statement does —
+    /// per-sync flooring would under-count against the real bill.
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn record_spend_bytes(&self, bytes: u64) -> Result<(), SyncError> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let conn = spend_conn(&self.dir.join("state.sqlite"))?;
+        conn.execute(
+            "INSERT INTO spend (ts, bytes) VALUES (?1, ?2)",
+            rusqlite::params![ts, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Total transferred bytes on the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn spent_bytes(&self) -> Result<u64, SyncError> {
+        let conn = spend_conn(&self.dir.join("state.sqlite"))?;
+        let total: i64 =
+            conn.query_row("SELECT COALESCE(SUM(bytes), 0) FROM spend", [], |r| r.get(0))?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    /// The ledger priced by the server's own tariff, over total bytes.
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn spent_cents(&self) -> Result<u64, SyncError> {
+        Ok(ciss::pricing::postage_cents(self.spent_bytes()?))
+    }
+
+    /// Clear the spend ledger (a new period).
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn reset_spend(&self) -> Result<(), SyncError> {
+        let conn = spend_conn(&self.dir.join("state.sqlite"))?;
+        conn.execute("DELETE FROM spend", [])?;
+        Ok(())
+    }
+
     /// A stable 16-hex identifier for (profile, tree path) — the state root's
     /// directory name under the per-user data dir.
     #[must_use]
@@ -118,6 +192,18 @@ fn config_conn(db: &Path) -> Result<Connection, SyncError> {
     let conn = Connection::open(db)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    Ok(conn)
+}
+
+fn spend_conn(db: &Path) -> Result<Connection, SyncError> {
+    let conn = Connection::open(db)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS spend (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            bytes INTEGER NOT NULL
+        );",
     )?;
     Ok(conn)
 }
@@ -143,4 +229,62 @@ fn write_config_u64(db: &Path, key: &str, value: u64) -> Result<(), SyncError> {
         rusqlite::params![key, value.to_string()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncState;
+
+    /// The M5 cost-twin state: the ceiling round-trips (set, read, clear)
+    /// and the spend ledger accumulates bytes, pricing the TOTAL — two
+    /// 600-byte transfers are 1200 bytes = 1¢, where per-sync flooring
+    /// would have said 0¢ + 0¢ and under-counted the statement.
+    #[test]
+    fn ceiling_and_spend_ledger_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = SyncState::open(dir.path().join("s")).expect("open");
+
+        assert_eq!(state.ceiling_cents().expect("read"), None, "unset by default");
+        state.set_ceiling_cents(Some(250)).expect("set");
+        assert_eq!(state.ceiling_cents().expect("read"), Some(250));
+        state.set_ceiling_cents(None).expect("clear");
+        assert_eq!(state.ceiling_cents().expect("read"), None);
+
+        assert_eq!(state.spent_bytes().expect("bytes"), 0);
+        assert_eq!(state.spent_cents().expect("cents"), 0);
+        state.record_spend_bytes(600).expect("record");
+        assert_eq!(state.spent_cents().expect("cents"), 0, "600 bytes floors to 0¢");
+        state.record_spend_bytes(600).expect("record");
+        assert_eq!(state.spent_bytes().expect("bytes"), 1200);
+        assert_eq!(state.spent_cents().expect("cents"), 1, "the TOTAL is priced: 1200 → 1¢");
+
+        state.reset_spend().expect("reset");
+        assert_eq!(state.spent_bytes().expect("bytes"), 0, "a new period starts at zero");
+    }
+
+    /// Config is a real round-trip (set → get → overwrite; unknown = None),
+    /// the cache-budget setter persists across a reopen, and the default
+    /// budget is the documented 256 MiB — pinned so plumbing stubs and
+    /// constant drift fail loudly.
+    #[test]
+    fn config_and_cache_budget_persist() {
+        assert_eq!(super::DEFAULT_CACHE_BUDGET, 256 * 1024 * 1024);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("s");
+        {
+            let mut state = SyncState::open(&root).expect("open");
+            assert_eq!(state.cache.budget(), super::DEFAULT_CACHE_BUDGET);
+            assert_eq!(state.config_get("never-set").expect("get"), None);
+            state.config_set("k", "v1").expect("set");
+            assert_eq!(state.config_get("k").expect("get"), Some("v1".to_owned()));
+            state.config_set("k", "v2").expect("overwrite");
+            assert_eq!(state.config_get("k").expect("get"), Some("v2".to_owned()));
+            state.set_cache_budget(12_345).expect("set budget");
+            assert_eq!(state.cache.budget(), 12_345, "applied immediately");
+        }
+        let reopened = SyncState::open(&root).expect("reopen");
+        assert_eq!(reopened.cache.budget(), 12_345, "budget persisted");
+        assert_eq!(reopened.config_get("k").expect("get"), Some("v2".to_owned()));
+    }
 }

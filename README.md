@@ -182,6 +182,8 @@ ciss-ctl sync status ~/notes                      # present vs evicted, cache us
 ciss-ctl sync converge ~/notes                    # fold all devices' heads; conflicts preserved, never lost
 ciss-ctl sync p2p share ~/notes                   # serve this tree device↔device over iroh; prints a ticket
 ciss-ctl sync p2p converge ~/notes --ticket <t>   # same fold, no server: frontier over gossip, blobs over iroh
+ciss-ctl sync price ~/notes                       # pre-flight quote in the server's own tariff; nothing moves
+ciss-ctl sync ceiling ~/notes --cents 500         # spend stops here: over-ceiling syncs defer whole, never bill
 ```
 
 Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`
