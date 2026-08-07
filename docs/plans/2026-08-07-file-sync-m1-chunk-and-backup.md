@@ -204,6 +204,18 @@ known cost, not an oversight.
   `EnvFilter` subscriber to `ciss-ctl`.
 - **(Pass 3) mutation tooling:** `.cargo/mutants.toml` exists (accessor exclusions with per-entry
   justification comments) — `cargo mutants` is the configured tool for the Phase 1 mutation audit.
+- **(Phase 0, 2026-08-07) D1 — `fastcdc` pinned at 4.0.1** (plan guessed 3.x; 4.x is current). API:
+  `fastcdc::v2020::FastCDC::new(&[u8], min: usize, avg: usize, max: usize)` (params are `usize` in 4.x),
+  iterator of `Chunk{offset, length}`. Probe evidence (8 MiB LCG corpus, 64K/256K/1M): deterministic across
+  runs; max chunk 1,048,576 (cap respected); full coverage; 20/21 chunks byte-identical after a 1-byte
+  insert at 4 MiB (locality).
+- **(Phase 0) D2 — `blake3` pinned at 1.8.6.** `blake3::hash(&[u8]) -> Hash`; `.as_bytes() -> &[u8; 32]`;
+  `.to_hex()` (64 chars); streaming `Hasher::new/update/finalize` equals one-shot (probe-verified).
+- **(Phase 0) D5 — `serde_ipld_dagcbor` pinned at 0.7.0** (pulls `ipld-core` 0.4.3, compatible with the
+  workspace's `0.4`). `to_vec`/`from_slice`; probe evidence: repeat-stable bytes, insertion-order-stable,
+  round-trip exact. Bonus: the encoder emits **canonical DAG-CBOR key order on the wire** (length-first —
+  observed `"b"` before `"aa"` against BTreeMap iteration order), so wire determinism does not depend on
+  the map type; BTreeMap kept for deterministic in-memory iteration.
 
 ## Documentation Impact
 
@@ -226,25 +238,21 @@ worth isolating, and the phases share the `ciss-sync` crate write-set. No worktr
 
 ## Phases
 
-### Phase 0: Discovery
+### Phase 0: Discovery — ✅ SHIPPED (probes run 2026-08-07; findings in Verified Assumptions)
 **Goal:** pin the two external deps and confirm the `ciss` crate re-exports, before building on them.
-- [ ] **D1: FastCDC crate + params.** Probe: add `fastcdc` (latest 3.x), read its chunker API; confirm
-  min/avg/max are configurable and `max < 2 MiB` is settable; confirm pure-Rust, maintained, deterministic
-  boundaries. **Success:** a version pinned + the exact constructor/iterator call recorded here. **Disposition:**
-  throwaway. *(If sandbox egress blocks the fetch, escalate — user runs `! cargo add fastcdc -p ciss-sync`.)*
-- [ ] **D2: blake3 crate.** Probe: add `blake3`; confirm `blake3::hash(&[u8]) -> Hash` + hex/`[u8;32]` access
-  and streaming hasher. **Success:** version pinned + API recorded. **Disposition:** throwaway.
+- [x] **D1: FastCDC crate + params.** **DONE — pinned 4.0.1** (usize params; deterministic; cap + locality
+  probe-verified; see VA). Probe project deleted per throwaway disposition.
+- [x] **D2: blake3 crate.** **DONE — pinned 1.8.6** (API verified; see VA). Throwaway honored.
 - [x] **D3: `ciss` crate re-exports.** ~~Probe: read `src/lib.rs`~~ **RESOLVED at Pass 3 (planning-time
   read)** — all imports `pub` and reachable; evidence in Verified Assumptions. No execution-time work.
 - [x] **D4: manifest wire contract.** ~~Probe: read `put_manifest_handler`~~ **RESOLVED at Pass 3
   (planning-time read)** — `x-croft-pubkey` header only (self-authorizing, no session header), JSON body =
   `Manifest` serde; evidence in Verified Assumptions. No execution-time work.
-- [ ] **D5: DAG-CBOR codec (canonical, deterministic).** Probe: confirm `ipld-core` (already a CISS dep) +
-  add a DAG-CBOR codec (`serde_ipld_dagcbor` or equivalent); verify it produces **deterministic** bytes
-  (sorted keys, definite lengths) so `content_id` over an `FsManifest` is stable across runs. **Success:**
-  crate/version pinned + a round-trip + a byte-determinism check recorded. **Disposition:** throwaway.
+- [x] **D5: DAG-CBOR codec (canonical, deterministic).** **DONE — pinned `serde_ipld_dagcbor` 0.7.0**
+  (deterministic canonical key order on the wire, round-trip exact; see VA). Throwaway honored.
 **Done when:** D1, D2, D5 recorded in Verified Assumptions with concrete evidence (D3/D4 already resolved
-at Pass 3); no BLOCKING unknown remains.
+at Pass 3); no BLOCKING unknown remains. **Met 2026-08-07 — no material plan change (version bump 3.x→4.0.1
+and `usize` params only).**
 
 ### Phase 1: chunk + content-address core (`ciss-sync` crate, pure, no network)
 **Goal:** deterministic chunking + dual-hash + a canonical filesystem manifest, fully unit-tested offline.
