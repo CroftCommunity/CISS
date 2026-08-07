@@ -46,6 +46,12 @@ async-trait = "0.1"
 k256 = { version = "0.13", features = ["ecdsa"] }
 multibase = "0.9"
 base64 = "0.22"
+# The sync flow tests (tests/flow_sync_*.rs) drive the real client engine
+# against the in-process server. Dev-dep cycles are fine in cargo.
+ciss-sync = { path = "crates/ciss-sync" }
+ciss-cli = { path = "crates/ciss-cli" }
+async-trait = "0.1"
+tempfile = "3"
 
 [profile.release]
 # Metering arithmetic must never silently wrap: a wrapped byte count corrupts a

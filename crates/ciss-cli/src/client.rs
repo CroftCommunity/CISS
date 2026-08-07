@@ -527,6 +527,51 @@ impl Client {
         resp.json::<Usage>().await.context("parse du response")
     }
 
+    /// `PUT /{did}/manifest` — commit a signed keep-set manifest. The manifest
+    /// is self-authorizing (the presented pubkey must derive the DID and have
+    /// signed it), so only `x-croft-pubkey` is sent — no session header. The
+    /// server refuses a seq that is not strictly newer than the stored one (I5).
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status (a stale seq is a 4xx whose
+    /// body names the seq conflict).
+    pub async fn put_manifest(
+        &self,
+        session: &Session,
+        manifest: &ciss::manifest::Manifest,
+    ) -> Result<()> {
+        let url = format!("{}/{}/manifest", self.base, session.did);
+        let body = serde_json::to_vec(manifest).context("serialize manifest")?;
+        let resp = self
+            .send(
+                self.http.put(&url).header("x-croft-pubkey", &session.pubkey).body(body),
+                "manifest commit",
+            )
+            .await?;
+        self.ensure_success(resp, "manifest commit").await?;
+        Ok(())
+    }
+
+    /// `GET /{did}/manifest` — the committed keep-set manifest, if one exists
+    /// (`None` on 404: a cold namespace). Anonymous: the manifest is a signed,
+    /// world-readable record.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error, a non-2xx/404 status, or an unparseable body.
+    pub async fn get_manifest(&self, did: &str) -> Result<Option<ciss::manifest::Manifest>> {
+        let url = format!("{}/{}/manifest", self.base, did);
+        let resp = self.send(self.http.get(&url), "manifest fetch").await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let resp = self.ensure_success(resp, "manifest fetch").await?;
+        let manifest: ciss::manifest::Manifest =
+            resp.json().await.context("parse manifest response")?;
+        Ok(Some(manifest))
+    }
+
     /// Send a request, translating a connect/timeout failure into an actionable
     /// "server unreachable" error rather than a raw reqwest string.
     async fn send(

@@ -342,7 +342,9 @@ dependencies = [
  "axum",
  "base64",
  "ciss-auth",
+ "ciss-cli",
  "ciss-resolve",
+ "ciss-sync",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hex",
@@ -355,6 +357,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",
@@ -385,10 +388,12 @@ name = "ciss-cli"
 version = "0.5.6"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "ciss",
  "ciss-auth",
  "ciss-resolve",
+ "ciss-sync",
  "clap",
  "clap_mangen",
  "getrandom 0.2.17",
@@ -401,6 +406,8 @@ dependencies = [
  "ssh-key",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 
@@ -421,6 +428,7 @@ dependencies = [
 name = "ciss-sync"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "ciss",
  "fastcdc",

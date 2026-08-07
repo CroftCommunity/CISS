@@ -43,4 +43,27 @@ pub enum SyncError {
     /// A scanned path was not valid UTF-8 and cannot be a manifest key.
     #[error("path is not valid utf-8: {0:?}")]
     NonUtf8Path(PathBuf),
+
+    /// The server assigned a different cid than we derived locally (G3): a
+    /// lying or misrouting server, or local hashing drift. Always fatal —
+    /// a chunk stored under the wrong address is silent corruption later.
+    #[error("server cid {got} != local sha-256 {expected} — refusing to trust the transfer")]
+    CidMismatch {
+        /// Our locally derived sha-256 hex.
+        expected: String,
+        /// The cid the server claims it stored.
+        got: String,
+    },
+
+    /// The transport failed (connect error, non-2xx, interrupted stream).
+    #[error("transport: {0}")]
+    Transport(String),
+
+    /// A file's bytes changed between scan and upload (TOCTOU) — the manifest
+    /// no longer describes what would be uploaded, so the backup must restart.
+    #[error("{path} changed between scan and upload — re-run the backup")]
+    ChangedDuringBackup {
+        /// The manifest key of the file that moved underneath us.
+        path: String,
+    },
 }

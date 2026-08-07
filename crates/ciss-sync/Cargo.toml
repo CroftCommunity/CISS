@@ -17,6 +17,7 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
+async-trait = "0.1.91"
 
 [dev-dependencies]
 # The server's own crypto is the oracle the dual-hash guard checks against —

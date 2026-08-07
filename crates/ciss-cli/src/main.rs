@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use ciss_cli::client::Plane;
-use ciss_cli::{atproto, client, commands, config, identity};
+use ciss_cli::{atproto, client, commands, config, identity, sync};
 
 /// Which identity plane the client acts under.
 ///
@@ -166,9 +166,26 @@ enum Commands {
     #[command(subcommand)]
     Acl(AclCommand),
 
+    /// Back up a directory to your namespace (chunked, dedup'd, keep-set
+    /// committed) or restore it. File-sync M1; `id:` plane only — the keep-set
+    /// manifest must be signed by the namespace key.
+    #[command(subcommand)]
+    Sync(SyncCommand),
+
     /// Emit a roff man page for `ciss-ctl` to stdout (used by packaging).
     #[command(hide = true)]
     Man,
+}
+
+#[derive(Subcommand, Debug)]
+enum SyncCommand {
+    /// Chunk `dir`, upload only the chunks the server lacks plus the
+    /// fs-manifest blob, then commit the keep-set manifest (strictly newer
+    /// seq). Set RUST_LOG=info to see the have/want and pricing lines.
+    Backup {
+        /// The directory to back up.
+        dir: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -473,6 +490,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_ls(&cli.global, &config).await,
         },
+        Commands::Sync(SyncCommand::Backup { dir }) => match cli.global.identity {
+            IdentityKind::Id => sync_backup(&cli.global, &config, &dir).await,
+            IdentityKind::Did => anyhow::bail!(
+                "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+            ),
+        },
         Commands::Du => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
@@ -563,7 +586,48 @@ fn emit_man_page() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a backup for the active `id:` identity and print the report.
+async fn sync_backup(global: &GlobalArgs, config: &config::Config, dir: &str) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let report = ciss_sync::backup(std::path::Path::new(dir), &server, None).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "files": report.files,
+                "chunks_total": report.chunks_total,
+                "chunks_uploaded": report.chunks_uploaded,
+                "bytes_uploaded": report.bytes_uploaded,
+                "fs_manifest_cid": report.fs_manifest_cid,
+                "manifest_seq": report.manifest_seq,
+            })
+        );
+    } else {
+        println!(
+            "backed up {} files: {}/{} chunks uploaded ({} bytes), fs-manifest {}, keep-set seq {}",
+            report.files,
+            report.chunks_uploaded,
+            report.chunks_total,
+            report.bytes_uploaded,
+            report.fs_manifest_cid,
+            report.manifest_seq,
+        );
+    }
+    Ok(())
+}
+
+/// Engine diagnostics (`ciss-sync`'s tracing) surface via `RUST_LOG`, default
+/// `warn` so plain CLI output stays clean — the server's `init_tracing`
+/// convention (OQ6).
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
     dispatch(Cli::parse()).await
 }
