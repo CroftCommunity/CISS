@@ -253,6 +253,37 @@ enum SyncCommand {
         #[arg(long)]
         manifest: Option<String>,
     },
+    /// Serverless device↔device sync over iroh — no CISS involved: the
+    /// frontier rides gossip on a topic derived from the account key, blobs
+    /// ride iroh-blobs (blake3/Bao), and the fold is exactly `converge`'s.
+    #[command(subcommand)]
+    P2p(P2pCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum P2pCommand {
+    /// Publish this device's tree into the mesh and stay up serving blobs +
+    /// announcements. Prints the pairing ticket the other device dials.
+    Share {
+        /// The synced directory.
+        dir: String,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
+    /// Dial a sharing device and converge with it — commit local state,
+    /// fold, materialize, re-announce. The server can be offline; it is
+    /// never contacted.
+    Converge {
+        /// The synced directory.
+        dir: String,
+        /// The pairing ticket printed by `sync p2p share` on the other device.
+        #[arg(long)]
+        ticket: String,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -609,6 +640,20 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
         },
+        Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
+            IdentityKind::Id => match cmd {
+                P2pCommand::Share { dir, state_dir } => {
+                    sync_p2p_share(&cli.global, &config, &dir, state_dir.as_deref()).await
+                }
+                P2pCommand::Converge { dir, ticket, state_dir } => {
+                    sync_p2p_converge(&cli.global, &config, &dir, &ticket, state_dir.as_deref())
+                        .await
+                }
+            },
+            IdentityKind::Did => anyhow::bail!(
+                "sync uses the id: identity — device heads must be signed by the namespace key"
+            ),
+        },
         Commands::Du => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
@@ -830,6 +875,12 @@ async fn sync_converge(
     let device = sync::device_id(config)?;
     let report =
         ciss_sync::converge(std::path::Path::new(dir), &mut state, &server, &device).await?;
+    print_converge_report(global, &report);
+    Ok(())
+}
+
+/// Shared converge-report rendering (server-backed and p2p paths).
+fn print_converge_report(global: &GlobalArgs, report: &ciss_sync::ConvergeReport) {
     if global.json {
         println!(
             "{}",
@@ -855,6 +906,61 @@ async fn sync_converge(
             println!("  conflict preserved: {c}");
         }
     }
+}
+
+/// Publish this device's tree into the lineage mesh and serve until ctrl-c.
+async fn sync_p2p_share(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let device = sync::device_id(config)?;
+    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[]).await?;
+    let report =
+        ciss_sync::backup_frontier(std::path::Path::new(dir), &mesh, &mut state, &device).await?;
+    let ticket = ciss_iroh::ticket_for(&mesh.addr())?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ticket": ticket,
+                "device_id": device,
+                "fs_manifest_cid": report.fs_manifest_cid,
+                "files": report.files,
+            })
+        );
+    } else {
+        println!("sharing {} file(s) as device {device}", report.files);
+        println!("pairing ticket (run on the other device):");
+        println!("  ciss-ctl sync p2p converge <dir> --ticket {ticket}");
+    }
+    eprintln!("serving blobs + announcements; ctrl-c to stop");
+    tokio::signal::ctrl_c().await?;
+    mesh.shutdown().await;
+    Ok(())
+}
+
+/// Dial a sharing device and converge with it — no server involved.
+async fn sync_p2p_converge(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    ticket: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let device = sync::device_id(config)?;
+    let peer_addr = ciss_iroh::addr_from_ticket(ticket)?;
+    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[peer_addr]).await?;
+    mesh.await_devices(1, std::time::Duration::from_secs(30)).await?;
+    let report =
+        ciss_sync::converge(std::path::Path::new(dir), &mut state, &mesh, &device).await?;
+    print_converge_report(global, &report);
+    mesh.shutdown().await;
     Ok(())
 }
 

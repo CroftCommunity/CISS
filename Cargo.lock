@@ -621,6 +621,7 @@ dependencies = [
  "axum",
  "ciss",
  "ciss-auth",
+ "ciss-iroh",
  "ciss-resolve",
  "ciss-sync",
  "clap",

@@ -14,8 +14,12 @@
 
 #![warn(missing_docs)]
 
+mod mesh;
+
+pub use mesh::{addr_from_ticket, ticket_for, MeshPeer, ANNOUNCE_KIND};
+
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ciss_sync::{BlobTransport, SyncError};
 use iroh::address_lookup::memory::MemoryLookup;
@@ -42,10 +46,38 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// What the peer knows about one sha-256 cid: its blake3 alias, who is
 /// believed to hold it, and whether the local store holds it.
 #[derive(Debug, Clone)]
-struct Mapping {
-    blake3: Hash,
-    providers: Vec<EndpointId>,
-    local: bool,
+pub(crate) struct Mapping {
+    pub(crate) blake3: Hash,
+    pub(crate) providers: Vec<EndpointId>,
+    pub(crate) local: bool,
+}
+
+pub(crate) type MappingIndex = Arc<Mutex<HashMap<String, Mapping>>>;
+
+/// Register (or extend) a sha256→blake3 mapping in `index`, optionally
+/// adding a provider; a full provider address also lands in `lookup` so the
+/// endpoint can dial it.
+pub(crate) fn register_mapping(
+    index: &MappingIndex,
+    lookup: &MemoryLookup,
+    cid_hex: &str,
+    blake3: [u8; 32],
+    provider: Option<&EndpointAddr>,
+) {
+    if let Some(addr) = provider {
+        lookup.add_endpoint_info(addr.clone());
+    }
+    let mut index = index.lock().expect("index mutex poisoned");
+    let entry = index.entry(cid_hex.to_owned()).or_insert(Mapping {
+        blake3: Hash::from(blake3),
+        providers: Vec::new(),
+        local: false,
+    });
+    if let Some(addr) = provider {
+        if !entry.providers.contains(&addr.id) {
+            entry.providers.push(addr.id);
+        }
+    }
 }
 
 /// A [`BlobTransport`] backed by iroh-blobs: serves its local blobs to peers
@@ -58,10 +90,35 @@ pub struct IrohPeer {
     store: MemStore,
     downloader: iroh_blobs::api::downloader::Downloader,
     lookup: MemoryLookup,
-    index: Mutex<HashMap<String, Mapping>>,
+    index: MappingIndex,
 }
 
 impl IrohPeer {
+    /// Bind a loopback endpoint (`presets::Minimal`, relay disabled) — the
+    /// probe-verified recipe shared by [`IrohPeer::spawn`] and the mesh.
+    pub(crate) async fn bind_endpoint(lookup: &MemoryLookup) -> Result<Endpoint, SyncError> {
+        Endpoint::builder(presets::Minimal)
+            .address_lookup(lookup.clone())
+            .relay_mode(RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|e| transport_err("bind_addr", e))?
+            .bind()
+            .await
+            .map_err(|e| transport_err("bind", e))
+    }
+
+    /// Assemble a peer from parts (the mesh builds the router itself so it
+    /// can accept the gossip ALPN alongside blobs).
+    pub(crate) fn from_parts(
+        endpoint: Endpoint,
+        router: iroh::protocol::Router,
+        store: MemStore,
+        lookup: MemoryLookup,
+    ) -> Self {
+        let downloader = store.downloader(&endpoint);
+        Self { endpoint, router, store, downloader, lookup, index: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
     /// Bind a loopback endpoint, spawn the blobs protocol behind a router,
     /// and return a ready peer.
     ///
@@ -70,21 +127,21 @@ impl IrohPeer {
     /// Endpoint bind failures surface as [`SyncError::Transport`].
     pub async fn spawn() -> Result<Self, SyncError> {
         let lookup = MemoryLookup::new();
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .address_lookup(lookup.clone())
-            .relay_mode(RelayMode::Disabled)
-            .bind_addr(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0))
-            .map_err(|e| transport_err("bind_addr", e))?
-            .bind()
-            .await
-            .map_err(|e| transport_err("bind", e))?;
+        let endpoint = Self::bind_endpoint(&lookup).await?;
         let store = MemStore::new();
         let blobs = BlobsProtocol::new(&store, None);
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
             .spawn();
-        let downloader = store.downloader(&endpoint);
-        Ok(Self { endpoint, router, store, downloader, lookup, index: Mutex::new(HashMap::new()) })
+        Ok(Self::from_parts(endpoint, router, store, lookup))
+    }
+
+    pub(crate) fn index_handle(&self) -> MappingIndex {
+        Arc::clone(&self.index)
+    }
+
+    pub(crate) fn lookup_handle(&self) -> MemoryLookup {
+        self.lookup.clone()
     }
 
     /// This peer's dialable address (direct sockets; no relay).
@@ -107,16 +164,7 @@ impl IrohPeer {
         blake3: [u8; 32],
         provider: &EndpointAddr,
     ) -> Result<(), SyncError> {
-        self.lookup.add_endpoint_info(provider.clone());
-        let mut index = self.index.lock().expect("index mutex poisoned");
-        let entry = index.entry(cid_hex.to_owned()).or_insert(Mapping {
-            blake3: Hash::from(blake3),
-            providers: Vec::new(),
-            local: false,
-        });
-        if !entry.providers.contains(&provider.id) {
-            entry.providers.push(provider.id);
-        }
+        register_mapping(&self.index, &self.lookup, cid_hex, blake3, Some(provider));
         Ok(())
     }
 
