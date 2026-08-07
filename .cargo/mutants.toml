@@ -28,6 +28,7 @@ exclude_re = [
     "replace IrohPeer::shutdown with ()",
     "replace MeshPeer::shutdown with ()",
     "replace Keypair::label ->",
+    "replace SpendLedger::scope ->",
     "replace Identity::verifying_key ->",
     "replace Ledger::owner_id ->",
     "replace ManifestLeaf::cid ->",

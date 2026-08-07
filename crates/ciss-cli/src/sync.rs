@@ -66,6 +66,27 @@ pub fn default_state_dir(profile: &str, tree: &Path) -> anyhow::Result<PathBuf> 
         .join(SyncState::tree_id(profile, &canonical)))
 }
 
+/// The per-profile aggregate spend ledger:
+/// `$XDG_DATA_HOME/ciss-ctl/profiles/<profile>/ledger.sqlite` — one ledger
+/// for the account, spanning every synced tree.
+///
+/// # Errors
+///
+/// If no home directory is set, or the directory cannot be created.
+pub fn profile_ledger(profile: &str) -> anyhow::Result<ciss_sync::SpendLedger> {
+    let data_home = match std::env::var("XDG_DATA_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME")
+                .map_err(|_| anyhow::anyhow!("neither XDG_DATA_HOME nor HOME is set"))?;
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    let dir = data_home.join("ciss-ctl/profiles").join(profile);
+    std::fs::create_dir_all(&dir)?;
+    Ok(ciss_sync::SpendLedger::open(dir.join("ledger.sqlite"), "profile")?)
+}
+
 /// A CISS server as the sync engine sees it: blobs over the metered S3 plane,
 /// the keep-set over the signed manifest slot, all as one identity.
 pub struct HttpCiss {

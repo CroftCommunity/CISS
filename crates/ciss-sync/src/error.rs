@@ -110,14 +110,16 @@ pub enum SyncError {
     /// keep-set commit, nothing billed (E89: throttle/defer, never mint
     /// debt). Egress of your own data is never gated by this (POSTURE B6).
     #[error(
-        "sync deferred: total postage would reach {needed_cents}¢ \
+        "sync deferred by the {scope} ceiling: total postage would reach {needed_cents}¢ \
          (spent {spent_cents}¢, ceiling {ceiling_cents}¢) — nothing was transferred; \
-         raise the ceiling or reset the spend ledger to proceed"
+         raise the ceiling or start a new spend period to proceed"
     )]
     CeilingDeferred {
+        /// Which ledger deferred it ("tree" / "profile").
+        scope: String,
         /// The total cents the ledger would reach if this sync ran.
         needed_cents: u64,
-        /// Cents already on the spend ledger.
+        /// Cents already on the spend ledger this period.
         spent_cents: u64,
         /// The configured ceiling.
         ceiling_cents: u64,
