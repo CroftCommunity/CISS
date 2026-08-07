@@ -42,8 +42,3 @@ fn server_cid_matches_local() {
         other => panic!("wrong error variant: {other:?}"),
     }
 }
-
-#[test]
-fn ci_gate_bite_check() {
-    assert!(false, "deliberate red: verifying the CI gate bites");
-}
