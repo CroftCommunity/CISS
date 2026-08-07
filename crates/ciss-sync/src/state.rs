@@ -34,6 +34,8 @@ pub struct SyncState {
     pub cache: ChunkCache,
     /// This tree's spend ledger (in `state.sqlite`).
     spend: crate::ledger::SpendLedger,
+    /// The persistent sha256→blake3 alias index (in `state.sqlite`).
+    aliases: crate::aliases::AliasStore,
     /// The optional per-profile aggregate ledger (attached by the CLI).
     profile_spend: Option<crate::ledger::SpendLedger>,
     dir: PathBuf,
@@ -56,9 +58,16 @@ impl SyncState {
             placeholders: PlaceholderStore::open(&db)?,
             cache: ChunkCache::open(dir.join("cache"), budget)?,
             spend: crate::ledger::SpendLedger::open(&db, "tree")?,
+            aliases: crate::aliases::AliasStore::open(&db)?,
             profile_spend: None,
             dir,
         })
+    }
+
+    /// The tree's persistent sha256→blake3 alias index.
+    #[must_use]
+    pub fn aliases(&self) -> &crate::aliases::AliasStore {
+        &self.aliases
     }
 
     /// Persist a new cache budget and reopen the cache under it.

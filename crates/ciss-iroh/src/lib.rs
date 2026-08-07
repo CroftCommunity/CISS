@@ -16,7 +16,7 @@
 
 mod mesh;
 
-pub use mesh::{addr_from_ticket, ticket_for, MeshPeer, ANNOUNCE_KIND};
+pub use mesh::{addr_from_ticket, ticket_for, MeshPeer, MeshPersist, ANNOUNCE_KIND};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -56,16 +56,24 @@ pub(crate) type MappingIndex = Arc<Mutex<HashMap<String, Mapping>>>;
 
 /// Register (or extend) a sha256→blake3 mapping in `index`, optionally
 /// adding a provider; a full provider address also lands in `lookup` so the
-/// endpoint can dial it.
+/// endpoint can dial it. When a durable [`ciss_sync::AliasStore`] is
+/// attached, the alias write-throughs immediately (a persistence failure is
+/// logged, never fatal — it degrades a *future* restart, not this run).
 pub(crate) fn register_mapping(
     index: &MappingIndex,
     lookup: &MemoryLookup,
+    aliases: Option<&ciss_sync::AliasStore>,
     cid_hex: &str,
     blake3: [u8; 32],
     provider: Option<&EndpointAddr>,
 ) {
     if let Some(addr) = provider {
         lookup.add_endpoint_info(addr.clone());
+    }
+    if let Some(store) = aliases {
+        if let Err(e) = store.set(cid_hex, blake3) {
+            tracing::warn!(cid = %cid_hex, error = %e, "alias write-through failed");
+        }
     }
     let mut index = index.lock().expect("index mutex poisoned");
     let entry = index.entry(cid_hex.to_owned()).or_insert(Mapping {
@@ -87,10 +95,12 @@ pub(crate) fn register_mapping(
 pub struct IrohPeer {
     endpoint: Endpoint,
     router: iroh::protocol::Router,
-    store: MemStore,
+    store: iroh_blobs::api::Store,
     downloader: iroh_blobs::api::downloader::Downloader,
     lookup: MemoryLookup,
     index: MappingIndex,
+    /// Optional durable alias index (write-through; see `register_mapping`).
+    aliases: Option<ciss_sync::AliasStore>,
 }
 
 /// The relay this deployment runs (croft-stack: `relay.croft.ing`, mode B).
@@ -139,15 +149,25 @@ impl IrohPeer {
     }
 
     /// Assemble a peer from parts (the mesh builds the router itself so it
-    /// can accept the gossip ALPN alongside blobs).
+    /// can accept the gossip ALPN alongside blobs, and chooses the store —
+    /// in-memory or fs-backed — plus the durable alias index).
     pub(crate) fn from_parts(
         endpoint: Endpoint,
         router: iroh::protocol::Router,
-        store: MemStore,
+        store: iroh_blobs::api::Store,
         lookup: MemoryLookup,
+        aliases: Option<ciss_sync::AliasStore>,
     ) -> Self {
         let downloader = store.downloader(&endpoint);
-        Self { endpoint, router, store, downloader, lookup, index: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            endpoint,
+            router,
+            store,
+            downloader,
+            lookup,
+            index: Arc::new(Mutex::new(HashMap::new())),
+            aliases,
+        }
     }
 
     /// Bind an endpoint (relay per `relay`; `None` = loopback-only), spawn
@@ -160,12 +180,12 @@ impl IrohPeer {
     pub async fn spawn(relay: Option<&str>) -> Result<Self, SyncError> {
         let lookup = MemoryLookup::new();
         let endpoint = Self::bind_endpoint(&lookup, relay).await?;
-        let store = MemStore::new();
+        let store: iroh_blobs::api::Store = (*MemStore::new()).clone();
         let blobs = BlobsProtocol::new(&store, None);
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
             .spawn();
-        Ok(Self::from_parts(endpoint, router, store, lookup))
+        Ok(Self::from_parts(endpoint, router, store, lookup, None))
     }
 
     /// Wait (bounded) until this peer has attached to its home relay — a
@@ -182,6 +202,14 @@ impl IrohPeer {
 
     pub(crate) fn lookup_handle(&self) -> MemoryLookup {
         self.lookup.clone()
+    }
+
+    pub(crate) fn aliases_handle(&self) -> Option<ciss_sync::AliasStore> {
+        self.aliases.clone()
+    }
+
+    pub(crate) fn store_handle(&self) -> iroh_blobs::api::Store {
+        self.store.clone()
     }
 
     /// This peer's dialable address (direct sockets; no relay).
@@ -204,7 +232,7 @@ impl IrohPeer {
         blake3: [u8; 32],
         provider: &EndpointAddr,
     ) -> Result<(), SyncError> {
-        register_mapping(&self.index, &self.lookup, cid_hex, blake3, Some(provider));
+        register_mapping(&self.index, &self.lookup, self.aliases.as_ref(), cid_hex, blake3, Some(provider));
         Ok(())
     }
 
@@ -245,6 +273,11 @@ impl BlobTransport for IrohPeer {
             .add_bytes(bytes.to_vec())
             .await
             .map_err(|e| transport_err("add_bytes", e))?;
+        if let Some(aliases) = &self.aliases {
+            if let Err(e) = aliases.set(cid_hex, *tag.hash.as_bytes()) {
+                tracing::warn!(cid = %cid_hex, error = %e, "alias write-through failed");
+            }
+        }
         let mut index = self.index.lock().expect("index mutex poisoned");
         let entry = index.entry(cid_hex.to_owned()).or_insert(Mapping {
             blake3: tag.hash,

@@ -107,6 +107,17 @@ pub fn addr_from_ticket(ticket: &str) -> Result<EndpointAddr, SyncError> {
     serde_json::from_slice(&json).map_err(|e| SyncError::Decode(format!("ticket json: {e}")))
 }
 
+/// Where a mesh peer's durable state lives: the fs-backed iroh blob store
+/// and the tree's alias index (from `SyncState::aliases`). Both belong to
+/// the per-tree state root — delete the state root, forget the tree.
+#[derive(Debug, Clone)]
+pub struct MeshPersist {
+    /// The fs store root (conventionally `<state_dir>/iroh/`).
+    pub store_dir: std::path::PathBuf,
+    /// The tree's persistent sha256→blake3 index.
+    pub aliases: ciss_sync::AliasStore,
+}
+
 /// A device on the lineage mesh: blobs over iroh-blobs, frontier over
 /// iroh-gossip, `converge()` runs against it unchanged.
 pub struct MeshPeer {
@@ -135,27 +146,65 @@ impl MeshPeer {
     /// `bootstrap` peers (empty = wait to be found). `relay` = `None` binds
     /// loopback-only (tests/LAN drills); a relay URL binds all interfaces
     /// and makes this device dialable through the relay once attached
-    /// ([`MeshPeer::await_online`]).
+    /// ([`MeshPeer::await_online`]). `persist` = `None` keeps everything
+    /// in-memory (process-lifetime, the hermetic posture); a
+    /// [`MeshPersist`] makes blobs and aliases survive restarts — the
+    /// serverless base problem (`SYNC-MODEL.md` §4) dissolves.
     ///
     /// # Errors
     ///
-    /// Endpoint bind or gossip subscribe failures as [`SyncError::Transport`].
+    /// Endpoint bind, store-load, or gossip subscribe failures as
+    /// [`SyncError::Transport`].
     pub async fn spawn(
         keypair: ciss::crypto::Keypair,
         device_id: &str,
         bootstrap: &[EndpointAddr],
         relay: Option<&str>,
+        persist: Option<MeshPersist>,
     ) -> Result<Self, SyncError> {
         let lookup = MemoryLookup::new();
         let endpoint = IrohPeer::bind_endpoint(&lookup, relay).await?;
-        let store = MemStore::new();
+        let (store, aliases): (iroh_blobs::api::Store, Option<ciss_sync::AliasStore>) =
+            match &persist {
+                Some(p) => {
+                    let fs = iroh_blobs::store::fs::FsStore::load(&p.store_dir)
+                        .await
+                        .map_err(|e| transport_err("fs store load", e))?;
+                    ((*fs).clone(), Some(p.aliases.clone()))
+                }
+                None => ((*MemStore::new()).clone(), None),
+            };
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
-        let peer = IrohPeer::from_parts(endpoint, router, store, lookup);
+        let peer = IrohPeer::from_parts(endpoint, router, store, lookup, aliases);
+
+        // Rehydrate the in-memory index from the durable aliases: an alias
+        // whose blob the fs store still holds is local again — this device
+        // can serve (and fold from) last round's bytes with no provider.
+        if let Some(aliases) = peer.aliases_handle() {
+            let store = peer.store_handle();
+            let index = peer.index_handle();
+            let mut local = 0u32;
+            for (cid, blake3) in aliases.all()? {
+                let held = store
+                    .blobs()
+                    .has(iroh_blobs::Hash::from(blake3))
+                    .await
+                    .map_err(|e| transport_err("has", e))?;
+                let mut idx = index.lock().expect("index mutex poisoned");
+                idx.entry(cid).or_insert(crate::Mapping {
+                    blake3: iroh_blobs::Hash::from(blake3),
+                    providers: Vec::new(),
+                    local: held,
+                });
+                local += u32::from(held);
+            }
+            tracing::info!(local, "rehydrated persistent aliases");
+        }
 
         for addr in bootstrap {
             peer.lookup_handle().add_endpoint_info(addr.clone());
@@ -177,6 +226,7 @@ impl MeshPeer {
             Arc::clone(&last_announce),
             peer.index_handle(),
             peer.lookup_handle(),
+            peer.aliases_handle(),
         ));
 
         Ok(Self {
@@ -284,10 +334,11 @@ fn ingest(
     slot: &Mutex<SlotState>,
     index: &MappingIndex,
     lookup: &MemoryLookup,
+    aliases: Option<&ciss_sync::AliasStore>,
     ann: &Announcement,
 ) -> bool {
-    register_mapping(index, lookup, &ann.head_sha256, ann.head_blake3, Some(&ann.addr));
-    register_mapping(index, lookup, &ann.fs_root_sha256, ann.fs_root_blake3, Some(&ann.addr));
+    register_mapping(index, lookup, aliases, &ann.head_sha256, ann.head_blake3, Some(&ann.addr));
+    register_mapping(index, lookup, aliases, &ann.fs_root_sha256, ann.fs_root_blake3, Some(&ann.addr));
     let mut slot = slot.lock().expect("slot mutex poisoned");
     merge_announcement(&mut slot, &ann.device_id, ann.counter, &ann.head_sha256)
 }
@@ -299,6 +350,7 @@ async fn receive_loop(
     last_announce: Arc<Mutex<Option<Announcement>>>,
     index: MappingIndex,
     lookup: MemoryLookup,
+    aliases: Option<ciss_sync::AliasStore>,
 ) {
     while let Some(event) = receiver.next().await {
         match event {
@@ -311,7 +363,7 @@ async fn receive_loop(
                     tracing::debug!(kind = %ann.kind, "ignoring unknown announcement kind");
                     continue;
                 }
-                if ingest(&slot, &index, &lookup, &ann) {
+                if ingest(&slot, &index, &lookup, aliases.as_ref(), &ann) {
                     tracing::info!(
                         device = %ann.device_id,
                         counter = ann.counter,
@@ -365,7 +417,14 @@ impl BlobTransport for MeshPeer {
                 };
                 for entry in manifest.entries.values() {
                     for chunk in &entry.chunks {
-                        register_mapping(&index, &lookup, &chunk.sha256_hex(), chunk.blake3.0, None);
+                        register_mapping(
+                            &index,
+                            &lookup,
+                            self.peer.aliases_handle().as_ref(),
+                            &chunk.sha256_hex(),
+                            chunk.blake3.0,
+                            None,
+                        );
                         let mut idx = index.lock().expect("index mutex poisoned");
                         if let Some(m) = idx.get_mut(&chunk.sha256_hex()) {
                             for p in &providers {

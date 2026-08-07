@@ -1,6 +1,6 @@
 # Serverless persistence: the fs-backed iroh store + the alias index
 
-**Status:** IN PROGRESS
+**Status:** CLOSED — shipped
 **Follow-on to:** M4 (`docs/plans/2026-08-07-file-sync-m4-iroh-peer-fetch.md`,
 the "Out of scope" limitation it named).
 **Server change:** none.
@@ -68,4 +68,27 @@ is a superset of what the cache spill holds for this purpose.
 
 ## Outcome Summary
 
-(to be filled at close-out)
+Shipped on `ciss-persistent-store`. Server change: none.
+
+- `AliasStore` (ciss-sync, sqlite beside the tree's other durable state);
+  `SyncState::aliases()`. Mutants: 11 → 9 caught, 2 unviable, 0 missed.
+- `MeshPersist { store_dir, aliases }` on `MeshPeer::spawn`: fs-backed
+  `FsStore` (both store flavors deref to the shared `Store` handle — the
+  peer's internals didn't change shape), write-through aliasing on every
+  put/learn/announcement/self-prime (persistence failure = WARN, never
+  fatal — it degrades a future restart, not this run), and spawn-time
+  rehydration (aliases whose blobs the store holds are local again). The
+  CLI attaches persistence always (`<state>/iroh/` + the tree's aliases);
+  `None` keeps the hermetic in-memory posture for tests.
+- **Acceptance** (`tests/flow_sync_p2p_restart.rs`, no `World`): converge →
+  kill every mesh → edit both trees → fresh meshes on the same state →
+  round 2 converges to identical trees. **Live drill**: the same story
+  through two real `ciss-ctl` processes per round — round 2, on entirely
+  fresh processes, both devices reached fs-manifest `ddd491cc…`, `diff -r`
+  clean. Before this branch that round failed loud on the base fetch.
+- `SYNC-MODEL.md` §4 updated: the serverless path is now documented as
+  durable; the fail-loud lifetime note remains only for the explicit
+  in-memory posture.
+- P3 of the accepted proposal (ChunkCache as a mesh bytes source) dropped
+  as redundant — the fs store retains a superset of what the cache spill
+  would contribute.
