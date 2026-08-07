@@ -52,7 +52,7 @@ mod tests {
     #[async_trait::async_trait]
     impl DidResolver for SlowResolver {
         async fn resolve(&self, _did: &str, _force: bool) -> Result<ResolvedKeys, ResolveError> {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
             Ok(ResolvedKeys::new("did:key:zNeverReached".to_owned()))
         }
     }
