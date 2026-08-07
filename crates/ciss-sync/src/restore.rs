@@ -4,12 +4,11 @@
 //! A tampered or substituted chunk fails the restore closed: the error names
 //! the cid and the target path, and no partial file is left behind.
 
-use std::fs;
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
 
 use crate::error::SyncError;
 use crate::manifest::{DagCbor, FsManifest, ManifestCodec};
+use crate::materialize::write_verified_file;
 use crate::transport::{verify_content, BlobTransport, ManifestSlot};
 
 /// What a restore did.
@@ -23,10 +22,6 @@ pub struct RestoreReport {
     pub bytes_fetched: u64,
     /// The fs-manifest the tree was restored from.
     pub fs_manifest_cid: String,
-}
-
-fn io_err(path: &Path, source: std::io::Error) -> SyncError {
-    SyncError::Io { path: path.to_path_buf(), source }
 }
 
 /// Cold-restore discovery: find the self-tagged fs-manifest among the
@@ -90,20 +85,13 @@ where
     };
     let manifest: FsManifest = DagCbor.decode(&manifest_bytes)?;
 
-    // 2. Materialize each file: fetch + verify every chunk into a temp file,
-    // set metadata, then rename into place — verify-before-rename means a
-    // failure never leaves a partial file at the final path.
+    // 2. Materialize each file: fetch + verify every chunk, then land it via
+    // the shared verify-before-rename path — a failure never leaves a
+    // partial file at the final path.
     let mut chunks_fetched = 0u64;
     let mut bytes_fetched = 0u64;
     for (path, entry) in &manifest.entries {
         let final_path = dir.join(path);
-        let parent = final_path.parent().expect("manifest paths are relative, never bare root");
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-
-        let tmp_path = parent.join(format!(
-            ".ciss-restore-{}.tmp",
-            final_path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
-        ));
         let mut content = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0));
         for chunk in &entry.chunks {
             let chunk_cid = chunk.sha256_hex();
@@ -119,17 +107,7 @@ where
             tracing::debug!(cid = %&chunk_cid[..12], len = bytes.len(), path = %path, "chunk verified");
             content.extend_from_slice(&bytes);
         }
-        if content.len() as u64 != entry.size {
-            return Err(SyncError::Decode(format!(
-                "{path}: reassembled {} bytes, manifest says {}",
-                content.len(),
-                entry.size
-            )));
-        }
-
-        fs::write(&tmp_path, &content).map_err(|e| io_err(&tmp_path, e))?;
-        restore_metadata(&tmp_path, entry)?;
-        fs::rename(&tmp_path, &final_path).map_err(|e| io_err(&final_path, e))?;
+        write_verified_file(&final_path, path, entry, &content)?;
         tracing::debug!(path = %path, size = entry.size, chunks = entry.chunks.len(), "restored");
     }
 
@@ -149,26 +127,3 @@ where
     Ok(report)
 }
 
-/// Apply `mode` and `mtime` to the restored file. The mtime is an assertion
-/// being replayed, never an ordering input; a pre-epoch mtime is skipped
-/// with a warning rather than guessed at.
-fn restore_metadata(path: &Path, entry: &crate::manifest::FileEntry) -> Result<(), SyncError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))
-            .map_err(|e| io_err(path, e))?;
-    }
-    if entry.mtime_secs >= 0 {
-        let mtime = UNIX_EPOCH
-            + Duration::new(
-                u64::try_from(entry.mtime_secs).expect("not possible: checked non-negative"),
-                entry.mtime_nanos,
-            );
-        let file = fs::File::open(path).map_err(|e| io_err(path, e))?;
-        file.set_modified(mtime).map_err(|e| io_err(path, e))?;
-    } else {
-        tracing::warn!(path = %path.display(), "pre-epoch mtime not restored");
-    }
-    Ok(())
-}

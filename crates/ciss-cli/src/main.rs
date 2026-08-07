@@ -210,6 +210,18 @@ enum SyncCommand {
         #[arg(long)]
         state_dir: Option<String>,
     },
+    /// Bring evicted files' bytes back — from the local cache when it still
+    /// holds them (no metered egress), from the server when it doesn't —
+    /// verified either way. Refuses to overwrite a file that reappeared.
+    Hydrate {
+        /// The synced directory.
+        dir: String,
+        /// Manifest-relative paths to hydrate; omitted = every evicted file.
+        paths: Vec<String>,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
     /// Show the tree's sync state: present vs evicted files, cache usage
     /// against its budget, and the committed keep-set seq.
     Status {
@@ -554,6 +566,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 ),
             }
         }
+        Commands::Sync(SyncCommand::Hydrate { dir, paths, state_dir }) => {
+            match cli.global.identity {
+                IdentityKind::Id => {
+                    sync_hydrate(&cli.global, &config, &dir, &paths, state_dir.as_deref()).await
+                }
+                IdentityKind::Did => anyhow::bail!(
+                    "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+                ),
+            }
+        }
         Commands::Sync(SyncCommand::Status { dir, state_dir }) => match cli.global.identity {
             IdentityKind::Id => {
                 sync_status(&cli.global, &config, &dir, state_dir.as_deref()).await
@@ -747,6 +769,40 @@ async fn sync_evict(
         println!(
             "evicted {} file(s): {} bytes freed, {} chunk(s) kept in the local cache",
             report.evicted, report.bytes_freed, report.chunks_cached,
+        );
+    }
+    Ok(())
+}
+
+/// Hydrate evicted files for the active `id:` identity and print the report.
+async fn sync_hydrate(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    paths: &[String],
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let selection = if path_refs.is_empty() { None } else { Some(path_refs.as_slice()) };
+    let report =
+        ciss_sync::hydrate(std::path::Path::new(dir), &mut state, &server, selection).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "files": report.files,
+                "chunks_from_cache": report.chunks_from_cache,
+                "chunks_from_server": report.chunks_from_server,
+                "bytes_written": report.bytes_written,
+            })
+        );
+    } else {
+        println!(
+            "hydrated {} file(s): {} bytes ({} chunk(s) from cache, {} from the server)",
+            report.files, report.bytes_written, report.chunks_from_cache, report.chunks_from_server,
         );
     }
     Ok(())

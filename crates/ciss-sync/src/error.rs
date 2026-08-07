@@ -79,4 +79,20 @@ pub enum SyncError {
         /// The chunk cids the server does not provably hold.
         missing_cids: Vec<String>,
     },
+
+    /// Hydration refused: a file already exists at the placeholder's path.
+    /// The on-disk file wins — the next backup will commit it and drop the
+    /// placeholder; hydrating over it would destroy new content.
+    #[error("refusing to hydrate {path}: a file already exists there (the on-disk file wins)")]
+    HydrateWouldOverwrite {
+        /// The contested path.
+        path: String,
+    },
+
+    /// Hydration asked for a path that has no placeholder.
+    #[error("no placeholder for {path} — nothing to hydrate")]
+    NoPlaceholder {
+        /// The path with nothing recorded.
+        path: String,
+    },
 }

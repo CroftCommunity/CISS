@@ -176,6 +176,9 @@ ciss-ctl meter                                    # receipts + bytes + postage
 ciss-ctl acl set <cid> --class grantees --readers id:<did>   # gate a private object
 ciss-ctl sync backup ~/notes                      # chunked, dedup'd backup; only missing chunks transfer
 ciss-ctl sync restore ~/notes-restored            # byte-identical restore; every chunk verified on receipt
+ciss-ctl sync evict ~/notes big/video.mov         # drop local bytes (refused unless provably backed)
+ciss-ctl sync hydrate ~/notes                     # bring evicted bytes back (cache first, then server)
+ciss-ctl sync status ~/notes                      # present vs evicted, cache usage, keep-set seq
 ```
 
 Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`
