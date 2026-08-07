@@ -19,6 +19,14 @@ exclude_re = [
     # identical to the original. The `-> true` mutant IS caught (a test asserts
     # every v0 op is not heavy). See ROADMAP_TODO E83/E86.
     "replace Op::is_heavy -> bool with false",
+    # Equivalent mutants (M4 audit): both `shutdown(self)` methods consume
+    # self, so a no-op body still drops the router/endpoint at end of scope
+    # and the peer stops serving either way — proven by the
+    # "shut-down peer stops serving" tests, which pass under BOTH the real
+    # body and the () replacement. Graceful-close vs drop is not observable
+    # from the outside; not a coverage gap.
+    "replace IrohPeer::shutdown with ()",
+    "replace MeshPeer::shutdown with ()",
     "replace Keypair::label ->",
     "replace Identity::verifying_key ->",
     "replace Ledger::owner_id ->",

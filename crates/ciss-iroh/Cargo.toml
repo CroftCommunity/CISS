@@ -1,0 +1,31 @@
+[package]
+name = "ciss-iroh"
+version = "0.1.0"
+edition = "2021"
+description = "iroh transport for the ciss-sync engine: peer blob fetch (blake3/Bao) and serverless gossip frontier"
+license = "AGPL-3.0-only"
+
+[dependencies]
+# Pinned in the M4 plan's Phase 0 discovery (docs/plans/2026-08-07-file-sync-m4-iroh-peer-fetch.md):
+# add_bytes' hash IS blake3(bytes); presets::Minimal supplies the rustls
+# provider; TopicId::from_bytes takes a 32-byte digest.
+iroh = "1.0.3"
+iroh-blobs = "0.103.0"
+iroh-gossip = "0.101.0"
+ciss-sync = { path = "../ciss-sync" }
+ciss = { path = "../.." }
+async-trait = "0.1.91"
+sha2 = "0.10"
+bytes = "1"
+n0-future = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+blake3 = "1.8.6"
+serde_json = "1"
+tempfile = "3"
