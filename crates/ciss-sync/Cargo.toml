@@ -1,0 +1,25 @@
+[package]
+name = "ciss-sync"
+version = "0.1.0"
+edition = "2021"
+description = "File-sync engine over CISS: content-defined chunking, dual-hash refs, canonical fs-manifest"
+license = "AGPL-3.0-only"
+
+[dependencies]
+# Pinned in the M1 plan's Phase 0 discovery (docs/plans/2026-08-07-file-sync-m1-chunk-and-backup.md):
+# fastcdc 4.x takes usize min/avg/max; serde_ipld_dagcbor emits canonical key order on the wire.
+fastcdc = "4.0.1"
+blake3 = "1.8.6"
+serde_ipld_dagcbor = "0.7.0"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# The server's own crypto is the oracle the dual-hash guard checks against —
+# drift between ciss-sync's sha-256 and the server's cid derivation must fail a test.
+ciss = { path = "../.." }
+tempfile = "3"

@@ -149,7 +149,8 @@ lands as a test that was RED against the absent behavior and stays as a regressi
 
 ### M1 — "Back up a directory to CISS and restore it byte-identical." (one device + helper)
 Server change: **none** (runs against v0.5.6 as-is). Frontier is trivial (one head, tracked client-local).
-**Execution plan: `docs/plans/2026-08-07-file-sync-m1-chunk-and-backup.md`** (phase-plan Pass 1+2 done).
+**Execution plan: `docs/plans/2026-08-07-file-sync-m1-chunk-and-backup.md`** (phase-plan Pass 1–3 +
+foundations/corpus review done; executing).
 
 - **P1.1 chunk + content-address core** (new `ciss-sync` crate, no network): FastCDC boundaries; `ChunkRef`
   dual sha256/blake3; a local sqlite index (`path → mtime,mode → [ChunkRef]`); the fs-manifest format +
