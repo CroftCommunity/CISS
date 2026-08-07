@@ -1,7 +1,8 @@
 # CISS file-sync — M1 execution plan (chunk core + one-device backup/restore)
 
 date: 2026-08-07
-status: **EXECUTING (2026-08-07).** Passes 1–3 + foundations review done; OQ1–OQ6 resolved.
+status: **CLOSED (2026-08-07). All four phases shipped; nothing skipped or deferred. M1 delivered:**
+*back up a directory to CISS and restore it byte-identical, uploading only what the server lacks.*
 
 ## Outcome Summary
 
@@ -10,7 +11,7 @@ status: **EXECUTING (2026-08-07).** Passes 1–3 + foundations review done; OQ1�
 | 0 discovery | ✅ | `6515155` | fastcdc 4.0.1 / blake3 1.8.6 / serde_ipld_dagcbor 0.7.0 pinned; probes green |
 | 1 core | ✅ | `410fd9b` | `ciss-sync` crate; 17 tests RED→GREEN; mutants 34/0 missed (chunk+manifest) |
 | 2 backup | ✅ | `8348a58` | `sync backup` end-to-end; flow tests + I5/G3/resume guards; live smoke green |
-| 3 restore | ⏳ | — | |
+| 3 restore | ✅ | `3d21f8c` | `sync restore` + cold discovery; tamper fail-closed; live diff + tamper drill green |
 parent: `docs/plans/2026-08-07-file-sync-client.md` (milestone ladder; this doc executes **M1**).
 skill: authored under the `phase-plan` three-pass workflow (`coding-agents/skills/phase-plan.md`).
 
@@ -415,7 +416,16 @@ the transport.
 **Validation:** Moderate → wiring + unit + exercise the CLI against the in-process server; confirm zero-chunk
 re-backup outside the harness.
 
-### Phase 3: restore + verify (`sync restore <dir>`)
+### Phase 3: restore + verify (`sync restore <dir>`) — ✅ SHIPPED (`3d21f8c`)
+
+**Delivered notes (2026-08-07):** as specced, plus: restore verifies every fetched blob **at the engine
+layer** (`verify_content`), not only inside `HttpCiss::get` — defense in depth the M4 iroh transport
+inherits for free, and what lets the tamper test substitute bytes at the transport seam.
+`ManifestSlot` gained `keep_set()` for the cold-discovery scan (smallest-leaf-first, kind-tag match —
+size alone cannot identify the manifest, since tiny files produce tiny chunks). Atomicity is
+**per-file** (verify-before-rename): files that fully verified before a failure remain — complete and
+correct — while the failing file never appears; the live at-rest drill (server C2 refuses the tampered
+block with a 500; client names cid + path) confirmed exactly this shape.
 **Goal:** reconstruct a backed-up tree byte-identically from the server, verifying every chunk.
 **Changes:**
 - [ ] restore flow: locate the fs-manifest (cold-restore discovery, OQ5) → fetch its chunks via `transport.get`
@@ -585,3 +595,32 @@ exempt; bilateral receipts remain `501` (E82 seam) and join the chunk-tuning rev
 corpus's backfill-admission (contiguity + standing) and freshness-honesty rules become live obligations.
 **Confirmed ready:** yes — all six open questions resolved; execute next (Phase 0: D1/D2/D5, then
 Phases 1–3, commit per phase).
+
+### Plan close-out — 2026-08-07
+**Shipped:** the full M1 capability, all four phases, one execution session. In git: `6515155` (Phase 0
+findings), `8bf2a14` (pre-existing lint drive-bys), `410fd9b` (Phase 1: the `ciss-sync` crate — FastCDC
+chunking 64K/256K/1M with dual sha-256/blake3 `ChunkRef`s, canonical DAG-CBOR `FsManifest` led by the
+`kind` self-tag, `content_id` = the server's own cid derivation, scanner + mtime/size sqlite index),
+`8348a58` (Phase 2: `BlobTransport`/`ManifestSlot` seams, backup flow with have/want via `du`, G3
+server-cid guard, keep-set commit under I5 at `last+1`, `Client::put_manifest`/`get_manifest`,
+`ciss-ctl sync backup`, tracing + the pre-transfer pricing line), `3d21f8c` (Phase 3: verified restore
+with per-file verify-before-rename atomicity, cold discovery via the kind tag, `ciss-ctl sync restore`).
+Observable behavior: `sync backup <dir>` uploads a tree once and re-uploads nothing for an unchanged
+tree; an interrupted backup resumes by skipping stored chunks and never half-commits; `sync restore`
+reproduces the tree byte-identically (content + mode + mtime) from nothing but the account key, and
+fails closed on any tampered byte. Gates: 53 workspace test suites green, clippy-pedantic 0 warnings,
+cargo-mutants 34 caught / 0 missed on the chunker + codec, live server drills (backup dedup, cold
+restore diff, at-rest tamper refusal) all green.
+**Stopped or skipped:** nothing. All phases shipped as specced (three recorded per-phase deviations:
+`HttpCiss` lives in `ciss-cli` to avoid a package cycle; the transport addresses by expected cid-hex;
+per-file rather than whole-tree atomicity — each argued in its phase's Delivered notes).
+**Discoveries:** (1) fastcdc 4.x (not 3.x) with `usize` params; `serde_ipld_dagcbor` sorts map keys
+canonically on the wire, so determinism never depended on `BTreeMap`. (2) The mutation audit caught the
+tuning constants unpinned — a min-size drift is invisible in any one corpus's cuts; the golden digest now
+covers params + boundaries together. (3) The scan index must live outside the scanned tree (a RED test
+caught the index scanning its own mutating sqlite). (4) The plan's `ciss-sync → ciss-cli` dependency
+direction was backwards once the CLI had to consume the engine — caught at design time in Phase 2, not
+mid-debug. (5) Cold discovery cannot filter by size alone (tiny files make tiny chunks); the `kind`
+self-tag — added by the foundations review for domain separation — turned out to be the load-bearing
+discovery mechanism too. (6) Server C2 refuses a tampered block with a 500 before the client's own
+verify ever sees the bytes — the defense really is two-layer in practice.
