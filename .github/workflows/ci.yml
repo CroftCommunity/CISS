@@ -1,0 +1,49 @@
+# CI gate, per the workspace pattern (CroftC/.claude/CI-PATTERN.md; canonical
+# reasoning in croft-pwa/docs/CI.md). Gate on every PR and every push to main;
+# there is no deploy job here — deployment lives in croft-stack.
+#
+# The gate runs the same two commands the repo gates on locally (CLAUDE.md):
+#   cargo test --workspace
+#   cargo clippy --all-targets --workspace   (pedantic; warnings are errors here)
+# Note: no cargo fmt — deliberate, see CLAUDE.md ("do not run cargo fmt").
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Manual escape hatch (rule 9) — exercised once at setup so it is known to work.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A per-ref group: a new push to the same PR cancels the stale run; runs on
+# main never collide with PR runs (rule 4).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rule 7: resolve the toolchain explicitly through rustup, which reads
+      # rust-toolchain.toml — never whatever rustc happens to shadow PATH.
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy (pedantic, deny warnings)
+        run: cargo clippy --all-targets --workspace -- -D warnings
