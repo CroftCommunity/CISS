@@ -32,6 +32,10 @@ pub struct SyncState {
     pub placeholders: PlaceholderStore,
     /// The budgeted chunk cache.
     pub cache: ChunkCache,
+    /// This tree's spend ledger (in `state.sqlite`).
+    spend: crate::ledger::SpendLedger,
+    /// The optional per-profile aggregate ledger (attached by the CLI).
+    profile_spend: Option<crate::ledger::SpendLedger>,
     dir: PathBuf,
 }
 
@@ -51,6 +55,8 @@ impl SyncState {
             index: Index::open(&db)?,
             placeholders: PlaceholderStore::open(&db)?,
             cache: ChunkCache::open(dir.join("cache"), budget)?,
+            spend: crate::ledger::SpendLedger::open(&db, "tree")?,
+            profile_spend: None,
             dir,
         })
     }
@@ -101,77 +107,50 @@ impl SyncState {
         Ok(())
     }
 
-    /// The configured spending ceiling in cents, if any (M5 cost twin).
-    ///
-    /// # Errors
-    ///
-    /// Sqlite failures; a non-numeric stored value.
-    pub fn ceiling_cents(&self) -> Result<Option<u64>, SyncError> {
-        read_config_u64(&self.dir.join("state.sqlite"), "ceiling_cents")
+    /// This tree's spend ledger (ceiling, monotonic periods, history).
+    #[must_use]
+    pub fn ledger(&self) -> &crate::ledger::SpendLedger {
+        &self.spend
     }
 
-    /// Set or clear the spending ceiling.
+    /// Attach the per-profile aggregate ledger: ceilings are then checked —
+    /// and transfers recorded — against **both** scopes.
+    pub fn attach_profile_ledger(&mut self, ledger: crate::ledger::SpendLedger) {
+        self.profile_spend = Some(ledger);
+    }
+
+    /// The attached profile ledger, if any.
+    #[must_use]
+    pub fn profile_ledger(&self) -> Option<&crate::ledger::SpendLedger> {
+        self.profile_spend.as_ref()
+    }
+
+    /// Pre-flight the ceiling rule against every attached ledger (tree,
+    /// then profile). The first ceiling the transfer would break defers it.
     ///
     /// # Errors
     ///
-    /// Sqlite failures.
-    pub fn set_ceiling_cents(&mut self, cents: Option<u64>) -> Result<(), SyncError> {
-        if let Some(c) = cents {
-            return write_config_u64(&self.dir.join("state.sqlite"), "ceiling_cents", c);
+    /// [`SyncError::CeilingDeferred`] naming the deferring scope; sqlite
+    /// failures.
+    pub fn check_ceilings(&self, want_bytes: u64) -> Result<(), SyncError> {
+        self.spend.check(want_bytes)?;
+        if let Some(profile) = &self.profile_spend {
+            profile.check(want_bytes)?;
         }
-        let conn = config_conn(&self.dir.join("state.sqlite"))?;
-        conn.execute("DELETE FROM config WHERE key = 'ceiling_cents'", [])?;
         Ok(())
     }
 
-    /// Ledger a completed transfer's bytes (M5). The ledger stores bytes and
-    /// derives cents over the *total*, exactly as a server statement does —
-    /// per-sync flooring would under-count against the real bill.
+    /// Record a completed transfer in every attached ledger — both scopes
+    /// must see every transfer or the aggregate under-counts.
     ///
     /// # Errors
     ///
     /// Sqlite failures.
-    pub fn record_spend_bytes(&self, bytes: u64) -> Result<(), SyncError> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let conn = spend_conn(&self.dir.join("state.sqlite"))?;
-        conn.execute(
-            "INSERT INTO spend (ts, bytes) VALUES (?1, ?2)",
-            rusqlite::params![ts, bytes],
-        )?;
-        Ok(())
-    }
-
-    /// Total transferred bytes on the ledger.
-    ///
-    /// # Errors
-    ///
-    /// Sqlite failures.
-    pub fn spent_bytes(&self) -> Result<u64, SyncError> {
-        let conn = spend_conn(&self.dir.join("state.sqlite"))?;
-        let total: i64 =
-            conn.query_row("SELECT COALESCE(SUM(bytes), 0) FROM spend", [], |r| r.get(0))?;
-        Ok(u64::try_from(total).unwrap_or(0))
-    }
-
-    /// The ledger priced by the server's own tariff, over total bytes.
-    ///
-    /// # Errors
-    ///
-    /// Sqlite failures.
-    pub fn spent_cents(&self) -> Result<u64, SyncError> {
-        Ok(ciss::pricing::postage_cents(self.spent_bytes()?))
-    }
-
-    /// Clear the spend ledger (a new period).
-    ///
-    /// # Errors
-    ///
-    /// Sqlite failures.
-    pub fn reset_spend(&self) -> Result<(), SyncError> {
-        let conn = spend_conn(&self.dir.join("state.sqlite"))?;
-        conn.execute("DELETE FROM spend", [])?;
+    pub fn record_spend_all(&self, bytes: u64) -> Result<(), SyncError> {
+        self.spend.record_bytes(bytes)?;
+        if let Some(profile) = &self.profile_spend {
+            profile.record_bytes(bytes)?;
+        }
         Ok(())
     }
 
@@ -192,18 +171,6 @@ fn config_conn(db: &Path) -> Result<Connection, SyncError> {
     let conn = Connection::open(db)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-    )?;
-    Ok(conn)
-}
-
-fn spend_conn(db: &Path) -> Result<Connection, SyncError> {
-    let conn = Connection::open(db)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS spend (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            bytes INTEGER NOT NULL
-        );",
     )?;
     Ok(conn)
 }
@@ -235,31 +202,35 @@ fn write_config_u64(db: &Path, key: &str, value: u64) -> Result<(), SyncError> {
 mod tests {
     use super::SyncState;
 
-    /// The M5 cost-twin state: the ceiling round-trips (set, read, clear)
-    /// and the spend ledger accumulates bytes, pricing the TOTAL — two
-    /// 600-byte transfers are 1200 bytes = 1¢, where per-sync flooring
-    /// would have said 0¢ + 0¢ and under-counted the statement.
+    /// The tree ledger opens with the state, and the two-scope surface
+    /// composes: the tighter ceiling defers with its scope named, and a
+    /// recorded transfer lands on BOTH ledgers.
     #[test]
-    fn ceiling_and_spend_ledger_round_trip() {
+    fn ceilings_and_recording_span_both_scopes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = SyncState::open(dir.path().join("s")).expect("open");
+        assert_eq!(state.ledger().ceiling_cents().expect("read"), None, "unset by default");
 
-        assert_eq!(state.ceiling_cents().expect("read"), None, "unset by default");
-        state.set_ceiling_cents(Some(250)).expect("set");
-        assert_eq!(state.ceiling_cents().expect("read"), Some(250));
-        state.set_ceiling_cents(None).expect("clear");
-        assert_eq!(state.ceiling_cents().expect("read"), None);
+        let profile = crate::ledger::SpendLedger::open(dir.path().join("profile.sqlite"), "profile")
+            .expect("open profile");
+        profile.set_ceiling_cents(Some(1)).expect("set profile ceiling");
+        state.attach_profile_ledger(profile);
 
-        assert_eq!(state.spent_bytes().expect("bytes"), 0);
-        assert_eq!(state.spent_cents().expect("cents"), 0);
-        state.record_spend_bytes(600).expect("record");
-        assert_eq!(state.spent_cents().expect("cents"), 0, "600 bytes floors to 0¢");
-        state.record_spend_bytes(600).expect("record");
-        assert_eq!(state.spent_bytes().expect("bytes"), 1200);
-        assert_eq!(state.spent_cents().expect("cents"), 1, "the TOTAL is priced: 1200 → 1¢");
+        // No tree ceiling; the profile's 1¢ is the binding one.
+        let err = state.check_ceilings(5000).expect_err("profile ceiling binds");
+        match err {
+            crate::error::SyncError::CeilingDeferred { scope, .. } => assert_eq!(scope, "profile"),
+            other => panic!("expected CeilingDeferred, got {other}"),
+        }
+        state.check_ceilings(900).expect("0¢-marginal passes both scopes");
 
-        state.reset_spend().expect("reset");
-        assert_eq!(state.spent_bytes().expect("bytes"), 0, "a new period starts at zero");
+        state.record_spend_all(600).expect("record");
+        assert_eq!(state.ledger().spent_bytes().expect("tree"), 600);
+        assert_eq!(
+            state.profile_ledger().expect("attached").spent_bytes().expect("profile"),
+            600,
+            "both scopes see every transfer"
+        );
     }
 
     /// Config is a real round-trip (set → get → overwrite; unknown = None),

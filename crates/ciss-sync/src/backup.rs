@@ -245,28 +245,14 @@ where
         "will upload"
     );
 
-    // The ceiling (M5): compare the ledger-plus-this-sync total — priced as
-    // a server statement prices it, cents over total bytes — BEFORE any byte
+    // The ceilings (M5): the rule itself lives in `SpendLedger::check`
+    // (0¢-marginal never blocked; exactly-at-ceiling passes) and runs
+    // against every attached scope — tree, then profile — BEFORE any byte
     // moves. Over means the whole sync defers: no partial tree, no commit,
     // nothing billed. Reads (restore/hydrate) never pass through here — a
     // ceiling can throttle spending, never hold data hostage (POSTURE B6).
     if let Some(state) = state.as_deref_mut() {
-        if let Some(ceiling_cents) = state.ceiling_cents()? {
-            let spent_bytes = state.spent_bytes()?;
-            let spent_cents = ciss::pricing::postage_cents(spent_bytes);
-            let needed_cents = ciss::pricing::postage_cents(spent_bytes + want_bytes);
-            // Defer only a sync that would *add* priced spend past the
-            // ceiling. A 0¢-marginal sync spends nothing and is never
-            // blocked — the ceiling stops new spending, it does not
-            // retroactively freeze free operations.
-            if needed_cents > ceiling_cents && needed_cents > spent_cents {
-                return Err(SyncError::CeilingDeferred {
-                    needed_cents,
-                    spent_cents,
-                    ceiling_cents,
-                });
-            }
-        }
+        state.check_ceilings(want_bytes)?;
     }
 
     // 4. Upload missing chunks, re-reading each file that owns one. The
@@ -327,11 +313,12 @@ where
         tracing::debug!(cid = %&fs_manifest_cid[..12], len = manifest_bytes.len(), "fs-manifest uploaded");
     }
 
-    // Ledger the transfer (M5): bytes, not per-sync cents — spent_cents
-    // prices the running total exactly as a server statement would.
+    // Ledger the transfer (M5): bytes, not per-sync cents — the ledgers
+    // price the running total exactly as a server statement would, and
+    // every attached scope sees every transfer.
     if bytes_uploaded > 0 {
         if let Some(state) = state {
-            state.record_spend_bytes(bytes_uploaded)?;
+            state.record_spend_all(bytes_uploaded)?;
         }
     }
 

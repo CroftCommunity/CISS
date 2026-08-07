@@ -263,19 +263,24 @@ enum SyncCommand {
         #[arg(long)]
         state_dir: Option<String>,
     },
-    /// Show or set this tree's spending ceiling. A sync that would take
-    /// total postage past the ceiling defers whole — no partial upload,
-    /// nothing billed. Restore/hydrate are never gated (exit-exempt, B6).
+    /// Show or set spending ceilings. Two scopes: this tree's, and the
+    /// profile's account-level aggregate (`--profile`) which binds every
+    /// tree. A sync that would take a scope's total postage past its
+    /// ceiling defers whole — no partial upload, nothing billed.
+    /// Restore/hydrate are never gated (exit-exempt, B6).
     Ceiling {
         /// The synced directory.
         dir: String,
+        /// Operate on the profile's aggregate ledger instead of the tree's.
+        #[arg(long)]
+        profile: bool,
         /// Set the ceiling to this many cents.
         #[arg(long, conflicts_with = "clear")]
         cents: Option<u64>,
         /// Remove the ceiling.
         #[arg(long)]
         clear: bool,
-        /// Clear the spend ledger (start a new period).
+        /// Start a new spend period (history is preserved, never deleted).
         #[arg(long)]
         reset_spend: bool,
         /// Override the state root.
@@ -675,9 +680,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
         },
-        Commands::Sync(SyncCommand::Ceiling { dir, cents, clear, reset_spend, state_dir }) => {
-            sync_ceiling(&cli.global, &dir, cents, clear, reset_spend, state_dir.as_deref())
-        }
+        Commands::Sync(SyncCommand::Ceiling {
+            dir,
+            profile,
+            cents,
+            clear,
+            reset_spend,
+            state_dir,
+        }) => sync_ceiling(
+            &cli.global,
+            &dir,
+            profile,
+            cents,
+            clear,
+            reset_spend,
+            state_dir.as_deref(),
+        ),
         Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
             IdentityKind::Id => match cmd {
                 P2pCommand::Share { dir, state_dir } => {
@@ -793,7 +811,11 @@ fn resolve_state(
         Some(p) => std::path::PathBuf::from(p),
         None => sync::default_state_dir(&global.profile, std::path::Path::new(dir))?,
     };
-    Ok(ciss_sync::SyncState::open(root)?)
+    let mut state = ciss_sync::SyncState::open(root)?;
+    // The account-level ceiling binds every tree: attach the profile ledger
+    // so pushes check — and record into — both scopes.
+    state.attach_profile_ledger(sync::profile_ledger(&global.profile)?);
+    Ok(state)
 }
 
 /// Run a backup for the active `id:` identity and print the report.
@@ -946,40 +968,64 @@ fn print_converge_report(global: &GlobalArgs, report: &ciss_sync::ConvergeReport
     }
 }
 
-/// Show or adjust the tree's spending ceiling and spend ledger.
+/// Show or adjust the spending ceilings — the tree's, or with `--profile`
+/// the account-level aggregate.
 fn sync_ceiling(
     global: &GlobalArgs,
     dir: &str,
+    profile: bool,
     cents: Option<u64>,
     clear: bool,
     reset_spend: bool,
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut state = resolve_state(global, dir, state_dir)?;
+    let state = resolve_state(global, dir, state_dir)?;
+    let target = if profile {
+        state.profile_ledger().expect("resolve_state always attaches the profile ledger")
+    } else {
+        state.ledger()
+    };
     if let Some(c) = cents {
-        state.set_ceiling_cents(Some(c))?;
+        target.set_ceiling_cents(Some(c))?;
     } else if clear {
-        state.set_ceiling_cents(None)?;
+        target.set_ceiling_cents(None)?;
     }
     if reset_spend {
-        state.reset_spend()?;
+        let period = target.reset_spend()?;
+        eprintln!("started spend period {period} on the {} ledger", target.scope());
     }
-    let ceiling = state.ceiling_cents()?;
-    let spent_bytes = state.spent_bytes()?;
-    let spent_cents = state.spent_cents()?;
+
+    let scope_json = |l: &ciss_sync::SpendLedger| -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "ceiling_cents": l.ceiling_cents()?,
+            "spent_bytes": l.spent_bytes()?,
+            "spent_cents": l.spent_cents()?,
+            "period": l.current_period()?,
+        }))
+    };
     if global.json {
         println!(
             "{}",
             serde_json::json!({
-                "ceiling_cents": ceiling,
-                "spent_bytes": spent_bytes,
-                "spent_cents": spent_cents,
+                "tree": scope_json(state.ledger())?,
+                "profile": scope_json(state.profile_ledger().expect("attached"))?,
             })
         );
     } else {
-        match ceiling {
-            Some(c) => println!("ceiling: {c}¢ — spent {spent_cents}¢ ({spent_bytes} bytes)"),
-            None => println!("ceiling: none — spent {spent_cents}¢ ({spent_bytes} bytes)"),
+        for l in [state.ledger(), state.profile_ledger().expect("attached")] {
+            let spent_c = l.spent_cents()?;
+            let spent_b = l.spent_bytes()?;
+            let period = l.current_period()?;
+            match l.ceiling_cents()? {
+                Some(c) => println!(
+                    "{:>7} ceiling: {c}¢ — spent {spent_c}¢ ({spent_b} bytes, period {period})",
+                    l.scope()
+                ),
+                None => println!(
+                    "{:>7} ceiling: none — spent {spent_c}¢ ({spent_b} bytes, period {period})",
+                    l.scope()
+                ),
+            }
         }
     }
     Ok(())
