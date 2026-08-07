@@ -1,0 +1,11 @@
+# Toolchain pin (CI-PATTERN rule 7): CI resolves exactly this toolchain via
+# rustup, so "green locally, red in CI on untouched code" cannot come from a
+# version skew. Bump deliberately, alongside a clean local run on the same
+# version.
+#
+# Local caveat: on machines where Homebrew's rustc precedes ~/.cargo/bin on
+# PATH, this pin does not bind local builds — keep the Homebrew toolchain on
+# the same minor (both are 1.97.x as of 2026-08-07).
+[toolchain]
+channel = "1.97.1"
+components = ["clippy"]
