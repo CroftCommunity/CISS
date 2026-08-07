@@ -245,6 +245,7 @@ mod tests {
         let p1 = l.reset_spend().expect("reset");
         assert_eq!(p1, 1, "reset = a new period, monotonic");
         assert_eq!(l.spent_bytes().expect("bytes"), 0, "the new period starts empty");
+        assert_eq!(l.spent_cents().expect("cents"), 0, "…and prices at zero");
         assert_eq!(l.spent_bytes_in(0).expect("bytes"), 1200, "history preserved, not deleted");
 
         l.record_bytes(500).expect("record");

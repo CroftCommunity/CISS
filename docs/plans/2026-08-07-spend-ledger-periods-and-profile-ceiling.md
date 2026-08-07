@@ -1,6 +1,6 @@
 # Spend ledger: monotonic periods + the per-profile ceiling
 
-**Status:** IN PROGRESS
+**Status:** CLOSED — shipped (plus two user-directed additions: `SYNC-MODEL.md` and the at-rest cost picture)
 **Follow-on to:** `docs/plans/2026-08-07-file-sync-m5-cost-twin.md` (M5).
 **Server change:** none.
 
@@ -71,4 +71,32 @@ Two corrections to the M5 cost twin, both user-directed (2026-08-07):
 
 ## Outcome Summary
 
-(to be filled at close-out)
+Shipped on `ciss-spend-ledger`:
+
+- **`4d362ba`** — `SpendLedger` extracted with monotonic `period_seq` as the
+  only accounting authority (`ts` reference-only, consulted by no query);
+  `reset_spend` increments the period and deletes nothing; v0.6.0 tables
+  migrate in place (old rows = period 0). The ceiling rule moved into
+  `SpendLedger::check` (unit-tested at its boundaries); the push path checks
+  and records every attached scope; the CLI always attaches the profile
+  aggregate (`.../profiles/<profile>/ledger.sqlite`);
+  `sync ceiling --profile`; `CeilingDeferred` names the deferring scope.
+- **`bd31531`** — `docs/SYNC-MODEL.md` (user-directed): the sync semantics
+  reference, centered on the 3-way fold — three versions not devices, the
+  who-moved table, why a baseless 2-way merge is unacceptable, fail-loud,
+  the manual authoritative-restore escape hatch.
+- **`fdd3a34`** — the complete cost picture (user design decision: the
+  ceiling caps **transfer only**; at-rest is **always queryable** and the
+  numbers stack). `sync price`: at-rest now → after + rent ¢/day
+  (`rent_cents` — the server's own tariff); `sync status`: committed
+  keep-set at-rest + run-rate. Per-DID at-rest limits remain the server's
+  separate lever (`Limits::did_cap`).
+- **Mutation audit** (ledger + price): 39 mutants → 33 caught, 3 unviable,
+  3 missed; `spent_cents → Ok(1)` killed (the suite had only ever pinned
+  cents at 1), `scope()` accessor stubs excluded per the repo's
+  pure-accessor convention. Re-verify: 2/2 caught.
+
+Deferred by explicit decision: rent inside any ceiling (transfer-only cap);
+statement reconciliation for the profile ledger (the multi-device blind
+spot — a candidate next increment); the co-signed ceiling (E82 ADR, where
+the rent-reservation question now lives).
