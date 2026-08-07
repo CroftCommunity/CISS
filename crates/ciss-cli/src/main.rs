@@ -253,6 +253,16 @@ enum SyncCommand {
         #[arg(long)]
         manifest: Option<String>,
     },
+    /// Price a backup before sending it: the have/want diff in bytes and
+    /// integer cents, by the server's own linked tariff. Reads only —
+    /// nothing is uploaded, nothing is committed.
+    Price {
+        /// The directory a backup would push.
+        dir: String,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
     /// Serverless device↔device sync over iroh — no CISS involved: the
     /// frontier rides gossip on a topic derived from the account key, blobs
     /// ride iroh-blobs (blake3/Bao), and the fold is exactly `converge`'s.
@@ -640,6 +650,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
             ),
         },
+        Commands::Sync(SyncCommand::Price { dir, state_dir }) => match cli.global.identity {
+            IdentityKind::Id => sync_price(&cli.global, &config, &dir, state_dir.as_deref()).await,
+            IdentityKind::Did => anyhow::bail!(
+                "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+            ),
+        },
         Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
             IdentityKind::Id => match cmd {
                 P2pCommand::Share { dir, state_dir } => {
@@ -906,6 +922,39 @@ fn print_converge_report(global: &GlobalArgs, report: &ciss_sync::ConvergeReport
             println!("  conflict preserved: {c}");
         }
     }
+}
+
+/// Price a backup pre-flight and print the quote — nothing moves.
+async fn sync_price(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let quote =
+        ciss_sync::price_backup(std::path::Path::new(dir), &server, Some(&mut state)).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "files": quote.files,
+                "chunks_to_upload": quote.chunks_to_upload,
+                "chunks_skipped": quote.chunks_skipped,
+                "bytes": quote.bytes,
+                "postage_cents": quote.postage_cents,
+            })
+        );
+    } else {
+        println!(
+            "quote: {} file(s), {} chunk(s) to upload ({} already held), {} bytes = {}¢ postage",
+            quote.files, quote.chunks_to_upload, quote.chunks_skipped, quote.bytes,
+            quote.postage_cents,
+        );
+    }
+    Ok(())
 }
 
 /// Publish this device's tree into the lineage mesh and serve until ctrl-c.

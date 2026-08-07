@@ -30,6 +30,7 @@ pub mod index;
 pub mod manifest;
 mod materialize;
 pub mod placeholder;
+pub mod price;
 pub mod restore;
 pub mod scan;
 pub mod state;
@@ -44,6 +45,7 @@ pub use evict::{evict, EvictReport};
 pub use frontier::{backup_frontier, FrontierReport};
 pub use hydrate::{hydrate, HydrateReport};
 pub use placeholder::PlaceholderStore;
+pub use price::{price_backup, PriceQuote};
 pub use restore::{restore, RestoreReport};
 pub use state::{SyncState, DEFAULT_CACHE_BUDGET};
 pub use chunk::{
