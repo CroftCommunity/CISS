@@ -132,7 +132,10 @@ impl std::fmt::Debug for MeshPeer {
 
 impl MeshPeer {
     /// Join the account's lineage topic as `device_id`, bootstrapping from
-    /// `bootstrap` peers (empty = wait to be found).
+    /// `bootstrap` peers (empty = wait to be found). `relay` = `None` binds
+    /// loopback-only (tests/LAN drills); a relay URL binds all interfaces
+    /// and makes this device dialable through the relay once attached
+    /// ([`MeshPeer::await_online`]).
     ///
     /// # Errors
     ///
@@ -141,9 +144,10 @@ impl MeshPeer {
         keypair: ciss::crypto::Keypair,
         device_id: &str,
         bootstrap: &[EndpointAddr],
+        relay: Option<&str>,
     ) -> Result<Self, SyncError> {
         let lookup = MemoryLookup::new();
-        let endpoint = IrohPeer::bind_endpoint(&lookup).await?;
+        let endpoint = IrohPeer::bind_endpoint(&lookup, relay).await?;
         let store = MemStore::new();
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -186,10 +190,17 @@ impl MeshPeer {
         })
     }
 
-    /// This device's dialable address (goes in the pairing ticket).
+    /// This device's dialable address (goes in the pairing ticket; includes
+    /// the relay transport once attached).
     #[must_use]
     pub fn addr(&self) -> EndpointAddr {
         self.peer.addr()
+    }
+
+    /// Wait (bounded) for the home-relay attach; see
+    /// [`IrohPeer::await_online`].
+    pub async fn await_online(&self, timeout: Duration) -> bool {
+        self.peer.await_online(timeout).await
     }
 
     /// Broadcast raw bytes on the topic — a diagnostic/test hook proving

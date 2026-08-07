@@ -294,13 +294,40 @@ enum SyncCommand {
     P2p(P2pCommand),
 }
 
+/// Relay flags shared by the p2p commands. Precedence: `--no-relay` >
+/// `--relay` > the profile's `relay` file > the deployment default
+/// (`relay.croft.ing`). An unreachable relay degrades to direct paths.
+#[derive(Args, Debug)]
+struct RelayArgs {
+    /// Use this relay server instead of the default.
+    #[arg(long, conflicts_with = "no_relay")]
+    relay: Option<String>,
+    /// Disable the relay entirely (LAN/loopback only; binds 127.0.0.1).
+    #[arg(long)]
+    no_relay: bool,
+}
+
+impl RelayArgs {
+    fn resolve(&self, config: &config::Config) -> Option<String> {
+        sync::resolve_relay(
+            self.no_relay,
+            self.relay.as_deref(),
+            sync::profile_relay_setting(config).as_deref(),
+        )
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum P2pCommand {
     /// Publish this device's tree into the mesh and stay up serving blobs +
-    /// announcements. Prints the pairing ticket the other device dials.
+    /// announcements. Prints the pairing ticket the other device dials
+    /// (including the relay address once attached, so NAT'd devices can
+    /// reach this one).
     Share {
         /// The synced directory.
         dir: String,
+        #[command(flatten)]
+        relay: RelayArgs,
         /// Override the state root.
         #[arg(long)]
         state_dir: Option<String>,
@@ -314,6 +341,8 @@ enum P2pCommand {
         /// The pairing ticket printed by `sync p2p share` on the other device.
         #[arg(long)]
         ticket: String,
+        #[command(flatten)]
+        relay: RelayArgs,
         /// Override the state root.
         #[arg(long)]
         state_dir: Option<String>,
@@ -698,12 +727,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         ),
         Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
             IdentityKind::Id => match cmd {
-                P2pCommand::Share { dir, state_dir } => {
-                    sync_p2p_share(&cli.global, &config, &dir, state_dir.as_deref()).await
-                }
-                P2pCommand::Converge { dir, ticket, state_dir } => {
-                    sync_p2p_converge(&cli.global, &config, &dir, &ticket, state_dir.as_deref())
+                P2pCommand::Share { dir, relay, state_dir } => {
+                    let relay = relay.resolve(&config);
+                    sync_p2p_share(&cli.global, &config, &dir, relay.as_deref(), state_dir.as_deref())
                         .await
+                }
+                P2pCommand::Converge { dir, ticket, relay, state_dir } => {
+                    let relay = relay.resolve(&config);
+                    sync_p2p_converge(
+                        &cli.global,
+                        &config,
+                        &dir,
+                        &ticket,
+                        relay.as_deref(),
+                        state_dir.as_deref(),
+                    )
+                    .await
                 }
             },
             IdentityKind::Did => anyhow::bail!(
@@ -1076,12 +1115,22 @@ async fn sync_p2p_share(
     global: &GlobalArgs,
     config: &config::Config,
     dir: &str,
+    relay: Option<&str>,
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let keypair = identity::load_keypair(config)?;
     let mut state = resolve_state(global, dir, state_dir)?;
     let device = sync::device_id(config)?;
-    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[]).await?;
+    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[], relay).await?;
+    if let Some(url) = relay {
+        // The ticket only carries the relay transport after the attach —
+        // wait (bounded), but an unreachable relay must not wedge LAN use.
+        if mesh.await_online(std::time::Duration::from_secs(10)).await {
+            eprintln!("relay attached: {url}");
+        } else {
+            eprintln!("warning: relay {url} unreachable — serving direct paths only");
+        }
+    }
     let report =
         ciss_sync::backup_frontier(std::path::Path::new(dir), &mesh, &mut state, &device).await?;
     let ticket = ciss_iroh::ticket_for(&mesh.addr())?;
@@ -1112,13 +1161,14 @@ async fn sync_p2p_converge(
     config: &config::Config,
     dir: &str,
     ticket: &str,
+    relay: Option<&str>,
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let keypair = identity::load_keypair(config)?;
     let mut state = resolve_state(global, dir, state_dir)?;
     let device = sync::device_id(config)?;
     let peer_addr = ciss_iroh::addr_from_ticket(ticket)?;
-    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[peer_addr]).await?;
+    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[peer_addr], relay).await?;
     mesh.await_devices(1, std::time::Duration::from_secs(30)).await?;
     let report =
         ciss_sync::converge(std::path::Path::new(dir), &mut state, &mesh, &device).await?;
