@@ -17,16 +17,22 @@
 #![warn(clippy::pedantic)]
 
 pub mod backup;
+pub mod cache;
 pub mod chunk;
 pub mod error;
 pub mod index;
 pub mod manifest;
+pub mod placeholder;
 pub mod restore;
 pub mod scan;
+pub mod state;
 pub mod transport;
 
 pub use backup::{backup, BackupReport};
+pub use cache::ChunkCache;
+pub use placeholder::PlaceholderStore;
 pub use restore::{restore, RestoreReport};
+pub use state::{SyncState, DEFAULT_CACHE_BUDGET};
 pub use chunk::{
     chunk_file, Chunk, ChunkRef, Hash32, CHUNK_AVG_BYTES, CHUNK_MAX_BYTES, CHUNK_MIN_BYTES,
 };
