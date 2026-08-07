@@ -102,14 +102,14 @@ fold time:
 - **Server path** (`sync converge`): always available — the keep-set retains
   every head's closure including bases, so the base manifest is one verified
   `GET` away. Restart-proof.
-- **Serverless path** (`sync p2p converge`): available for the lifetime of
-  the participating processes (everything put or fetched is held and
-  announced). Across *restarts of every process on both devices*, with edits
-  on both sides, the base's bytes may be nowhere on the mesh — the converge
-  fails loud ("no sha256→blake3 mapping"), and the recovery is the server
-  path or a deliberate manual restore. The planned persistent local store
-  (fs-backed iroh store + persisted alias index, see the M4 plan's follow-on
-  note) removes this limit; the fold's semantics do not change.
+- **Serverless path** (`sync p2p converge`): durable too — the mesh's blob
+  store is fs-backed under the tree's state root and the sha256→blake3
+  alias index persists in the same sqlite, so the base's bytes and identity
+  both survive any number of process restarts (the acceptance test:
+  converge, kill every process, edit both trees, converge again). A peer
+  running *without* persistence (the hermetic in-memory posture) keeps the
+  old lifetime and the old fail-loud behavior; the fold's semantics never
+  change either way.
 
 ## 5. Serverless is the same model, minus the middleman
 

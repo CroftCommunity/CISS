@@ -1121,7 +1121,11 @@ async fn sync_p2p_share(
     let keypair = identity::load_keypair(config)?;
     let mut state = resolve_state(global, dir, state_dir)?;
     let device = sync::device_id(config)?;
-    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[], relay).await?;
+    let persist = ciss_iroh::MeshPersist {
+        store_dir: state.dir().join("iroh"),
+        aliases: state.aliases().clone(),
+    };
+    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[], relay, Some(persist)).await?;
     if let Some(url) = relay {
         // The ticket only carries the relay transport after the attach —
         // wait (bounded), but an unreachable relay must not wedge LAN use.
@@ -1168,7 +1172,12 @@ async fn sync_p2p_converge(
     let mut state = resolve_state(global, dir, state_dir)?;
     let device = sync::device_id(config)?;
     let peer_addr = ciss_iroh::addr_from_ticket(ticket)?;
-    let mesh = ciss_iroh::MeshPeer::spawn(keypair, &device, &[peer_addr], relay).await?;
+    let persist = ciss_iroh::MeshPersist {
+        store_dir: state.dir().join("iroh"),
+        aliases: state.aliases().clone(),
+    };
+    let mesh =
+        ciss_iroh::MeshPeer::spawn(keypair, &device, &[peer_addr], relay, Some(persist)).await?;
     mesh.await_devices(1, std::time::Duration::from_secs(30)).await?;
     let report =
         ciss_sync::converge(std::path::Path::new(dir), &mut state, &mesh, &device).await?;

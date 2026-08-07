@@ -27,8 +27,8 @@ fn device(id: &'static str) -> Device {
 async fn mesh_pair() -> (MeshPeer, MeshPeer) {
     let key_a = ciss::crypto::derive_keypair("p2p-master", "lineage");
     let key_b = ciss::crypto::derive_keypair("p2p-master", "lineage");
-    let a = MeshPeer::spawn(key_a, "dev-a", &[], None).await.expect("spawn a");
-    let b = MeshPeer::spawn(key_b, "dev-b", &[a.addr()], None).await.expect("spawn b");
+    let a = MeshPeer::spawn(key_a, "dev-a", &[], None, None).await.expect("spawn a");
+    let b = MeshPeer::spawn(key_b, "dev-b", &[a.addr()], None, None).await.expect("spawn b");
     (a, b)
 }
 

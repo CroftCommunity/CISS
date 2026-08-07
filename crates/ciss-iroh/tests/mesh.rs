@@ -17,8 +17,8 @@ fn cid_of(bytes: &[u8]) -> String {
 async fn mesh_pair() -> (MeshPeer, MeshPeer) {
     let key_a = ciss::crypto::derive_keypair("mesh-master", "pool");
     let key_b = ciss::crypto::derive_keypair("mesh-master", "pool");
-    let a = MeshPeer::spawn(key_a, "dev-a", &[], None).await.expect("spawn a");
-    let b = MeshPeer::spawn(key_b, "dev-b", &[a.addr()], None).await.expect("spawn b");
+    let a = MeshPeer::spawn(key_a, "dev-a", &[], None, None).await.expect("spawn a");
+    let b = MeshPeer::spawn(key_b, "dev-b", &[a.addr()], None, None).await.expect("spawn b");
     (a, b)
 }
 
@@ -151,7 +151,7 @@ async fn hand_crafted_announcement_moves_the_frontier() {
 #[tokio::test]
 async fn mesh_keep_set_slot_round_trips_and_rejects_stale() {
     let key = ciss::crypto::derive_keypair("mesh-master", "slot-pool");
-    let peer = MeshPeer::spawn(key, "dev-solo", &[], None).await.expect("spawn");
+    let peer = MeshPeer::spawn(key, "dev-solo", &[], None, None).await.expect("spawn");
 
     let payload = b"slot test blob".to_vec();
     let cid = cid_of(&payload);
