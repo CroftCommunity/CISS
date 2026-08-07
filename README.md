@@ -188,7 +188,9 @@ ciss-ctl sync ceiling ~/notes --cents 500         # spend stops here: over-ceili
 
 Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`
 path relays a PDS-minted service-auth JWT (Model R) — the client holds a
-credential, never a key. Full walkthrough: **`docs/CLIENT.md`**.
+credential, never a key. Full walkthrough: **`docs/CLIENT.md`**; the sync
+semantics (the 3-way fold, why it needs its base, conflict rules, serverless):
+**`docs/SYNC-MODEL.md`**.
 
 ## Configuration
 

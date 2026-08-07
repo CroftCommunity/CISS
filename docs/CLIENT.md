@@ -137,6 +137,14 @@ the atproto plane is the `did:` path.
   found, **or** not visible to you — the gated-read ambiguity), `409` (policy
   `seq` not newer), and a clear "server unreachable" on a connect failure.
 
+## File sync
+
+`ciss-ctl sync` (backup/restore, evict/hydrate/status, converge, p2p,
+price/ceiling) is documented in two places: command examples in the README,
+and the **model** — what a tree commit is, how two devices converge with no
+primary, exactly what the 3-way fold does and why it needs its base — in
+**`SYNC-MODEL.md`**. Read the model before reasoning about a merge outcome.
+
 ## What is not in v1 (explicit)
 
 - **Bilateral (client co-signed) receipts** — the server is unilateral only; a
