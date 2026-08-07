@@ -72,6 +72,35 @@ impl SyncState {
         &self.dir
     }
 
+    /// Read a persisted config value (the frontier keeps `device_counter`,
+    /// `last_head_cid`, and `base_fs_root` here).
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn config_get(&self, key: &str) -> Result<Option<String>, SyncError> {
+        let conn = config_conn(&self.dir.join("state.sqlite"))?;
+        let value: Option<String> = conn
+            .query_row("SELECT value FROM config WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Persist a config value.
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn config_set(&self, key: &str, value: &str) -> Result<(), SyncError> {
+        let conn = config_conn(&self.dir.join("state.sqlite"))?;
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// A stable 16-hex identifier for (profile, tree path) — the state root's
     /// directory name under the per-user data dir.
     #[must_use]

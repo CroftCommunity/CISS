@@ -19,8 +19,10 @@
 pub mod backup;
 pub mod cache;
 pub mod chunk;
+pub mod device_head;
 pub mod error;
 pub mod evict;
+pub mod frontier;
 pub mod hydrate;
 pub mod index;
 pub mod manifest;
@@ -33,7 +35,9 @@ pub mod transport;
 
 pub use backup::{backup, BackupReport};
 pub use cache::ChunkCache;
+pub use device_head::{DeviceHead, DEVICE_HEAD_KIND};
 pub use evict::{evict, EvictReport};
+pub use frontier::{backup_frontier, FrontierReport};
 pub use hydrate::{hydrate, HydrateReport};
 pub use placeholder::PlaceholderStore;
 pub use restore::{restore, RestoreReport};
@@ -45,4 +49,7 @@ pub use error::SyncError;
 pub use index::Index;
 pub use manifest::{DagCbor, FileEntry, FsManifest, ManifestCodec, PrettyJson, FS_MANIFEST_KIND};
 pub use scan::{scan_tree, scan_tree_indexed};
-pub use transport::{missing_blobs, verify_content, verify_server_cid, BlobTransport, ManifestSlot};
+pub use transport::{
+    missing_blobs, verify_content, verify_server_cid, AccountKey, BlobTransport, FrontierView,
+    ManifestSlot,
+};

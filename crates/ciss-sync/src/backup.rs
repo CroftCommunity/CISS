@@ -89,6 +89,18 @@ pub struct BackupReport {
     pub manifest_seq: u64,
 }
 
+/// Everything a tree push produced, short of a keep-set commit — shared by
+/// the M1 [`backup`] and the M3 frontier commit.
+pub(crate) struct PushedTree {
+    pub files: u64,
+    pub chunks_total: u64,
+    pub chunks_uploaded: u64,
+    pub bytes_uploaded: u64,
+    pub fs_manifest_cid: String,
+    /// The full blob set this tree needs, `(cid, size)`.
+    pub needed: Vec<(String, u64)>,
+}
+
 /// Back up `dir` to `server`: upload the chunks and fs-manifest the server
 /// lacks, then commit the keep-set (∪ chunk cids + fs-manifest cid) at
 /// `last_seq + 1`. Pass a [`SyncState`] to use the scan fast-path index and
@@ -108,6 +120,44 @@ pub async fn backup<S>(
 ) -> Result<BackupReport, SyncError>
 where
     S: BlobTransport + ManifestSlot + Sync,
+{
+    let pushed = push_tree(dir, server, state).await?;
+
+    // Commit the keep-set at last+1 (seq 1 on a cold namespace). A stale
+    // seq is surfaced, never retried — one device cannot race itself (OQ5).
+    let seq = server.current_seq().await?.map_or(1, |s| s + 1);
+    server.commit_keep_set(&pushed.needed, seq).await?;
+
+    let report = BackupReport {
+        files: pushed.files,
+        chunks_total: pushed.chunks_total,
+        chunks_uploaded: pushed.chunks_uploaded,
+        bytes_uploaded: pushed.bytes_uploaded,
+        fs_manifest_cid: pushed.fs_manifest_cid,
+        manifest_seq: seq,
+    };
+    tracing::info!(
+        files = report.files,
+        chunks_total = report.chunks_total,
+        chunks_uploaded = report.chunks_uploaded,
+        bytes_uploaded = report.bytes_uploaded,
+        seq = report.manifest_seq,
+        fs_manifest = %&report.fs_manifest_cid[..12],
+        "backup committed"
+    );
+    Ok(report)
+}
+
+/// Push `dir`'s logical tree: scan (+ placeholder merge), have/want diff,
+/// upload only what's missing (chunks + the fs-manifest blob). No commit —
+/// callers decide how the keep-set lands (plain seq or frontier heads).
+pub(crate) async fn push_tree<S>(
+    dir: &Path,
+    server: &S,
+    state: Option<&mut SyncState>,
+) -> Result<PushedTree, SyncError>
+where
+    S: BlobTransport + Sync,
 {
     // 1. The logical tree: scanned files ∪ placeholder entries.
     let mut state = state;
@@ -204,27 +254,12 @@ where
         tracing::debug!(cid = %&fs_manifest_cid[..12], len = manifest_bytes.len(), "fs-manifest uploaded");
     }
 
-    // 6. Commit the keep-set at last+1 (seq 1 on a cold namespace). A stale
-    // seq is surfaced, never retried — one device cannot race itself (OQ5).
-    let seq = server.current_seq().await?.map_or(1, |s| s + 1);
-    server.commit_keep_set(&needed, seq).await?;
-
-    let report = BackupReport {
+    Ok(PushedTree {
         files: manifest.entries.len() as u64,
         chunks_total,
         chunks_uploaded,
         bytes_uploaded,
         fs_manifest_cid,
-        manifest_seq: seq,
-    };
-    tracing::info!(
-        files = report.files,
-        chunks_total = report.chunks_total,
-        chunks_uploaded = report.chunks_uploaded,
-        bytes_uploaded = report.bytes_uploaded,
-        seq = report.manifest_seq,
-        fs_manifest = %&report.fs_manifest_cid[..12],
-        "backup committed"
-    );
-    Ok(report)
+        needed,
+    })
 }

@@ -95,4 +95,13 @@ pub enum SyncError {
         /// The path with nothing recorded.
         path: String,
     },
+
+    /// The server refused a commit because its seq was not strictly newer
+    /// (I5) — another device landed first. The frontier commit loop treats
+    /// this as "re-read, re-apply own slot, retry"; anything else surfaces it.
+    #[error("keep-set commit at seq {attempted} was stale — another writer landed first")]
+    StaleSeq {
+        /// The seq the refused commit carried.
+        attempted: u64,
+    },
 }

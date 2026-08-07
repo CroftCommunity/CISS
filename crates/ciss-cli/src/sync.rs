@@ -9,11 +9,38 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeMap;
+
 use ciss::crypto::Keypair;
-use ciss::manifest::{build_manifest, ManifestLeaf};
-use ciss_sync::{verify_server_cid, BlobTransport, ManifestSlot, SyncError, SyncState};
+use ciss::manifest::{build_manifest, build_manifest_with_heads, ManifestLeaf};
+use ciss_sync::{
+    verify_server_cid, AccountKey, BlobTransport, FrontierView, ManifestSlot, SyncError, SyncState,
+};
 
 use crate::client::{session_for, Client, Session};
+
+/// This install's stable device label for the M3 frontier: read from the
+/// profile dir's `device_id` file, generated once (8 random hex) on first use.
+/// Self-asserted (shared-key era) — a real device key replaces it later.
+///
+/// # Errors
+///
+/// Filesystem failures reading/creating the file.
+pub fn device_id(config: &crate::config::Config) -> anyhow::Result<String> {
+    let path = config.profile_dir().join("device_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim().to_owned();
+        anyhow::ensure!(!trimmed.is_empty(), "empty device_id at {}", path.display());
+        return Ok(trimmed);
+    }
+    let mut raw = [0u8; 4];
+    getrandom::getrandom(&mut raw).map_err(|e| anyhow::anyhow!("entropy: {e}"))?;
+    let id: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::create_dir_all(config.profile_dir())?;
+    std::fs::write(&path, format!("{id}\n"))?;
+    tracing::info!(device_id = %id, "generated this install's device id");
+    Ok(id)
+}
 
 /// The default state root for (profile, tree): `$XDG_DATA_HOME` (or
 /// `$HOME/.local/share`) `/ciss-ctl/sync/<tree-id>/`. The tree path is
@@ -120,21 +147,67 @@ impl ManifestSlot for HttpCiss {
         }))
     }
 
+    async fn frontier(&self) -> Result<Option<FrontierView>, SyncError> {
+        let manifest =
+            self.client.get_manifest(&self.session.did).await.map_err(transport_err)?;
+        Ok(manifest.map(|m| FrontierView {
+            seq: m.seq(),
+            heads: m.heads().cloned().unwrap_or_default(),
+            leaves: m
+                .leaves()
+                .iter()
+                .map(|l| (l.cid().to_owned(), l.size() as u64))
+                .collect(),
+        }))
+    }
+
     async fn commit_keep_set(
         &self,
         leaves: &[(String, u64)],
         seq: u64,
     ) -> Result<(), SyncError> {
-        let leaves: Vec<ManifestLeaf> = leaves
-            .iter()
-            .map(|(cid, size)| {
-                ManifestLeaf::new(
-                    cid,
-                    usize::try_from(*size).expect("blob sizes are far below usize::MAX"),
-                )
-            })
-            .collect();
-        let manifest = build_manifest(&leaves, &self.session.did, &self.keypair, seq);
+        let manifest =
+            build_manifest(&to_leaves(leaves), &self.session.did, &self.keypair, seq);
         self.client.put_manifest(&self.session, &manifest).await.map_err(transport_err)
     }
+
+    async fn commit_frontier(
+        &self,
+        leaves: &[(String, u64)],
+        seq: u64,
+        heads: &BTreeMap<String, String>,
+    ) -> Result<(), SyncError> {
+        let manifest = build_manifest_with_heads(
+            &to_leaves(leaves),
+            &self.session.did,
+            &self.keypair,
+            seq,
+            heads,
+        );
+        self.client.put_manifest(&self.session, &manifest).await.map_err(|e| {
+            // The server's I5 refusal ("manifest seq is not newer…") is the
+            // frontier loop's retry signal. Text-matching our own server's
+            // message is a known seam, pinned by the flow tests.
+            if format!("{e:#}").contains("seq is not newer") {
+                SyncError::StaleSeq { attempted: seq }
+            } else {
+                transport_err(e)
+            }
+        })
+    }
+}
+
+impl AccountKey for HttpCiss {
+    fn keypair(&self) -> &Keypair {
+        &self.keypair
+    }
+}
+
+fn to_leaves(leaves: &[(String, u64)]) -> Vec<ManifestLeaf> {
+    leaves
+        .iter()
+        .map(|(cid, size)| {
+            ManifestLeaf::new(cid, usize::try_from(*size).expect("blob sizes are far below usize::MAX"))
+        })
+        .collect()
 }

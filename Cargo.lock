@@ -431,6 +431,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "ciss",
+ "ed25519-dalek",
  "fastcdc",
  "rusqlite",
  "serde",

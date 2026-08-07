@@ -704,7 +704,6 @@ async fn sync_backup(
 ) -> anyhow::Result<()> {
     let keypair = identity::load_keypair(config)?;
     let server = sync::HttpCiss::new(server_client(global), keypair);
-    let mut state = if no_state { None } else { Some(resolve_state(global, dir, state_dir)?) };
     if no_state {
         if let Ok(existing) = resolve_state(global, dir, state_dir) {
             anyhow::ensure!(
@@ -713,30 +712,55 @@ async fn sync_backup(
                  them from the committed tree"
             );
         }
+        // Stateless = the M1 path: no index, no placeholders, no frontier.
+        let report = ciss_sync::backup(std::path::Path::new(dir), &server, None).await?;
+        return print_backup_report(global, report.files, report.chunks_total,
+            report.chunks_uploaded, report.bytes_uploaded, &report.fs_manifest_cid,
+            report.manifest_seq, None);
     }
+    // The frontier path (M3): publish this device's head, commit non-lossily.
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let device = sync::device_id(config)?;
     let report =
-        ciss_sync::backup(std::path::Path::new(dir), &server, state.as_mut()).await?;
+        ciss_sync::backup_frontier(std::path::Path::new(dir), &server, &mut state, &device)
+            .await?;
+    print_backup_report(global, report.files, report.chunks_total, report.chunks_uploaded,
+        report.bytes_uploaded, &report.fs_manifest_cid, report.manifest_seq,
+        Some(&report.device_head_cid))
+}
+
+/// Shared report printer for the stateless and frontier backup paths.
+#[allow(clippy::too_many_arguments)]
+fn print_backup_report(
+    global: &GlobalArgs,
+    files: u64,
+    chunks_total: u64,
+    chunks_uploaded: u64,
+    bytes_uploaded: u64,
+    fs_manifest_cid: &str,
+    manifest_seq: u64,
+    device_head_cid: Option<&str>,
+) -> anyhow::Result<()> {
     if global.json {
         println!(
             "{}",
             serde_json::json!({
-                "files": report.files,
-                "chunks_total": report.chunks_total,
-                "chunks_uploaded": report.chunks_uploaded,
-                "bytes_uploaded": report.bytes_uploaded,
-                "fs_manifest_cid": report.fs_manifest_cid,
-                "manifest_seq": report.manifest_seq,
+                "files": files,
+                "chunks_total": chunks_total,
+                "chunks_uploaded": chunks_uploaded,
+                "bytes_uploaded": bytes_uploaded,
+                "fs_manifest_cid": fs_manifest_cid,
+                "manifest_seq": manifest_seq,
+                "device_head_cid": device_head_cid,
             })
         );
     } else {
+        let head_note = device_head_cid
+            .map(|c| format!(", device head {}", &c[..c.len().min(12)]))
+            .unwrap_or_default();
         println!(
-            "backed up {} files: {}/{} chunks uploaded ({} bytes), fs-manifest {}, keep-set seq {}",
-            report.files,
-            report.chunks_uploaded,
-            report.chunks_total,
-            report.bytes_uploaded,
-            report.fs_manifest_cid,
-            report.manifest_seq,
+            "backed up {files} files: {chunks_uploaded}/{chunks_total} chunks uploaded \
+             ({bytes_uploaded} bytes), fs-manifest {fs_manifest_cid}, keep-set seq {manifest_seq}{head_note}"
         );
     }
     Ok(())

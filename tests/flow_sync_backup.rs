@@ -130,12 +130,23 @@ impl ManifestSlot for FailAfter<'_> {
     async fn keep_set(&self) -> Result<Option<Vec<(String, u64)>>, SyncError> {
         self.inner.keep_set().await
     }
+    async fn frontier(&self) -> Result<Option<ciss_sync::FrontierView>, SyncError> {
+        self.inner.frontier().await
+    }
     async fn commit_keep_set(
         &self,
         leaves: &[(String, u64)],
         seq: u64,
     ) -> Result<(), SyncError> {
         self.inner.commit_keep_set(leaves, seq).await
+    }
+    async fn commit_frontier(
+        &self,
+        leaves: &[(String, u64)],
+        seq: u64,
+        heads: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), SyncError> {
+        self.inner.commit_frontier(leaves, seq, heads).await
     }
 }
 

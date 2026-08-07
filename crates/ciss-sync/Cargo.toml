@@ -18,9 +18,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1.91"
+# The engine links the server's own crypto (Keypair, verify_message) so the
+# DeviceHead signatures cannot drift from the wire — the same argument as
+# ciss-cli linking ciss. (Promoted from dev-dep at M3; also the sha-256 oracle
+# the dual-hash guard checks against.)
+ciss = { path = "../.." }
+ed25519-dalek = "2"
 
 [dev-dependencies]
-# The server's own crypto is the oracle the dual-hash guard checks against —
-# drift between ciss-sync's sha-256 and the server's cid derivation must fail a test.
-ciss = { path = "../.." }
 tempfile = "3"
