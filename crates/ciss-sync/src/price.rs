@@ -80,4 +80,44 @@ mod tests {
             assert_eq!(quote.postage_cents, cents);
         }
     }
+
+    /// A store that already holds a fixed cid set; put/get are unreachable
+    /// in a pricing pass (pricing must move nothing).
+    struct Holding(std::collections::HashSet<String>);
+
+    #[async_trait::async_trait]
+    impl BlobTransport for Holding {
+        async fn have(&self) -> Result<std::collections::HashSet<String>, SyncError> {
+            Ok(self.0.clone())
+        }
+        async fn put(&self, _cid: &str, _bytes: &[u8]) -> Result<(), SyncError> {
+            unreachable!("pricing must never upload")
+        }
+        async fn get(&self, _cid: &str) -> Result<Vec<u8>, SyncError> {
+            unreachable!("pricing must never download")
+        }
+    }
+
+    /// Dedup is priced in: with one of two files already held, the skipped
+    /// count is exactly the held chunk — `total - to_upload`, not any other
+    /// arithmetic — and only the missing bytes are quoted.
+    #[tokio::test]
+    async fn skipped_counts_the_already_held_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("held.txt"), b"already on the server").expect("write");
+        std::fs::write(dir.path().join("new.txt"), b"not yet uploaded").expect("write");
+
+        let held_chunks = crate::chunk::chunk_file(b"already on the server");
+        assert_eq!(held_chunks.len(), 1, "a tiny file is one chunk");
+        let have: std::collections::HashSet<String> =
+            held_chunks.iter().map(|c| c.chunk_ref.sha256_hex()).collect();
+
+        let quote =
+            price_backup(dir.path(), &Holding(have), None).await.expect("price");
+        assert_eq!(quote.files, 2);
+        assert_eq!(quote.chunks_skipped, 1, "the held file's chunk is skipped");
+        assert_eq!(quote.chunks_to_upload, 1, "the new file's chunk uploads");
+        let manifest_overhead = quote.bytes - b"not yet uploaded".len() as u64;
+        assert!(manifest_overhead > 0, "the fs-manifest blob rides in the quote");
+    }
 }

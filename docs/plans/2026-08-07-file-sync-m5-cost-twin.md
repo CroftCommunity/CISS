@@ -1,6 +1,6 @@
 # M5 — cost twin: I know the cost before I sync, and it stops at my ceiling
 
-**Status:** IN PROGRESS
+**Status:** CLOSED — all phases shipped (the ladder's final milestone)
 **Parent plan:** `docs/plans/2026-08-07-file-sync-client.md` (M5 section); ties discovery **E89**.
 **Server change:** none (code). One **doc** change: the exit-exempt invariant lands in
 `docs/SECURITY-POSTURE.md` as **B6** (E89 lane (a) — the highest-value structural rule).
@@ -100,4 +100,40 @@ new logic once green.
 
 ## Outcome Summary
 
-(to be filled at close-out)
+All phases shipped on `ciss-m5`; server change: none (code); POSTURE gained B6.
+
+- **P5.1 (pre-flight pricing)** — `4c268d7`. The push planner extracted as
+  `plan_push` and shared, so the quote and the transfer cannot diverge;
+  `price_backup` prices via the linked `ciss::pricing::postage_cents`. Flow
+  test: a quote uploads nothing and commits nothing; the backup then moves
+  exactly the quoted bytes; an unchanged tree re-prices at 0¢.
+- **P5.2 (ceiling + B6)** — `113bdb1`. Per-tree ceiling + spend ledger in
+  `SyncState` (bytes on the ledger, cents derived over the *total* — the
+  statement's own aggregation, so per-sync flooring cannot under-count).
+  Over-ceiling syncs defer whole before any byte moves; deferral leaves the
+  server and the ledger untouched (asserted). **Exit-exempt** landed as
+  POSTURE **invariant B6** + checklist row (E89 lane (a)); client-side it
+  holds by construction and by the restore-under-exhausted-ceiling test.
+- **Mutation audit** — price.rs + state.rs: baseline 32 mutants / 11 missed
+  (the root-flow blind spot again: `chunks_skipped` arithmetic, plus
+  pre-existing config/cache-budget plumbing in the touched file); all closed
+  with crate-level kills (`Holding` mock transport, config/budget persistence
+  round-trip) → re-run **27 caught, 5 unviable, 0 missed**. The ceiling
+  branch in backup.rs (flow-test-only territory) audited separately with a
+  workspace-tested scoped run (`--test-workspace true --re` on its lines):
+  10/12, then both `>` → `>=` boundary survivors killed with real semantics —
+  a ceiling set to exactly the priced total lets the sync through ("stops at
+  X" means X is spendable; the deferral error's own number is actionable),
+  and a 0-byte sync leaves no ledger row (asserted by row count). Final
+  re-verify: **6/6 caught, 0 missed**.
+
+Discoveries:
+
+- The ceiling's first cut deferred a 0¢-marginal sync when the ledger already
+  sat past a lowered ceiling — the flow test caught it live (RED doing its
+  job on a semantic, not just a wiring, bug). The rule that survived: defer
+  only a sync that would *add* priced spend past the ceiling; the ceiling
+  stops new spending, it does not retroactively freeze free operations.
+- Pricing the ledger as bytes-then-total-cents (not per-sync cents) is the
+  faithful twin: `floor(a+b)` ≥ `floor(a)+floor(b)` — summing per-sync floors
+  would drift under the real statement.

@@ -36,14 +36,15 @@ async fn over_ceiling_defers_whole_and_exit_stays_exempt() {
     let err = backup(dir.path(), &server, Some(&mut state))
         .await
         .expect_err("a sync priced over the ceiling must defer");
-    match &err {
+    let needed = match &err {
         SyncError::CeilingDeferred { needed_cents, spent_cents, ceiling_cents } => {
             assert!(*needed_cents > 2000, "the quote is the real price: {needed_cents}");
             assert_eq!(*spent_cents, 0);
             assert_eq!(*ceiling_cents, 100);
+            *needed_cents
         }
         other => panic!("expected CeilingDeferred, got: {other}"),
-    }
+    };
 
     // Deferred means DEFERRED: no blobs landed, no keep-set committed.
     let keypair = ciss::crypto::derive_keypair("flow-master", "ceilinged");
@@ -56,9 +57,10 @@ async fn over_ceiling_defers_whole_and_exit_stays_exempt() {
     );
     assert_eq!(state.spent_cents().expect("spent"), 0, "nothing was billed or ledgered");
 
-    // Raise the ceiling: the same sync goes through and the ledger records
-    // the spend at the statement's own aggregation (cents over total bytes).
-    state.set_ceiling_cents(Some(10_000)).expect("raise ceiling");
+    // "Spend stops at X" means X itself is spendable: a ceiling set to
+    // EXACTLY the priced total lets the sync through — the deferral error's
+    // own number is the actionable "set it here and proceed".
+    state.set_ceiling_cents(Some(needed)).expect("exact ceiling");
     let report = backup(dir.path(), &server, Some(&mut state)).await.expect("backup");
     assert!(report.bytes_uploaded > 2 * 1024 * 1024);
     assert_eq!(
@@ -72,6 +74,11 @@ async fn over_ceiling_defers_whole_and_exit_stays_exempt() {
     state.set_ceiling_cents(Some(1)).expect("exhausted ceiling");
     let again = backup(dir.path(), &server, Some(&mut state)).await.expect("free re-sync");
     assert_eq!(again.bytes_uploaded, 0, "0-byte sync spends nothing and is never deferred");
+    let spend_rows: i64 = rusqlite::Connection::open(state.dir().join("state.sqlite"))
+        .expect("open state db")
+        .query_row("SELECT COUNT(*) FROM spend", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(spend_rows, 1, "a 0-byte sync leaves no ledger row — only the real transfer did");
 
     // B6 — exit-exempt: with the ceiling exhausted, restore still runs.
     let dst = tempfile::tempdir().expect("tempdir");

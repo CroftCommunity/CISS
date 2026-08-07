@@ -261,4 +261,30 @@ mod tests {
         state.reset_spend().expect("reset");
         assert_eq!(state.spent_bytes().expect("bytes"), 0, "a new period starts at zero");
     }
+
+    /// Config is a real round-trip (set → get → overwrite; unknown = None),
+    /// the cache-budget setter persists across a reopen, and the default
+    /// budget is the documented 256 MiB — pinned so plumbing stubs and
+    /// constant drift fail loudly.
+    #[test]
+    fn config_and_cache_budget_persist() {
+        assert_eq!(super::DEFAULT_CACHE_BUDGET, 256 * 1024 * 1024);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("s");
+        {
+            let mut state = SyncState::open(&root).expect("open");
+            assert_eq!(state.cache.budget(), super::DEFAULT_CACHE_BUDGET);
+            assert_eq!(state.config_get("never-set").expect("get"), None);
+            state.config_set("k", "v1").expect("set");
+            assert_eq!(state.config_get("k").expect("get"), Some("v1".to_owned()));
+            state.config_set("k", "v2").expect("overwrite");
+            assert_eq!(state.config_get("k").expect("get"), Some("v2".to_owned()));
+            state.set_cache_budget(12_345).expect("set budget");
+            assert_eq!(state.cache.budget(), 12_345, "applied immediately");
+        }
+        let reopened = SyncState::open(&root).expect("reopen");
+        assert_eq!(reopened.cache.budget(), 12_345, "budget persisted");
+        assert_eq!(reopened.config_get("k").expect("get"), Some("v2".to_owned()));
+    }
 }

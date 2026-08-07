@@ -205,7 +205,9 @@ Server change: **none** (CISS remains one blob source among peers). — **✅ M4
 
 ### M5 — "I know the cost before I sync, and it stops at my ceiling instead of surprising me." (cost twin)
 Ties `discovery` **E89**. Server change: none for the client twin (a *co-signed* ceiling later wants the
-bilateral-receipt seam — out of scope here, E82).
+bilateral-receipt seam — out of scope here, E82). — **✅ M5 SHIPPED 2026-08-07 — LADDER COMPLETE**
+(`ciss-ctl sync price|ceiling` + POSTURE invariant **B6** (exit-exempt); execution plan
+`docs/plans/2026-08-07-file-sync-m5-cost-twin.md`)
 
 - **P5.1 pre-flight pricing**: from `du` sizes × the tariff (postage = `floor(bytes/1000)`¢ today), the client
   prices any sync **before** sending.
