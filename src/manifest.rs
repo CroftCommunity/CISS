@@ -20,7 +20,7 @@
 //! - **I12** — leaves are validated (hex content address, bounded size) and the
 //!   wire form denies unknown fields.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -110,10 +110,36 @@ fn has_duplicate_cids(leaves: &[ManifestLeaf]) -> bool {
 }
 
 /// The domain-separated preimage the customer signs. Binds the signer, the
-/// sequence number, the leaf count, the byte total, and the root — so none can be
-/// altered without invalidating the signature (I1, I5, I11).
-fn signing_preimage(signer_id: &str, seq: u64, leaf_count: usize, total_bytes: usize, root: &str) -> String {
-    format!("{MANIFEST_SIG_DOMAIN}:{signer_id}:{seq}:{leaf_count}:{total_bytes}:{root}")
+/// sequence number, the leaf count, the byte total, the root — and, when
+/// present, the `heads` map (M3 frontier) — so none can be altered without
+/// invalidating the signature (I1, I5, I11; B1 extended).
+///
+/// Back-compat is structural: with `heads = None` the preimage is
+/// byte-identical to the pre-heads era, so every manifest signed before the
+/// field existed still verifies. A present-but-tampered map changes the
+/// digest; a stripped map falls back to the legacy preimage, which the
+/// original signature (bound to the digest) no longer matches.
+fn signing_preimage(
+    signer_id: &str,
+    seq: u64,
+    leaf_count: usize,
+    total_bytes: usize,
+    root: &str,
+    heads: Option<&BTreeMap<String, String>>,
+) -> String {
+    let base = format!("{MANIFEST_SIG_DOMAIN}:{signer_id}:{seq}:{leaf_count}:{total_bytes}:{root}");
+    match heads {
+        None => base,
+        Some(map) => {
+            // BTreeMap iteration is key-sorted, so the digest is canonical.
+            let joined = map.iter().fold(String::new(), |mut acc, (device, cid)| {
+                use std::fmt::Write as _;
+                write!(acc, "{device}={cid};").expect("writing to a String cannot fail");
+                acc
+            });
+            format!("{base}:heads={}", sha256_hex(joined.as_bytes()))
+        }
+    }
 }
 
 /// A built, signed manifest.
@@ -126,6 +152,11 @@ pub struct Manifest {
     signer_id: String,
     seq: u64,
     signature: String,
+    /// The M3 frontier: `device_id → cid(DeviceHead)`, owner-signed via the
+    /// preimage, opaque to the server. Absent for pre-frontier manifests and
+    /// omitted from the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    heads: Option<BTreeMap<String, String>>,
 }
 
 impl Manifest {
@@ -159,6 +190,13 @@ impl Manifest {
         &self.leaves
     }
 
+    /// The frontier heads (`device_id → cid(DeviceHead)`), if this manifest
+    /// carries any. Signature-bound; the server never interprets them.
+    #[must_use]
+    pub fn heads(&self) -> Option<&BTreeMap<String, String>> {
+        self.heads.as_ref()
+    }
+
     /// Verify the manifest fully: leaves are well-formed and unique, the stored
     /// `root`/`total_bytes` reproduce from the leaves, and the customer's
     /// signature over the structured preimage checks out. Any tampering — an
@@ -182,6 +220,7 @@ impl Manifest {
             self.leaves.len(),
             self.total_bytes,
             &self.root,
+            self.heads.as_ref(),
         );
         verify_message(customer_key, &preimage, &self.signature)
     }
@@ -195,11 +234,35 @@ pub fn build_manifest(
     customer_key: &Keypair,
     seq: u64,
 ) -> Manifest {
+    build_signed(items, customer_id, customer_key, seq, None)
+}
+
+/// Build and sign a manifest that also carries the M3 frontier `heads` map
+/// (`device_id → cid(DeviceHead)`), bound into the signing preimage.
+#[must_use]
+pub fn build_manifest_with_heads(
+    items: &[ManifestLeaf],
+    customer_id: &str,
+    customer_key: &Keypair,
+    seq: u64,
+    heads: &BTreeMap<String, String>,
+) -> Manifest {
+    build_signed(items, customer_id, customer_key, seq, Some(heads.clone()))
+}
+
+fn build_signed(
+    items: &[ManifestLeaf],
+    customer_id: &str,
+    customer_key: &Keypair,
+    seq: u64,
+    heads: Option<BTreeMap<String, String>>,
+) -> Manifest {
     let mut leaves = items.to_vec();
     leaves.sort_by(|a, b| a.cid.cmp(&b.cid));
     let root = merkle_root(&leaves);
     let total_bytes: usize = leaves.iter().map(ManifestLeaf::size).sum();
-    let preimage = signing_preimage(customer_id, seq, leaves.len(), total_bytes, &root);
+    let preimage =
+        signing_preimage(customer_id, seq, leaves.len(), total_bytes, &root, heads.as_ref());
     let signature = customer_key.sign_message(&preimage);
     Manifest {
         leaves,
@@ -208,6 +271,7 @@ pub fn build_manifest(
         signer_id: customer_id.to_owned(),
         seq,
         signature,
+        heads,
     }
 }
 
@@ -219,7 +283,7 @@ pub fn expected_bytes(manifest: &Manifest) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_manifest, expected_bytes, merkle_root, Manifest, ManifestLeaf};
+    use super::{build_manifest, build_manifest_with_heads, expected_bytes, merkle_root, Manifest, ManifestLeaf};
     use crate::crypto::derive_keypair;
     use crate::identity::derive_id;
 
@@ -353,5 +417,68 @@ mod tests {
     fn empty_manifest_has_a_fixed_sentinel_root() {
         use crate::crypto::sha256_hex;
         assert_eq!(merkle_root(&[]), sha256_hex(b"empty-manifest"));
+    }
+
+    #[test]
+    fn leaf_content_is_bound_into_the_root() {
+        // Mutation audit 2026-08-07: nothing previously asserted that two
+        // DIFFERENT leaf sets produce different roots (a constant leaf_hash
+        // survived — provider and customer both recompute with the same
+        // function, so equality checks alone cannot see it).
+        let a = vec![ManifestLeaf::new(&"aa".repeat(32), 10)];
+        let b = vec![ManifestLeaf::new(&"bb".repeat(32), 10)];
+        let a_resized = vec![ManifestLeaf::new(&"aa".repeat(32), 11)];
+        assert_ne!(merkle_root(&a), merkle_root(&b), "cid is bound into the leaf hash");
+        assert_ne!(merkle_root(&a), merkle_root(&a_resized), "size is bound into the leaf hash");
+        assert_ne!(merkle_root(&a), merkle_root(&[]), "empty set has its own root");
+    }
+
+    #[test]
+    fn legacy_manifest_without_heads_still_verifies() {
+        // The M3 heads field is additive: a manifest built without heads has a
+        // byte-identical preimage to the pre-heads era, still verifies, and
+        // serializes with no "heads" key on the wire (old readers unaffected).
+        let customer = derive_keypair("master", "customer");
+        let did = derive_id(&customer.verifying_key());
+        let manifest = build_manifest(&leaves(), &did, &customer, 3);
+        assert!(manifest.verify(&customer.verifying_key()));
+        assert!(manifest.heads().is_none());
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("heads"), "absent heads must not appear on the wire");
+        // And the legacy wire form (no heads key) still parses + verifies.
+        let reparsed: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(reparsed.verify(&customer.verifying_key()));
+    }
+
+    #[test]
+    fn tampered_heads_fails_verify() {
+        let customer = derive_keypair("master", "customer");
+        let did = derive_id(&customer.verifying_key());
+        let mut heads = std::collections::BTreeMap::new();
+        heads.insert("dev-a".to_owned(), "aa".repeat(32));
+        let manifest = build_manifest_with_heads(&leaves(), &did, &customer, 4, &heads);
+        assert!(manifest.verify(&customer.verifying_key()), "signed heads verify");
+        assert_eq!(manifest.heads().unwrap().len(), 1);
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let reforge = |mutate: &dyn Fn(&mut serde_json::Value)| -> Manifest {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            mutate(&mut v);
+            serde_json::from_value(v).unwrap()
+        };
+
+        // Alter a head's cid: the signature must break.
+        let altered = reforge(&|v| v["heads"]["dev-a"] = serde_json::json!("bb".repeat(32)));
+        assert!(!altered.verify(&customer.verifying_key()), "altered head cid bound");
+
+        // Inject an extra device slot: bound.
+        let injected = reforge(&|v| v["heads"]["dev-evil"] = serde_json::json!("cc".repeat(32)));
+        assert!(!injected.verify(&customer.verifying_key()), "injected head bound");
+
+        // Strip heads entirely: bound (absence is a different preimage).
+        let stripped = reforge(&|v| {
+            v.as_object_mut().unwrap().remove("heads");
+        });
+        assert!(!stripped.verify(&customer.verifying_key()), "removed heads bound");
     }
 }

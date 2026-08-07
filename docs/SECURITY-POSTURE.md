@@ -215,7 +215,13 @@ returned (finding I4).
 a versioned, domain-separated preimage
 `ciss/v1/manifest:signer:seq:leaf_count:total_bytes:root` (findings I1, I11). On
 verify, `total_bytes` and `root` are re-derived from the leaves and must match, so
-neither the byte total nor the leaf set can be altered after signing.
+neither the byte total nor the leaf set can be altered after signing. When the
+optional M3 frontier `heads` map (`device_id → cid(DeviceHead)`) is present, a
+canonical digest of it is appended to the preimage (`…:heads=<sha256>`), so a
+head cannot be altered, injected, or stripped after signing; with no `heads` the
+preimage is byte-identical to the pre-frontier era, so legacy manifests keep
+verifying. The server never interprets a head — it validates the owner signature
+and seq-monotonicity (B3) and stores bytes; the fold stays client-side.
 
 **Invariant B2 — the Merkle root is unambiguous.** An odd child is tagged
 distinctly from a pair (`node1:` vs `node:`) and duplicate cids are rejected, so
