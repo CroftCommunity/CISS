@@ -210,6 +210,17 @@ enum SyncCommand {
         #[arg(long)]
         state_dir: Option<String>,
     },
+    /// Converge with the other devices of this account: commit local state,
+    /// fold every device's head deterministically (conflicts preserved as
+    /// `<path>.conflict-<device>` copies, never lost), materialize the folded
+    /// tree, and publish it as this device's new head.
+    Converge {
+        /// The synced directory.
+        dir: String,
+        /// Override the state root.
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
     /// Bring evicted files' bytes back — from the local cache when it still
     /// holds them (no metered egress), from the server when it doesn't —
     /// verified either way. Refuses to overwrite a file that reappeared.
@@ -566,6 +577,14 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 ),
             }
         }
+        Commands::Sync(SyncCommand::Converge { dir, state_dir }) => match cli.global.identity {
+            IdentityKind::Id => {
+                sync_converge(&cli.global, &config, &dir, state_dir.as_deref()).await
+            }
+            IdentityKind::Did => anyhow::bail!(
+                "sync uses the id: identity — the keep-set manifest must be signed by the namespace key"
+            ),
+        },
         Commands::Sync(SyncCommand::Hydrate { dir, paths, state_dir }) => {
             match cli.global.identity {
                 IdentityKind::Id => {
@@ -794,6 +813,47 @@ async fn sync_evict(
             "evicted {} file(s): {} bytes freed, {} chunk(s) kept in the local cache",
             report.evicted, report.bytes_freed, report.chunks_cached,
         );
+    }
+    Ok(())
+}
+
+/// Converge with the account's other devices and print the report.
+async fn sync_converge(
+    global: &GlobalArgs,
+    config: &config::Config,
+    dir: &str,
+    state_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let server = sync::HttpCiss::new(server_client(global), keypair);
+    let mut state = resolve_state(global, dir, state_dir)?;
+    let device = sync::device_id(config)?;
+    let report =
+        ciss_sync::converge(std::path::Path::new(dir), &mut state, &server, &device).await?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "files": report.files,
+                "files_written": report.files_written,
+                "files_deleted": report.files_deleted,
+                "conflicts": report.conflicts,
+                "fs_manifest_cid": report.fs_manifest_cid,
+                "manifest_seq": report.manifest_seq,
+            })
+        );
+    } else {
+        println!(
+            "converged: {} files ({} written, {} deleted), fs-manifest {}, seq {}",
+            report.files,
+            report.files_written,
+            report.files_deleted,
+            report.fs_manifest_cid,
+            report.manifest_seq,
+        );
+        for c in &report.conflicts {
+            println!("  conflict preserved: {c}");
+        }
     }
     Ok(())
 }

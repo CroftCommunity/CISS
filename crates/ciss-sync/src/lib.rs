@@ -19,9 +19,11 @@
 pub mod backup;
 pub mod cache;
 pub mod chunk;
+pub mod converge;
 pub mod device_head;
 pub mod error;
 pub mod evict;
+pub mod fold;
 pub mod frontier;
 pub mod hydrate;
 pub mod index;
@@ -35,7 +37,9 @@ pub mod transport;
 
 pub use backup::{backup, BackupReport};
 pub use cache::ChunkCache;
+pub use converge::{converge, ConvergeReport};
 pub use device_head::{DeviceHead, DEVICE_HEAD_KIND};
+pub use fold::{fold, ConflictNote, FoldOutcome};
 pub use evict::{evict, EvictReport};
 pub use frontier::{backup_frontier, FrontierReport};
 pub use hydrate::{hydrate, HydrateReport};
