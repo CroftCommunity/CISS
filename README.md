@@ -179,6 +179,7 @@ ciss-ctl sync restore ~/notes-restored            # byte-identical restore; ever
 ciss-ctl sync evict ~/notes big/video.mov         # drop local bytes (refused unless provably backed)
 ciss-ctl sync hydrate ~/notes                     # bring evicted bytes back (cache first, then server)
 ciss-ctl sync status ~/notes                      # present vs evicted, cache usage, keep-set seq
+ciss-ctl sync converge ~/notes                    # fold all devices' heads; conflicts preserved, never lost
 ```
 
 Denial is oracle-free (`404`, never `403`; `ls` omits hidden objects). The `did:`

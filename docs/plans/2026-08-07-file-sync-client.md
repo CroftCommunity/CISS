@@ -176,6 +176,8 @@ plan `docs/plans/2026-08-07-file-sync-m2-bounded-footprint.md`).
 
 ### M3 — "A second device converges, and a real conflict is preserved, not lost." (multi-writer frontier)
 Server change: **one, additive** — the `Frontier.heads` map (below). Shared account key ⇒ **no write-auth change.**
+— **✅ M3 SHIPPED 2026-08-07** (`ciss-ctl sync converge`; the heads field live under I5; execution plan
+`docs/plans/2026-08-07-file-sync-m3-two-device-converge.md`).
 
 - **P3.1 `DeviceHead` + `Frontier` records** and the non-lossy seq-CAS commit loop (retry re-applies only the
   local `heads` slot). Tests: two Actors committing concurrently both land (≤1 retry), both heads present.
