@@ -34,6 +34,7 @@ without first reading the posture doc and locating the relevant invariant.
 | `docs/spec/gated-reads.md` | **gated reads (read-authz) integrator contract** — invariants Z4–Z8, shipped v0.4.0 |
 | `docs/notes/atproto-integration-model.md` | **atproto identity design** (Model R: service-auth JWT + DID resolution) |
 | `docs/adr/0002-healthz-exposure-and-limit-exemption.md` | healthz edge-gating |
+| `docs/adr/0004-co-signed-spending-ceiling.md` | **co-signed ceiling design (Proposed)** — bilateral receipts, rent reservation, B6 carve-out |
 | `docs/plans/2026-08-03-hardening-and-auth.md` | phased remediation plan + follow-ons |
 | `docs/TESTING-STRATEGY.md` | the workflow (`World`/`Actor`) test tier |
 | `docs/ARCHITECTURE.md` · `docs/DEPLOYMENT.md` | design internals · deploy/ops |
