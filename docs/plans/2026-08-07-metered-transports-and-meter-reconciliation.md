@@ -1,6 +1,6 @@
 # Metered transports + meter reconciliation
 
-**Status:** IN PROGRESS
+**Status:** CLOSED — shipped
 **Follow-on to:** the spend-ledger work (`2026-08-07-spend-ledger-periods-and-profile-ceiling.md`).
 **Server change:** none (the client reads the existing owner-only `GET /{did}/meter`).
 
@@ -75,4 +75,29 @@ schema needs nothing new for it.)
 
 ## Outcome Summary
 
-(to be filled at close-out)
+Shipped on `ciss-meter-reconcile`. Server change: none.
+
+- **A — `BlobTransport::metered()`** (default `true`, fail-safe): `IrohPeer`
+  and `MeshPeer` return `false`, `PeerFirst` follows its origin. The push
+  path checks ceilings and records spend only when metered. The RED flow
+  test caught the shipped bug live: an exhausted ceiling was deferring a
+  free p2p backup; now the transfer runs and the ledger gains nothing,
+  while the server path still defers.
+- **B — `SpendLedger::reconcile_to_meter`**: baseline arithmetic against
+  the meter's cumulative account total. First reconcile of a period adopts
+  (`baseline = meter − local`; history and other periods are never charged
+  to this one); later reconciles record the positive delta — spend other
+  devices did, and unledgered download postage — as catch-up rows; a local
+  ledger ahead of the meter is surfaced (`LocalAhead`), never subtracted.
+  Timestamp-free: the baseline is a byte-count marker. CLI:
+  `sync ceiling --reconcile` (targets the profile ledger — account truth ↔
+  account twin).
+- Flow evidence: a bare same-account upload this ledger never saw is pulled
+  in exactly (`CaughtUp {250_000}`), and the profile ceiling then defers
+  the next sync against the *account* total.
+- Mutants (ledger.rs incl. reconcile): **47 → 44 caught, 3 unviable, 0
+  missed**. Workspace 68 suites green; clippy-pedantic clean.
+
+Superseded-by note: when the server's statement endpoint lands (the
+statement-close scheduler SEAM), per-period rent+postage reconciliation
+replaces the baseline arithmetic; the ledger schema needs nothing new.

@@ -17,6 +17,34 @@ use crate::error::SyncError;
 
 const KEY_CEILING: &str = "ceiling_cents";
 const KEY_PERIOD: &str = "spend_period";
+const KEY_BASELINE: &str = "reconcile_baseline_bytes";
+const KEY_BASELINE_PERIOD: &str = "reconcile_baseline_period";
+
+/// What one reconciliation against the meter did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// First reconcile of this period: a baseline was adopted so that
+    /// history is not charged to the current period. Records nothing.
+    Adopted {
+        /// The meter total assigned as this period's zero point.
+        baseline_bytes: u64,
+    },
+    /// The meter moved past the ledger: the difference — spend other
+    /// devices (or unledgered downloads) did — was recorded.
+    CaughtUp {
+        /// Bytes recorded as the catch-up row.
+        bytes: u64,
+    },
+    /// Ledger and meter agree.
+    InSync,
+    /// The local ledger is ahead of the meter. Surfaced, never subtracted —
+    /// the ledger is append-only and the meter is monotonic, so this means
+    /// something was ledgered that was never billed.
+    LocalAhead {
+        /// How far ahead the local ledger is, in bytes.
+        bytes: u64,
+    },
+}
 
 /// A spend ledger at one sqlite path (tree or profile scope).
 #[derive(Debug, Clone)]
@@ -192,6 +220,54 @@ impl SpendLedger {
         Ok(ciss::pricing::postage_cents(self.spent_bytes()?))
     }
 
+    /// Reconcile this ledger against the meter's cumulative account total
+    /// (`GET /{did}/meter` → `running_total_bytes` — every device's billed
+    /// transfers, both directions). The baseline is a byte-count marker,
+    /// not a moment: on the first reconcile of a period it is set to
+    /// `meter_total − local_spent` (history and other periods are not
+    /// charged to this one); afterwards the positive difference between
+    /// the meter's movement and the local ledger is recorded as a catch-up
+    /// row — the spend this device never saw.
+    ///
+    /// # Errors
+    ///
+    /// Sqlite failures.
+    pub fn reconcile_to_meter(
+        &self,
+        meter_total_bytes: u64,
+    ) -> Result<ReconcileOutcome, SyncError> {
+        let period = self.current_period()?;
+        let local = self.spent_bytes()?;
+        let baseline = self.config_get_u64(KEY_BASELINE)?;
+        let baseline_period = self.config_get_u64(KEY_BASELINE_PERIOD)?;
+
+        if baseline.is_none() || baseline_period != Some(period) {
+            let adopted = meter_total_bytes.saturating_sub(local);
+            self.config_set_u64(KEY_BASELINE, adopted)?;
+            self.config_set_u64(KEY_BASELINE_PERIOD, period)?;
+            tracing::info!(scope = %self.scope, baseline = adopted, period, "reconcile: baseline adopted");
+            return Ok(ReconcileOutcome::Adopted { baseline_bytes: adopted });
+        }
+
+        let account_spent = meter_total_bytes.saturating_sub(baseline.unwrap_or(0));
+        if account_spent > local {
+            let bytes = account_spent - local;
+            self.record_bytes(bytes)?;
+            tracing::info!(scope = %self.scope, bytes, "reconcile: caught up to the meter");
+            return Ok(ReconcileOutcome::CaughtUp { bytes });
+        }
+        if local > account_spent {
+            let bytes = local - account_spent;
+            tracing::warn!(
+                scope = %self.scope,
+                bytes,
+                "reconcile: local ledger is ahead of the meter (unbilled rows?)"
+            );
+            return Ok(ReconcileOutcome::LocalAhead { bytes });
+        }
+        Ok(ReconcileOutcome::InSync)
+    }
+
     /// The ceiling rule, pre-flight: would transferring `want_bytes` more
     /// take this period's priced total past the ceiling? Defers only a
     /// transfer that *adds* priced spend past it — a 0¢-marginal transfer
@@ -303,5 +379,62 @@ mod tests {
 
         l.set_ceiling_cents(None).expect("clear");
         assert!(l.check(u64::MAX / 2).is_ok(), "cleared ceiling: everything passes");
+    }
+
+    /// Reconciliation against the meter's cumulative account total: the
+    /// first reconcile (or the first after a period change) ADOPTS a
+    /// baseline so history isn't double-counted; later reconciles record
+    /// the catch-up — spend other devices did — as ledger rows; a local
+    /// ledger ahead of the meter is surfaced, never "corrected".
+    #[test]
+    fn reconcile_baselines_then_catches_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = ledger(dir.path());
+
+        // This device already spent 1_000 bytes (billed) before the first
+        // reconcile; the account meter shows 5_000 (other devices + history).
+        l.record_bytes(1_000).expect("record");
+        assert_eq!(
+            l.reconcile_to_meter(5_000).expect("reconcile"),
+            ReconcileOutcome::Adopted { baseline_bytes: 4_000 },
+            "first reconcile adopts: history is not charged to this period"
+        );
+        assert_eq!(l.spent_bytes().expect("spent"), 1_000, "adoption records nothing");
+
+        // The meter moves by 3_000 that this ledger never saw (another
+        // device) — the catch-up lands as a row.
+        assert_eq!(
+            l.reconcile_to_meter(8_000).expect("reconcile"),
+            ReconcileOutcome::CaughtUp { bytes: 3_000 }
+        );
+        assert_eq!(l.spent_bytes().expect("spent"), 4_000, "account truth in the ledger");
+
+        // Nothing moved: in sync.
+        assert_eq!(l.reconcile_to_meter(8_000).expect("reconcile"), ReconcileOutcome::InSync);
+
+        // Local ahead of the meter (should not happen now that free
+        // transfers are unledgered) — surfaced, never subtracted.
+        l.record_bytes(10_000).expect("record");
+        assert_eq!(
+            l.reconcile_to_meter(8_000).expect("reconcile"),
+            ReconcileOutcome::LocalAhead { bytes: 10_000 },
+            "the ledger is never silently shrunk"
+        );
+
+        // A period change re-adopts: the new period starts at the meter's
+        // now, minus whatever this period already recorded locally.
+        l.reset_spend().expect("reset");
+        l.record_bytes(500).expect("offline spend after reset");
+        assert_eq!(
+            l.reconcile_to_meter(20_000).expect("reconcile"),
+            ReconcileOutcome::Adopted { baseline_bytes: 19_500 },
+            "period change: fresh baseline; old meter history is not charged"
+        );
+        assert_eq!(l.spent_bytes().expect("spent"), 500);
+        assert_eq!(
+            l.reconcile_to_meter(21_000).expect("reconcile"),
+            ReconcileOutcome::CaughtUp { bytes: 1_000 },
+            "catch-up works in the new period"
+        );
     }
 }

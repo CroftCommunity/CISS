@@ -251,8 +251,12 @@ where
     // moves. Over means the whole sync defers: no partial tree, no commit,
     // nothing billed. Reads (restore/hydrate) never pass through here — a
     // ceiling can throttle spending, never hold data hostage (POSTURE B6).
-    if let Some(state) = state.as_deref_mut() {
-        state.check_ceilings(want_bytes)?;
+    // Only METERED transports are priced: a p2p transfer costs nothing on
+    // the bill, so it is neither deferred nor ledgered.
+    if server.metered() {
+        if let Some(state) = state.as_deref_mut() {
+            state.check_ceilings(want_bytes)?;
+        }
     }
 
     // 4. Upload missing chunks, re-reading each file that owns one. The
@@ -315,8 +319,9 @@ where
 
     // Ledger the transfer (M5): bytes, not per-sync cents — the ledgers
     // price the running total exactly as a server statement would, and
-    // every attached scope sees every transfer.
-    if bytes_uploaded > 0 {
+    // every attached scope sees every billed transfer. Free (unmetered)
+    // transfers never touch the ledger.
+    if bytes_uploaded > 0 && server.metered() {
         if let Some(state) = state {
             state.record_spend_all(bytes_uploaded)?;
         }
