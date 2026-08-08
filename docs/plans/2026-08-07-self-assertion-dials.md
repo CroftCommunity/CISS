@@ -1,7 +1,7 @@
 # Self-assertion dials: one substrate for every customer-signed setting
 
-**Status:** PLANNED — Pass 1 (reasoning/grounding) + Pass 2 (gap analysis)
-applied 2026-08-07; open questions below awaiting confirmation; nothing is built
+**Status:** READY TO BUILD — Passes 1+2 applied and three review rounds
+folded in (2026-08-07); every open question closed; nothing is built yet
 **Grounds:** ADR 0004 (co-signed ceiling, Proposed — amended to build on this),
 ADR 0001 (policy records), discovery E89.
 **Server change:** yes — the first shared-substrate refactor since gated reads,
@@ -225,8 +225,10 @@ migration is in-place and backward-verifying.
   attributable to a *declared* exit rather than an anomaly — "we can
   tell the difference," administratively and in the ledger, without ever
   refusing a read. Ordinary (non-drawdown) over-ceiling egress still
-  bills; drawdown makes the deliberate case distinguishable. Whether the
-  mode is one-way, reversible, or gated is an open question (OQ7).
+  bills; drawdown makes the deliberate case distinguishable. Resolved
+  (OQ7): **reversible by dial**, shrink-only keep-set while in drawdown
+  (no new blobs; manifest commits only with non-increasing total), the
+  monotonic period-gate held in reserve for when privileges attach.
   Client: the reservation term in `sync price`, the 90% soft-warn,
   `ciss-ctl dial account-mode`.
 - **D4 — receipt-mode dial + bilateral receipts.** `dial/receipt-mode`
@@ -345,16 +347,20 @@ Resolved in review (2026-08-07), recorded here:
 
 New from the account-mode refinement, awaiting confirmation:
 
-7. **[RECOMMENDED: PHASE-GATED (D3)] Drawdown-mode reversibility.** Is
-   entering drawdown one-way ("close the books" permanently), freely
-   reversible (a later dial re-opens writes), or gated (reversible with
-   friction — e.g. a cooldown, or only until some boundary)? The user
-   floated one-way "or something" without settling it. Recommend
-   PHASE-GATED: D1/D2 don't need the answer; D3 builds the mode and must
-   know. Leaning: **reversible by dial** (every mode change is a signed,
-   seq'd, timestamped-for-reference record anyway, so the history is
-   legible either way, and one-way-ness can't be un-decided later —
-   reversible is the conservative default).
+7. **[CONFIRMED: RESOLVED 2026-08-07] Drawdown-mode reversibility** —
+   **B now, C's shape held in reserve.** Drawdown is reversible by dial;
+   the record shows every transition ("disabled, then re-enabled — and
+   the metering counts toward the bill": an account that has come back
+   online is responsible again; one that hasn't keeps its books closed).
+   With the shrink-only nuance: in drawdown, no new blobs, keep-set
+   changes only downward (draining reduces rent as you exit). If
+   drawdown ever acquires privileges worth protecting, the gate is
+   **monotonic, not clock-based** — re-open refused within the period
+   that declared drawdown (C's shape, pre-agreed so gamesmanship has an
+   answer waiting). Noted future option (NOT in scope): entering
+   drawdown could auto-clamp the at-rest cap (e.g. to current usage —
+   harmonious with shrink-only); several mechanisms possible, deferred
+   until wanted.
 
 ## Review Log
 
@@ -410,6 +416,14 @@ New from the account-mode refinement, awaiting confirmation:
   anomalous over-ceiling egress). Added to D3; spawned OQ7
   (reversibility, PHASE-GATED D3).
 - OQ6: no migration machinery — crude one-line wipe.
+
+### Review round 3 — 2026-08-07 (OQ7 settled)
+- Drawdown reversibility: **B (reversible by dial)** with C's monotonic
+  period-gate pre-agreed as the escalation path; shrink-only keep-set
+  rule adopted into D3; re-enable = responsibility resumes (metering
+  counts toward the bill); future auto-clamp of the at-rest cap on
+  drawdown noted as an option, out of scope. **All open questions are
+  now closed — D1 is cleared to build.**
 
 ## Definition of done (whole plan)
 
