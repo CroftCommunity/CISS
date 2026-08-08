@@ -387,6 +387,14 @@ inside the hardened sandbox (§11).
 4. **Provider-key at-rest hardening on the box** — the code sources the key from a
    secret and the croft-stack unit wires the systemd credential; the one-time
    on-box `.cred` provisioning is the last step that completes S1 end-to-end.
+5. **Co-signed spending ceiling** (E89/E82) — the customer's spend limit is
+   enforced client-side only (the M5 twin); the binding version — a
+   customer-signed, server-countersigned dial under an I5-style seq, enforced
+   before serving billable transfers against bilateral receipts, with rent
+   reserved rather than gated and owner-egress carved out (B6) — is designed
+   in **ADR 0004** (Proposed) and not yet built. Until then,
+   `ReceiptMode::Bilateral` stays `501` and no billing-conditioned serve path
+   exists.
 
 Each gap is a place where "the code is correct per this document, but this
 document's guarantee is incomplete" — i.e. a design item, tracked in the plan and
