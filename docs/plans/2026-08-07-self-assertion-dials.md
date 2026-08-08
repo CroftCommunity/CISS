@@ -91,9 +91,11 @@ noted as the option it unlocks).
   (user decision 2026-08-07: pre-1.0 beta — "we can just nuke everything";
   the live box holds at most test-data ACLs). D1 restructures the wire
   shape and storage freely, ships the generic route immediately, and the
-  deploy **purges stored policy records** via a destructive schema
-  migration (documented in the CHANGELOG; the deployed box re-creates the
-  table on startup). The *behavioral* contract of gated reads — Z4–Z8,
+  deploy **just wipes the old policy table** — no migration machinery,
+  no schema-version framework, nothing graceful (user ruling 2026-08-07:
+  "don't spend a bunch of time trying to do it gracefully"): the new code
+  creates the new table; the old one is dropped by a one-line statement
+  at startup; a CHANGELOG sentence records that pre-D1 ACLs are gone. The *behavioral* contract of gated reads — Z4–Z8,
   oracle-free 404, Q4 visibility — is unchanged and re-guarded by the
   existing flow/e-suite tests; only the record plumbing and wire shape
   change.
@@ -192,8 +194,10 @@ migration is in-place and backward-verifying.
   (`Limits` at server.rs:164 — `min(store_ceiling, did_cap-if-set)`) with
   the bound in the quote; enforcement joins the existing quota gate in
   `op_put_object` as `min(provider bounds, dial)`; the attest pubkey is
-  published in `/.well-known/did.json` (server.rs:396 — a did:web
-  verification method) so clients verify acks offline;
+  published in `/.well-known/did.json` — verified 2026-08-07: the
+  document exists (served for atproto `aud` resolution, server.rs:813)
+  but currently carries **no keys**, so D2 adds its first
+  `verificationMethod` entry; clients then verify acks offline;
   `ciss-ctl dial ceiling --at-rest-bytes N | --show`. Tests: over-bound
   dial refused-with-quote; dial below current usage refuses new puts but
   never reads (B6); provider cap binds independently even with a larger
@@ -209,11 +213,22 @@ migration is in-place and backward-verifying.
   transfers; refuse-with-quote (typed, carrying the triple); rent
   reservation (`budget = ceiling − projected_rent_to_period_end`, from
   the stored manifest total × `rent_cents`); **B6 carve-out in code**:
-  owner-egress is *served* past the ceiling and still *billed* — the
-  ceiling governs refusable operations, never data availability, and
-  exempt egress may therefore carry the period past X (that is the
-  furniture rule working as intended). Client: the reservation term in
-  `sync price`, the 90% soft-warn.
+  owner-egress is *served* past the ceiling — the ceiling governs
+  refusable operations, never data availability. Refined in review
+  (2026-08-07): exempt egress is not merely tolerated, it is **legible**
+  via a new **account-mode dial** (`dial/account-mode`, same substrate):
+  a customer entering *drawdown* (naming TBD — archive/repository mode)
+  **closes the books to new writes** (puts refused with a typed
+  mode error) while egress stays served and fully metered/receipted as
+  ever. The mode-set is itself a seq'd dial, so the record shows exactly
+  when the account entered drawdown and every byte of egress after it is
+  attributable to a *declared* exit rather than an anomaly — "we can
+  tell the difference," administratively and in the ledger, without ever
+  refusing a read. Ordinary (non-drawdown) over-ceiling egress still
+  bills; drawdown makes the deliberate case distinguishable. Whether the
+  mode is one-way, reversible, or gated is an open question (OQ7).
+  Client: the reservation term in `sync price`, the 90% soft-warn,
+  `ciss-ctl dial account-mode`.
 - **D4 — receipt-mode dial + bilateral receipts.** `dial/receipt-mode`
   (opt-in `ReceiptMode::Bilateral` — receipts.rs:42; seq-CAS'd so it
   cannot be silently reverted); unstub the `501`: client co-signs the
@@ -317,24 +332,29 @@ Resolved in review (2026-08-07), recorded here:
    a dial above the effective provider bound is refused at set time with
    the bound quoted, and enforcement is always `min(provider, dial)`.
 
-New from Pass 2, awaiting confirmation:
+4. **[CONFIRMED: RESOLVED] Ack-key publication** — the well-known doc.
+   Verified: `/.well-known/did.json` exists but publishes no keys today
+   (service endpoint only, server.rs:813); D2 adds the first
+   `verificationMethod` entry.
+5. **[CONFIRMED: RESOLVED, refined] Exempt egress** — served, billed,
+   and now **legible**: the account-mode dial (drawdown closes the books
+   to new writes, egress stays served and metered, the mode-set moment
+   is on the record). See D3.
+6. **[CONFIRMED: RESOLVED] Purge** — crude wipe, one-line drop at
+   startup, no migration machinery.
 
-4. **[RECOMMENDED: ADVISORY] Ack-key publication mechanism.** D2 publishes
-   the attest pubkey as a did:web verification method in the existing
-   `/.well-known/did.json`. Alternative: a dedicated endpoint. The
-   well-known document is the idiomatic place and already served;
-   recommend confirming the default.
-5. **[RECOMMENDED: ADVISORY] Exempt egress is served AND billed.** The B6
-   carve-out means owner-egress past the ceiling is never refused — but
-   its postage still accrues, so exempt egress can carry a period past X.
-   The ceiling governs *refusable* operations, never availability. This
-   is the furniture rule working as intended, but it is a visible
-   behavior (a statement can exceed the ceiling) worth explicit sign-off.
-6. **[RECOMMENDED: ADVISORY] Purge mechanics.** The D1 destructive
-   migration runs automatically at server startup (drop/recreate the
-   policy table on schema-version bump), documented in the CHANGELOG —
-   versus a manual on-box step in croft-stack. Automatic is recommended:
-   pre-1.0, nothing to preserve, no operator choreography.
+New from the account-mode refinement, awaiting confirmation:
+
+7. **[RECOMMENDED: PHASE-GATED (D3)] Drawdown-mode reversibility.** Is
+   entering drawdown one-way ("close the books" permanently), freely
+   reversible (a later dial re-opens writes), or gated (reversible with
+   friction — e.g. a cooldown, or only until some boundary)? The user
+   floated one-way "or something" without settling it. Recommend
+   PHASE-GATED: D1/D2 don't need the answer; D3 builds the mode and must
+   know. Leaning: **reversible by dial** (every mode change is a signed,
+   seq'd, timestamped-for-reference record anyway, so the history is
+   legible either way, and one-way-ness can't be un-decided later —
+   reversible is the conservative default).
 
 ## Review Log
 
@@ -379,6 +399,17 @@ New from Pass 2, awaiting confirmation:
   generalize cleanly from `verify_policy`); the ack key and its
   publication surface already exist; `Bilateral` is a real enum variant
   behind `501`, not a hypothetical.
+
+### Review round 2 — 2026-08-07 (user rulings on OQ4–6)
+- OQ4: well-known confirmed; code check showed did.json carries no keys
+  yet — D2 adds the first verificationMethod (plan corrected; the earlier
+  text implied the slot merely gains another entry).
+- OQ5: upgraded from "sign-off on billed egress" to a design refinement —
+  the **account-mode dial** (drawdown: no new writes, egress served +
+  metered, mode-set on the record; deliberate exit distinguishable from
+  anomalous over-ceiling egress). Added to D3; spawned OQ7
+  (reversibility, PHASE-GATED D3).
+- OQ6: no migration machinery — crude one-line wipe.
 
 ## Definition of done (whole plan)
 
