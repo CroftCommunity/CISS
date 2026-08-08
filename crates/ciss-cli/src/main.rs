@@ -283,6 +283,12 @@ enum SyncCommand {
         /// Start a new spend period (history is preserved, never deleted).
         #[arg(long)]
         reset_spend: bool,
+        /// Reconcile the PROFILE ledger against the server meter's
+        /// cumulative account total — pulls in spend other devices did
+        /// (and unledgered downloads). The first reconcile of a period
+        /// adopts a baseline; nothing is ever subtracted.
+        #[arg(long)]
+        reconcile: bool,
         /// Override the state root.
         #[arg(long)]
         state_dir: Option<String>,
@@ -715,16 +721,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             cents,
             clear,
             reset_spend,
+            reconcile,
             state_dir,
-        }) => sync_ceiling(
-            &cli.global,
-            &dir,
-            profile,
-            cents,
-            clear,
-            reset_spend,
-            state_dir.as_deref(),
-        ),
+        }) => {
+            sync_ceiling(
+                &cli.global,
+                &config,
+                &dir,
+                profile,
+                cents,
+                clear,
+                reset_spend,
+                reconcile,
+                state_dir.as_deref(),
+            )
+            .await
+        }
         Commands::Sync(SyncCommand::P2p(cmd)) => match cli.global.identity {
             IdentityKind::Id => match cmd {
                 P2pCommand::Share { dir, relay, state_dir } => {
@@ -1009,13 +1021,16 @@ fn print_converge_report(global: &GlobalArgs, report: &ciss_sync::ConvergeReport
 
 /// Show or adjust the spending ceilings — the tree's, or with `--profile`
 /// the account-level aggregate.
-fn sync_ceiling(
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // a CLI arm mirrors its flags
+async fn sync_ceiling(
     global: &GlobalArgs,
+    config: &config::Config,
     dir: &str,
     profile: bool,
     cents: Option<u64>,
     clear: bool,
     reset_spend: bool,
+    reconcile: bool,
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let state = resolve_state(global, dir, state_dir)?;
@@ -1032,6 +1047,26 @@ fn sync_ceiling(
     if reset_spend {
         let period = target.reset_spend()?;
         eprintln!("started spend period {period} on the {} ledger", target.scope());
+    }
+    if reconcile {
+        // The meter is the account truth (every device, both directions);
+        // the profile ledger is its client twin — reconcile those two.
+        let keypair = identity::load_keypair(config)?;
+        let session = client::session_for(&keypair);
+        let meter = server_client(global).get_meter(&session).await?;
+        let ledger = state.profile_ledger().expect("attached");
+        match ledger.reconcile_to_meter(meter.running_total_bytes)? {
+            ciss_sync::ReconcileOutcome::Adopted { baseline_bytes } => eprintln!(
+                "reconciled: baseline adopted at {baseline_bytes} meter bytes (period start)"
+            ),
+            ciss_sync::ReconcileOutcome::CaughtUp { bytes } => eprintln!(
+                "reconciled: caught up {bytes} bytes other devices spent"
+            ),
+            ciss_sync::ReconcileOutcome::InSync => eprintln!("reconciled: in sync with the meter"),
+            ciss_sync::ReconcileOutcome::LocalAhead { bytes } => eprintln!(
+                "warning: local ledger is {bytes} bytes ahead of the meter (unbilled rows?)"
+            ),
+        }
     }
 
     let scope_json = |l: &ciss_sync::SpendLedger| -> anyhow::Result<serde_json::Value> {

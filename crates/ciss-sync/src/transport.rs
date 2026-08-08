@@ -26,6 +26,15 @@ pub trait BlobTransport {
     /// Fetch the bytes addressed by `cid_hex`, verified against that address
     /// before they are returned.
     async fn get(&self, cid_hex: &str) -> Result<Vec<u8>, SyncError>;
+
+    /// Whether transfers over this transport are billed by the meter. The
+    /// cost twin (ceiling + spend ledger) prices only what the meter
+    /// prices: a free transport (p2p) is never deferred and never
+    /// ledgered. Defaults to `true` — an unknown transport is assumed
+    /// billed, so the ceiling over-protects rather than under-protects.
+    fn metered(&self) -> bool {
+        true
+    }
 }
 
 /// The committed frontier as one read: the seq, the `heads` map, and the

@@ -320,6 +320,10 @@ impl BlobTransport for IrohPeer {
         self.mark_local(cid_hex);
         Ok(bytes.to_vec())
     }
+
+    fn metered(&self) -> bool {
+        false // peer-to-peer bytes are never billed by the meter
+    }
 }
 
 /// Reads prefer the peer, falling back to the origin per blob (including on
@@ -351,6 +355,10 @@ impl<O: BlobTransport + Sync> BlobTransport for PeerFirst<'_, O> {
                 self.origin.get(cid_hex).await
             }
         }
+    }
+
+    fn metered(&self) -> bool {
+        self.origin.metered() // writes land on the origin — its billing applies
     }
 }
 

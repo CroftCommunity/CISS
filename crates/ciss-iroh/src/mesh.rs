@@ -439,6 +439,10 @@ impl BlobTransport for MeshPeer {
         }
         Ok(bytes)
     }
+
+    fn metered(&self) -> bool {
+        false // the mesh is the free path — that is its point
+    }
 }
 
 #[async_trait::async_trait]

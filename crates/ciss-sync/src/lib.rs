@@ -47,7 +47,7 @@ pub use evict::{evict, EvictReport};
 pub use frontier::{backup_frontier, FrontierReport};
 pub use hydrate::{hydrate, HydrateReport};
 pub use aliases::AliasStore;
-pub use ledger::SpendLedger;
+pub use ledger::{ReconcileOutcome, SpendLedger};
 pub use placeholder::PlaceholderStore;
 pub use price::{price_backup, PriceQuote};
 pub use restore::{restore, RestoreReport};
