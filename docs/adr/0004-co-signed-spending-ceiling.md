@@ -1,7 +1,19 @@
 # ADR 0004 — The co-signed spending ceiling (bilateral receipts + the customer's dial)
 
-- **Status:** Proposed
+- **Status:** Proposed (amended 2026-08-07 — mechanism unification)
 - **Date:** 2026-08-07
+- **Amendment:** review discussion identified that the dial is the **third
+  instance of an existing pattern** — the owner-signed monotonic record
+  (manifest/I5, policy record/Z6; DeviceHead is a client-side fourth) — and
+  that enforcement/accounting reuse the existing `did_cap` gate and meter
+  caches. The build is therefore re-planned as a shared **self-assertion
+  substrate** plus dials on top, with bilateral receipts scoped to the one
+  thing that needs them (spend non-repudiation; the at-rest cap needs none —
+  the manifest already is the customer's signed at-rest assertion). The
+  milestone ladder superseding this ADR's "Build shape" lives in
+  `docs/plans/2026-08-07-self-assertion-dials.md` (D1–D5). The decisions in
+  this ADR (dial semantics, refuse-with-quote, rent reservation, B6
+  carve-out, sliver policy, soft-warn) stand unchanged.
 - **Context:** the M5 cost twin gave the customer a **unilateral** ceiling —
   the client refuses to send past X (`docs/plans/2026-08-07-file-sync-m5-cost-twin.md`,
   hardened by the metered-transport and meter-reconciliation follow-ons). That
