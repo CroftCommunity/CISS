@@ -460,7 +460,7 @@ const LISTBLOBS_LXM: &str = "com.atproto.sync.listBlobs";
 /// The lexicon method usage inspection (`du`) binds a `did:` token to (ADR 0003).
 const DU_LXM: &str = "ing.croft.ciss.du";
 /// The lexicon methods a Model-C `did:` owner's policy set/read tokens bind to.
-const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+const SET_POLICY_LXM: &str = "ing.croft.ciss.putAssertion";
 const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
 
 /// Resolve the token `aud`: the explicit `--aud`, else the service DID the server

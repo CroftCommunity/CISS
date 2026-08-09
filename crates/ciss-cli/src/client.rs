@@ -381,7 +381,7 @@ impl Client {
             .collect()
     }
 
-    /// `PUT /{did}/objects/{cid}/policy` with a self-signed `PolicyRecord` body
+    /// `PUT /{did}/assertion/policy/{cid}` with a self-signed `SignedAssertion` body
     /// (Model A — the record self-authorizes, so no session header is needed).
     /// Returns the stored `seq`.
     ///
@@ -389,7 +389,7 @@ impl Client {
     ///
     /// Fails on a connect error or a non-2xx status (a stale `seq` is 409).
     pub async fn put_object_policy(&self, did: &str, cid: &str, record_json: &[u8]) -> Result<u64> {
-        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let url = format!("{}/{}/assertion/policy/{}", self.base, did, cid);
         let resp = self
             .send(self.http.put(&url).body(record_json.to_vec()), "set policy")
             .await?;
@@ -398,7 +398,7 @@ impl Client {
         v["seq"].as_u64().context("policy response missing seq")
     }
 
-    /// `PUT /{did}/objects/{cid}/policy` as a **Model-C** `did:` owner: a
+    /// `PUT /{did}/assertion/policy/{cid}` as a **Model-C** `did:` owner: a
     /// `PolicyIntent` body plus a service-auth JWT bearer (`lxm=setPolicy`). CISS
     /// verifies the token, then builds and provider-attests the record. Returns
     /// the stored `seq`.
@@ -414,7 +414,7 @@ impl Client {
         intent_json: &[u8],
         token: &str,
     ) -> Result<u64> {
-        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let url = format!("{}/{}/assertion/policy/{}", self.base, did, cid);
         let resp = self
             .send(
                 self.http.put(&url).bearer_auth(token).body(intent_json.to_vec()),
@@ -450,7 +450,7 @@ impl Client {
         Ok(GetResult { bytes, etag: None })
     }
 
-    /// `GET /{did}/objects/{cid}/policy` with the caller's `session`. Returns the
+    /// `GET /{did}/assertion/policy/{cid}` with the caller's `session`. Returns the
     /// policy body the caller is allowed to see (the owner's full record, or a
     /// grantee's `{read_class, may_read}` view), or `None` when the gate returns
     /// 404 (no policy, or not visible to the caller — the oracle-free denial).
@@ -464,7 +464,7 @@ impl Client {
         did: &str,
         cid: &str,
     ) -> Result<Option<serde_json::Value>> {
-        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let url = format!("{}/{}/assertion/policy/{}", self.base, did, cid);
         let resp = self
             .send(with_session(self.http.get(&url), session), "get policy")
             .await?;
@@ -488,7 +488,7 @@ impl Client {
         cid: &str,
         token: &str,
     ) -> Result<Option<serde_json::Value>> {
-        let url = format!("{}/{}/objects/{}/policy", self.base, did, cid);
+        let url = format!("{}/{}/assertion/policy/{}", self.base, did, cid);
         let resp = self
             .send(self.http.get(&url).bearer_auth(token), "get policy")
             .await?;
@@ -646,7 +646,7 @@ fn status_hint(code: u16) -> &'static str {
         401 => "no or invalid credential — check your id: key (`ciss-ctl key gen`) or your did: credential/token",
         403 => "forbidden — bad signature or wrong signer for this namespace",
         404 => "not found, or not visible to you — a gated object denies reads without disclosing whether it exists",
-        409 => "conflict — the policy seq is not newer than the stored one",
+        409 => "conflict — stale seq: the record does not supersede the stored one",
         _ => "the server rejected the request",
     }
 }

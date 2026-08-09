@@ -50,8 +50,8 @@ async fn a_replayed_older_manifest_is_refused() {
     assert_eq!(put_manifest(&world, &did, &pk, body(&m2)).await, 200, "seq 2 accepted");
     assert_eq!(
         put_manifest(&world, &did, &pk, body(&m1)).await,
-        400,
-        "replaying seq 1 over seq 2 is refused",
+        409,
+        "replaying seq 1 over seq 2 is refused with the uniform typed staleness (D1.4)",
     );
 
     world.shutdown().await;

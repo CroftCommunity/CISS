@@ -2,7 +2,7 @@
 //! customer-signed setting.
 //!
 //! CISS grew the same machine three times — the manifest (I5), the policy
-//! record (Z6), the client's DeviceHead — and was about to grow a fourth
+//! record (Z6), the client's `DeviceHead` — and was about to grow a fourth
 //! (the ceiling dial). Each is: an owner-signed record over a
 //! **domain-separated structured preimage** binding every field, a
 //! **strictly-monotonic `seq`**, **key↔DID self-authorization**
@@ -199,6 +199,7 @@ impl SignedAssertion {
     /// Build a Model-C assertion: CISS attests, having verified the owner's
     /// service-auth JWT (`jti` recorded for audit).
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // the envelope's fields, verbatim
     pub fn attest_provider(
         kind: &str,
         owner_did: &str,
@@ -445,7 +446,7 @@ mod tests {
     }
 
     /// Model C round-trips under the attestation key; a mismatched
-    /// owner_did or a foreign attest key fails.
+    /// `owner_did` or a foreign attest key fails.
     #[test]
     fn model_c_attests_and_binds_the_owner() {
         let a = SignedAssertion::attest_provider(

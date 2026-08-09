@@ -1,13 +1,15 @@
-//! Object ACL subcommands (gated reads) — Model A: an `id:` owner self-signs a
-//! [`ciss::policy::PolicyRecord`] via `sign_owner` and PUTs it. Denial is
-//! oracle-free (a non-grantee read is 404, never 403), enforced server-side; the
-//! client's job is to build the record and pick a monotonic `seq`.
+//! Object ACL subcommands (gated reads) — Model A: an `id:` owner self-signs
+//! a policy **assertion** (the `policy` kind on the self-assertion substrate,
+//! dials plan D1) and PUTs it to `/{did}/assertion/policy/{cid}`. Denial is
+//! oracle-free (a non-grantee read is 404, never 403), enforced server-side;
+//! the client's job is to build the record and pick a monotonic `seq`.
 
 use anyhow::{bail, Context, Result};
 
 use ciss::crypto::Keypair;
 use ciss::identity::derive_id;
-use ciss::policy::{PolicyRecord, ReadClass};
+use ciss::assertion::SignedAssertion;
+use ciss::policy::{policy_body_fold, PolicyBody, ReadClass, POLICY_KIND};
 
 use crate::client::{session_for, Client};
 
@@ -47,12 +49,21 @@ pub async fn set(
     let current = client.get_object_policy(Some(&session), &did, cid).await?;
     let next_seq = current
         .as_ref()
-        .and_then(|v| v["seq"].as_u64())
+        .and_then(|v| v["assertion"]["seq"].as_u64())
         .unwrap_or(0)
         + 1;
 
-    let record = PolicyRecord::sign_owner(&did, Some(cid), read_class, readers, next_seq, keypair);
-    let body = serde_json::to_vec(&record).context("serialize policy record")?;
+    let policy_body = PolicyBody { read_class, readers: readers.to_vec() };
+    let record = SignedAssertion::sign_owner(
+        POLICY_KIND,
+        &did,
+        Some(cid),
+        next_seq,
+        serde_json::to_value(&policy_body).context("policy body to json")?,
+        &policy_body_fold(&policy_body),
+        keypair,
+    );
+    let body = serde_json::to_vec(&record).context("serialize policy assertion")?;
     let seq = client.put_object_policy(&did, cid, &body).await?;
 
     if json_out {
@@ -90,13 +101,12 @@ pub async fn set_model_c(
     let current = client.get_object_policy_bearer(owner_did, cid, get_token).await?;
     let next_seq = current
         .as_ref()
-        .and_then(|v| v["seq"].as_u64())
+        .and_then(|v| v["assertion"]["seq"].as_u64())
         .unwrap_or(0)
         + 1;
     let intent = serde_json::json!({
-        "read_class": class,
-        "readers": readers,
         "seq": next_seq,
+        "body": { "read_class": class, "readers": readers },
     })
     .to_string();
     let seq = client

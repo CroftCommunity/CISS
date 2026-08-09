@@ -106,6 +106,16 @@ per-repo read ACL): a gated read to an unauthenticated caller returns **404**
 not read (otherwise the gate leaks CIDs). Gated namespaces are not on the
 public-replication (`subscribeRepos`/relay) surface.
 
+**Amendment (2026-08-08 — record plumbing re-homed, dials plan D1).** The
+policy record's envelope (Model A/C signatures, monotonic seq, storage,
+routes) moved onto the shared **self-assertion substrate**
+(`src/assertion.rs`; plan: `docs/plans/2026-08-07-self-assertion-dials.md`):
+policy is now the `policy` *kind* at `PUT/GET /{did}/assertion/policy[/{cid}]`,
+with the substrate's uniform typed 409 staleness and a provider **ack**
+countersigned on every write. The *semantics* of this ADR — Model A/C, Z4–Z8,
+oracle-free denial, owner-only read-back visibility — are unchanged; wire
+shapes updated in `docs/spec/gated-reads.md` (pre-1.0, stored records wiped).
+
 **Amendment (2026-08-05 — gated reads built).** The grain resolved to **both
 namespace and per-object, composed** (finest-grain-wins: an object policy
 overrides its namespace policy, which overrides the `world` default) — the minimal

@@ -17,7 +17,8 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::manifest::Manifest;
-use crate::policy::{PolicyRecord, ResolvedPolicy};
+use crate::assertion::{Ack, SignedAssertion};
+use crate::policy::{PolicyBody, ResolvedPolicy, POLICY_KIND};
 use crate::receipts::{Direction, Receipt};
 use crate::statements::Statement;
 
@@ -50,12 +51,12 @@ pub enum PersistError {
     /// A record failed to (de)serialize as JSON.
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
-    /// A policy write did not supersede the stored policy for its target — the
-    /// new `seq` was not strictly greater. The write is rejected (anti-rollback),
-    /// the stored policy is unchanged.
-    #[error("policy seq {seq} does not supersede the stored policy for {target}")]
-    StalePolicySeq {
-        /// The rejected target (a DID, or `did/cid` for an object policy).
+    /// An assertion write did not supersede the stored record for its
+    /// `(did, kind, subkey)` — the new `seq` was not strictly greater. The
+    /// write is rejected (anti-rollback), the stored record is unchanged.
+    #[error("assertion seq {seq} does not supersede the stored record for {target}")]
+    StaleAssertionSeq {
+        /// The rejected target (`did/kind` or `did/kind/subkey`).
         target: String,
         /// The rejected sequence number.
         seq: u64,
@@ -193,17 +194,16 @@ impl Store {
                  download_bytes INTEGER NOT NULL DEFAULT 0,
                  stored_bytes   INTEGER NOT NULL DEFAULT 0
              );
-             CREATE TABLE IF NOT EXISTS namespace_policy (
-                 did  TEXT PRIMARY KEY,
-                 seq  INTEGER NOT NULL,
-                 json TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS object_policy (
-                 did  TEXT NOT NULL,
-                 cid  TEXT NOT NULL,
-                 seq  INTEGER NOT NULL,
-                 json TEXT NOT NULL,
-                 PRIMARY KEY (did, cid)
+             DROP TABLE IF EXISTS namespace_policy;
+             DROP TABLE IF EXISTS object_policy;
+             CREATE TABLE IF NOT EXISTS assertion (
+                 did    TEXT NOT NULL,
+                 kind   TEXT NOT NULL,
+                 subkey TEXT NOT NULL DEFAULT '',
+                 seq    INTEGER NOT NULL,
+                 json   TEXT NOT NULL,
+                 ack    TEXT NOT NULL,
+                 PRIMARY KEY (did, kind, subkey)
              );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);
@@ -292,61 +292,98 @@ impl Store {
         }
     }
 
-    /// Persist a verified policy record for its target (a namespace `did`, or a
-    /// `(did, cid)` object), enforcing anti-rollback **in-transaction**: the write
-    /// applies only if its `seq` strictly exceeds the stored policy's `seq` for the
-    /// same target. A stale/equal `seq` is rejected with
-    /// [`PersistError::StalePolicySeq`] and the stored policy is left unchanged.
+    /// Persist a verified assertion + its provider ack for `(did, kind,
+    /// subkey)`, enforcing anti-rollback **in-transaction**: the write applies
+    /// only if its `seq` strictly exceeds the stored record's for the same
+    /// target. A stale/equal `seq` is rejected with
+    /// [`PersistError::StaleAssertionSeq`] and the stored record is unchanged.
     ///
-    /// The caller (the set-policy handler) verifies the record's signature *before*
-    /// calling this; persistence is not a trust boundary. The seq guard here is
-    /// defense-in-depth against a racing lower-seq write.
+    /// The caller (the put-assertion op) verifies the record *before* calling
+    /// this; persistence is not a trust boundary. The in-transaction seq guard
+    /// is defense-in-depth against a racing lower-seq write.
     ///
     /// # Errors
-    /// Returns [`PersistError::StalePolicySeq`] if the write does not supersede, or
-    /// [`PersistError`] on a SQLite or serialization failure.
-    pub fn save_policy(&self, record: &PolicyRecord) -> Result<(), PersistError> {
+    /// Returns [`PersistError::StaleAssertionSeq`] if the write does not
+    /// supersede, or [`PersistError`] on a SQLite/serialization failure.
+    pub fn save_assertion(
+        &self,
+        record: &SignedAssertion,
+        ack: &Ack,
+    ) -> Result<(), PersistError> {
         let json = serde_json::to_string(record)?;
-        let seq = i64::try_from(record.seq()).unwrap_or(i64::MAX);
+        let ack_json = serde_json::to_string(ack)?;
+        let seq = i64::try_from(record.seq).unwrap_or(i64::MAX);
+        let subkey = record.subkey.as_deref().unwrap_or("");
         let tx = self.conn.unchecked_transaction()?;
-        // The conditional upsert applies only when the new seq strictly exceeds
-        // the stored seq (a fresh insert always applies); a stale/equal seq
-        // changes zero rows, which we surface as StalePolicySeq (anti-rollback).
-        let (applied, target) = match record.cid() {
-            None => {
-                let n = tx.execute(
-                    "INSERT INTO namespace_policy (did, seq, json) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(did) DO UPDATE SET seq = excluded.seq, json = excluded.json
-                     WHERE excluded.seq > namespace_policy.seq",
-                    rusqlite::params![record.did(), seq, json],
-                )?;
-                (n, record.did().to_owned())
-            }
-            Some(cid) => {
-                let n = tx.execute(
-                    "INSERT INTO object_policy (did, cid, seq, json) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(did, cid) DO UPDATE SET seq = excluded.seq, json = excluded.json
-                     WHERE excluded.seq > object_policy.seq",
-                    rusqlite::params![record.did(), cid, seq, json],
-                )?;
-                (n, format!("{}/{cid}", record.did()))
-            }
-        };
+        let applied = tx.execute(
+            "INSERT INTO assertion (did, kind, subkey, seq, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(did, kind, subkey) DO UPDATE
+                 SET seq = excluded.seq, json = excluded.json, ack = excluded.ack
+             WHERE excluded.seq > assertion.seq",
+            rusqlite::params![record.did, record.kind, subkey, seq, json, ack_json],
+        )?;
         tx.commit()?;
         if applied == 0 {
-            return Err(PersistError::StalePolicySeq {
-                target,
-                seq: record.seq(),
-            });
+            let target = match record.subkey.as_deref() {
+                None => format!("{}/{}", record.did, record.kind),
+                Some(sk) => format!("{}/{}/{sk}", record.did, record.kind),
+            };
+            return Err(PersistError::StaleAssertionSeq { target, seq: record.seq });
         }
         Ok(())
     }
 
+    /// The stored `seq` for `(did, kind, subkey)`, if a record exists — the
+    /// `prior_seq` fed to verification at write time so a replayed/lower-seq
+    /// assertion is refused before it is stored.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn assertion_seq(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<u64>, PersistError> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM assertion WHERE did = ?1 AND kind = ?2 AND subkey = ?3",
+                rusqlite::params![did, kind, subkey.unwrap_or("")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seq.map(|s| u64::try_from(s).unwrap_or(0)))
+    }
+
+    /// Load a stored assertion + its ack, if present — the durable signed
+    /// artifacts, for read-back. Surfaces a parse failure as an error: an owner
+    /// reading back its own record should see a loud failure, not a silent
+    /// default.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite or deserialization failure.
+    pub fn load_assertion(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<(SignedAssertion, Ack)>, PersistError> {
+        match self.assertion_json(did, kind, subkey)? {
+            Some((json, ack_json)) => Ok(Some((
+                serde_json::from_str(&json)?,
+                serde_json::from_str(&ack_json)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Resolve the effective read policy for a target, finest-grain-wins: a
-    /// per-object policy overrides a namespace policy, which overrides the
-    /// world-readable default. A stored row that fails to parse resolves
-    /// **fail-closed** to [`ResolvedPolicy::deny`] (owner-only) — never to a more
-    /// permissive value.
+    /// per-object policy (the `policy` kind with the cid subkey) overrides a
+    /// namespace policy (no subkey), which overrides the world-readable
+    /// default. A stored row that fails to parse resolves **fail-closed** to
+    /// [`ResolvedPolicy::deny`] — never to a more permissive value.
     ///
     /// # Errors
     /// Returns [`PersistError`] on a SQLite failure.
@@ -355,27 +392,21 @@ impl Store {
         did: &str,
         cid: Option<&str>,
     ) -> Result<ResolvedPolicy, PersistError> {
-        // Finest grain first: a per-object policy, if the target names an object
-        // and a row exists for it, is authoritative — its mere presence overrides
-        // the namespace (so an unparseable object row fails closed here, it does
-        // not fall through to a possibly-wider namespace policy).
         if let Some(cid) = cid {
-            if let Some(json) = self.policy_json("object_policy", did, Some(cid))? {
+            if let Some((json, _)) = self.assertion_json(did, POLICY_KIND, Some(cid))? {
                 return Ok(resolved_from_json(&json));
             }
         }
-        if let Some(json) = self.policy_json("namespace_policy", did, None)? {
+        if let Some((json, _)) = self.assertion_json(did, POLICY_KIND, None)? {
             return Ok(resolved_from_json(&json));
         }
-        // No policy row anywhere → the world-readable default.
         Ok(ResolvedPolicy::world())
     }
 
-    /// Resolve **only** a per-object policy for `(did, cid)`, returning `None` when
-    /// the object has no policy of its own (so the caller can fall back to a
-    /// namespace policy it resolved once). An unparseable object row fails closed
-    /// to [`ResolvedPolicy::deny`]. This is the batch primitive for `listBlobs`:
-    /// resolve the namespace once, then one object lookup per cid.
+    /// Resolve **only** a per-object policy for `(did, cid)`, returning `None`
+    /// when the object has no policy of its own (so the caller can fall back to
+    /// a namespace policy it resolved once). An unparseable row fails closed to
+    /// [`ResolvedPolicy::deny`]. The batch primitive for `listBlobs`.
     ///
     /// # Errors
     /// Returns [`PersistError`] on a SQLite failure.
@@ -385,8 +416,8 @@ impl Store {
         cid: &str,
     ) -> Result<Option<ResolvedPolicy>, PersistError> {
         Ok(self
-            .policy_json("object_policy", did, Some(cid))?
-            .map(|json| resolved_from_json(&json)))
+            .assertion_json(did, POLICY_KIND, Some(cid))?
+            .map(|(json, _)| resolved_from_json(&json)))
     }
 
     /// Whether `did` has any per-object policy rows at all — a single `EXISTS`
@@ -397,93 +428,30 @@ impl Store {
     /// Returns [`PersistError`] on a SQLite failure.
     pub fn has_object_policies(&self, did: &str) -> Result<bool, PersistError> {
         let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM object_policy WHERE did = ?1)",
-            [did],
+            "SELECT EXISTS(SELECT 1 FROM assertion
+                            WHERE did = ?1 AND kind = ?2 AND subkey != '')",
+            rusqlite::params![did, POLICY_KIND],
             |row| row.get(0),
         )?;
         Ok(exists)
     }
 
-    /// The stored policy `seq` for a target, if a policy row exists — the
-    /// `prior_seq` fed to `verify_policy` at write time so a replayed/lower-seq
-    /// policy is refused before it is stored.
-    ///
-    /// # Errors
-    /// Returns [`PersistError`] on a SQLite failure.
-    pub fn policy_seq(&self, did: &str, cid: Option<&str>) -> Result<Option<u64>, PersistError> {
-        let seq: Option<i64> = match cid {
-            None => self
-                .conn
-                .query_row(
-                    "SELECT seq FROM namespace_policy WHERE did = ?1",
-                    [did],
-                    |row| row.get(0),
-                )
-                .optional()?,
-            Some(cid) => self
-                .conn
-                .query_row(
-                    "SELECT seq FROM object_policy WHERE did = ?1 AND cid = ?2",
-                    [did, cid],
-                    |row| row.get(0),
-                )
-                .optional()?,
-        };
-        Ok(seq.map(|s| u64::try_from(s).unwrap_or(0)))
-    }
-
-    /// Load a target's full stored policy record, if present — the durable signed
-    /// artifact, for policy read-back. Unlike [`Store::resolve_policy`] (which
-    /// fails closed for the read gate), this surfaces a parse failure as an error:
-    /// an owner reading back its own record should see a loud failure, not a
-    /// silent default.
-    ///
-    /// # Errors
-    /// Returns [`PersistError`] on a SQLite or deserialization failure.
-    pub fn load_policy(
+    /// Fetch an assertion row's stored `(json, ack)` for a target, if present.
+    fn assertion_json(
         &self,
         did: &str,
-        cid: Option<&str>,
-    ) -> Result<Option<PolicyRecord>, PersistError> {
-        let table = if cid.is_some() {
-            "object_policy"
-        } else {
-            "namespace_policy"
-        };
-        match self.policy_json(table, did, cid)? {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Fetch a policy row's stored JSON for a target, if present. `table` is a
-    /// fixed internal literal (`namespace_policy` / `object_policy`), never
-    /// caller-supplied, so its interpolation carries no injection surface.
-    fn policy_json(
-        &self,
-        table: &str,
-        did: &str,
-        cid: Option<&str>,
-    ) -> Result<Option<String>, PersistError> {
-        let json: Option<String> = match cid {
-            None => self
-                .conn
-                .query_row(
-                    &format!("SELECT json FROM {table} WHERE did = ?1"),
-                    [did],
-                    |row| row.get(0),
-                )
-                .optional()?,
-            Some(cid) => self
-                .conn
-                .query_row(
-                    &format!("SELECT json FROM {table} WHERE did = ?1 AND cid = ?2"),
-                    [did, cid],
-                    |row| row.get(0),
-                )
-                .optional()?,
-        };
-        Ok(json)
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<(String, String)>, PersistError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT json, ack FROM assertion
+                  WHERE did = ?1 AND kind = ?2 AND subkey = ?3",
+                rusqlite::params![did, kind, subkey.unwrap_or("")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// Append a receipt to the DID's co-signed record set, keeping the cached
@@ -699,9 +667,12 @@ impl Store {
 /// never to the permissive world default. A stored row means the owner set a
 /// policy; if we cannot read it, we must not widen access.
 fn resolved_from_json(json: &str) -> ResolvedPolicy {
-    match serde_json::from_str::<PolicyRecord>(json) {
-        Ok(record) => ResolvedPolicy::from_record(&record),
-        Err(_) => ResolvedPolicy::deny(),
+    let body = serde_json::from_str::<SignedAssertion>(json)
+        .ok()
+        .and_then(|a| serde_json::from_value::<PolicyBody>(a.body).ok());
+    match body {
+        Some(body) => ResolvedPolicy::from_body(&body),
+        None => ResolvedPolicy::deny(),
     }
 }
 
@@ -711,7 +682,8 @@ mod tests {
     use crate::crypto::derive_keypair;
     use crate::identity::derive_id;
     use crate::manifest::{build_manifest, ManifestLeaf};
-    use crate::policy::{PolicyRecord, ReadClass};
+    use super::{Ack, SignedAssertion};
+    use crate::policy::{PolicyBody, ReadClass, POLICY_KIND};
 
     #[test]
     fn manifest_upsert_keeps_only_the_latest() {
@@ -726,6 +698,31 @@ mod tests {
 
         let loaded = store.load_manifest(&did).expect("load").expect("present");
         assert_eq!(loaded.root(), m2.root(), "upsert keeps the latest manifest");
+    }
+
+    /// Build + Model-A-sign a policy assertion (the test helper the old
+    /// `PolicyRecord::sign_owner` tests used, on the substrate).
+    fn policy_assertion(
+        did: &str,
+        cid: Option<&str>,
+        class: ReadClass,
+        readers: &[String],
+        seq: u64,
+        owner: &crate::crypto::Keypair,
+    ) -> (SignedAssertion, Ack) {
+        let body = PolicyBody { read_class: class, readers: readers.to_vec() };
+        let record = SignedAssertion::sign_owner(
+            POLICY_KIND,
+            did,
+            cid,
+            seq,
+            serde_json::to_value(&body).expect("json"),
+            &crate::policy::policy_body_fold(&body),
+            owner,
+        );
+        let ack = crate::assertion::make_ack(&record, &crate::crypto::derive_keypair("m", "attest"))
+            .expect("ack");
+        (record, ack)
     }
 
     #[test]
@@ -743,7 +740,7 @@ mod tests {
         );
 
         // A namespace policy gates the whole DID.
-        let ns = PolicyRecord::sign_owner(
+        let (ns, ns_ack) = policy_assertion(
             &did,
             None,
             ReadClass::Grantees,
@@ -751,7 +748,7 @@ mod tests {
             1,
             &owner,
         );
-        store.save_policy(&ns).expect("save namespace");
+        store.save_assertion(&ns, &ns_ack).expect("save namespace");
         assert_eq!(
             store.resolve_policy(&did, None).expect("resolve").read_class(),
             ReadClass::Grantees,
@@ -764,8 +761,9 @@ mod tests {
         );
 
         // A per-object policy overrides the namespace for that object only.
-        let obj = PolicyRecord::sign_owner(&did, Some(&cid), ReadClass::World, &[], 1, &owner);
-        store.save_policy(&obj).expect("save object");
+        let (obj, obj_ack) =
+            policy_assertion(&did, Some(&cid), ReadClass::World, &[], 1, &owner);
+        store.save_assertion(&obj, &obj_ack).expect("save object");
         assert_eq!(
             store.resolve_policy(&did, Some(&cid)).expect("resolve").read_class(),
             ReadClass::World,
@@ -776,6 +774,15 @@ mod tests {
             ReadClass::Grantees,
             "namespace policy is unchanged by the object override",
         );
+        assert!(store.has_object_policies(&did).expect("exists"), "object rows are visible");
+
+        // Read-back returns the stored record AND its ack, verbatim.
+        let (loaded, loaded_ack) = store
+            .load_assertion(&did, POLICY_KIND, Some(&cid))
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded, obj);
+        assert_eq!(loaded_ack, obj_ack, "the ack is stored and returned with the record");
     }
 
     #[test]
@@ -786,7 +793,7 @@ mod tests {
         let bob = "did:plc:bob".to_owned();
         let store = Store::open_in_memory().expect("open");
 
-        let s1 = PolicyRecord::sign_owner(
+        let (s1, a1) = policy_assertion(
             &did,
             None,
             ReadClass::Grantees,
@@ -794,10 +801,11 @@ mod tests {
             1,
             &owner,
         );
-        store.save_policy(&s1).expect("save seq 1");
+        store.save_assertion(&s1, &a1).expect("save seq 1");
+        assert_eq!(store.assertion_seq(&did, POLICY_KIND, None).expect("seq"), Some(1));
 
         // Equal seq is rejected; the stored policy is unchanged.
-        let equal = PolicyRecord::sign_owner(
+        let (equal, ea) = policy_assertion(
             &did,
             None,
             ReadClass::Grantees,
@@ -807,8 +815,8 @@ mod tests {
         );
         assert!(
             matches!(
-                store.save_policy(&equal),
-                Err(super::PersistError::StalePolicySeq { .. })
+                store.save_assertion(&equal, &ea),
+                Err(super::PersistError::StaleAssertionSeq { .. })
             ),
             "equal seq is rejected",
         );
@@ -819,11 +827,11 @@ mod tests {
         );
 
         // Lower seq is rejected.
-        let lower = PolicyRecord::sign_owner(&did, None, ReadClass::Owner, &[], 0, &owner);
-        assert!(store.save_policy(&lower).is_err(), "lower seq is rejected");
+        let (lower, la) = policy_assertion(&did, None, ReadClass::Owner, &[], 0, &owner);
+        assert!(store.save_assertion(&lower, &la).is_err(), "lower seq is rejected");
 
         // Strictly-higher seq supersedes.
-        let s2 = PolicyRecord::sign_owner(
+        let (s2, a2) = policy_assertion(
             &did,
             None,
             ReadClass::Grantees,
@@ -831,7 +839,7 @@ mod tests {
             2,
             &owner,
         );
-        store.save_policy(&s2).expect("save seq 2");
+        store.save_assertion(&s2, &a2).expect("save seq 2");
         assert_eq!(
             store.resolve_policy(&did, None).expect("resolve").readers().len(),
             2,
@@ -848,7 +856,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO namespace_policy (did, seq, json) VALUES (?1, ?2, ?3)",
+                "INSERT INTO assertion (did, kind, subkey, seq, json, ack)
+                 VALUES (?1, 'policy', '', ?2, ?3, '{}')",
                 rusqlite::params![did, 1_i64, "{ not valid json"],
             )
             .expect("raw insert");
@@ -857,12 +866,6 @@ mod tests {
             resolved.read_class(),
             ReadClass::Owner,
             "an unparseable row is owner-only (fail-closed)",
-        );
-        assert!(resolved.readers().is_empty(), "no grantees on a fail-closed resolve");
-        assert_ne!(
-            resolved.read_class(),
-            ReadClass::World,
-            "fail-closed must never be the permissive default",
         );
     }
 

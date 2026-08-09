@@ -8,12 +8,36 @@ use std::sync::Arc;
 
 use ciss::crypto::{derive_keypair, sha256_hex, Keypair};
 use ciss::identity::derive_id;
-use ciss::policy::{PolicyRecord, ReadClass};
+use ciss::assertion::SignedAssertion;
+use ciss::policy::{policy_body_fold, PolicyBody, ReadClass, POLICY_KIND};
 use ciss::server::{App, Blobs, Db};
 use ciss_auth::{did_key_secp256k1, mint_service_auth_jwt};
 use ciss_cli::client::{session_for, Client, Session};
 use ciss_resolve::{DidResolver, StaticResolver};
 use k256::ecdsa::SigningKey;
+
+/// Model-A-sign a per-object policy assertion (the substrate shape).
+fn signed_policy(
+    did: &str,
+    cid: &str,
+    class: ReadClass,
+    readers: &[String],
+    seq: u64,
+    keypair: &ciss::crypto::Keypair,
+) -> Vec<u8> {
+    let body = PolicyBody { read_class: class, readers: readers.to_vec() };
+    let record = SignedAssertion::sign_owner(
+        POLICY_KIND,
+        did,
+        Some(cid),
+        seq,
+        serde_json::to_value(&body).expect("json"),
+        &policy_body_fold(&body),
+        keypair,
+    );
+    serde_json::to_vec(&record).expect("serialize")
+}
+
 
 async fn spawn_server() -> String {
     let app = App::new("provider-master", Blobs::Memory, Db::Memory).expect("build app");
@@ -56,16 +80,16 @@ async fn model_a_three_party_gate_is_oracle_free_and_leak_free() {
     client.put_s3(&owner.session, "memo.txt", &payload).await.expect("owner upload");
 
     // Owner sets a grantees policy naming the grantee (seq 1).
-    let record = PolicyRecord::sign_owner(
+    let record = signed_policy(
         &owner.did,
-        Some(&cid),
+        &cid,
         ReadClass::Grantees,
         std::slice::from_ref(&grantee.did),
         1,
         &owner.keypair,
     );
     let seq = client
-        .put_object_policy(&owner.did, &cid, &serde_json::to_vec(&record).unwrap())
+        .put_object_policy(&owner.did, &cid, &record)
         .await
         .expect("set policy");
     assert_eq!(seq, 1, "first policy is seq 1");
@@ -163,7 +187,7 @@ async fn model_a_three_party_gate_is_oracle_free_and_leak_free() {
 
 const SERVICE_DID: &str = "did:web:ciss.test";
 const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
-const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+const SET_POLICY_LXM: &str = "ing.croft.ciss.putAssertion";
 const GETBLOB_LXM: &str = "com.atproto.sync.getBlob";
 const FAR_FUTURE: u64 = 4_000_000_000;
 
@@ -240,9 +264,8 @@ async fn model_c_did_owner_gate_and_bad_jwt_is_403() {
 
     // Owner sets a grantees policy naming the grantee, via intent + setPolicy JWT.
     let intent = serde_json::json!({
-        "read_class": "grantees",
-        "readers": [grantee.did],
         "seq": 1,
+        "body": { "read_class": "grantees", "readers": [grantee.did] },
     })
     .to_string();
     let seq = client
@@ -293,17 +316,8 @@ async fn a_stale_policy_seq_is_refused_409() {
     client.put_s3(&owner.session, "x.txt", &payload).await.expect("upload");
 
     let readers = std::slice::from_ref(&grantee.did);
-    let make = |seq| {
-        serde_json::to_vec(&PolicyRecord::sign_owner(
-            &owner.did,
-            Some(&cid),
-            ReadClass::Grantees,
-            readers,
-            seq,
-            &owner.keypair,
-        ))
-        .unwrap()
-    };
+    let make =
+        |seq| signed_policy(&owner.did, &cid, ReadClass::Grantees, readers, seq, &owner.keypair);
 
     assert_eq!(client.put_object_policy(&owner.did, &cid, &make(2)).await.unwrap(), 2);
     // Re-submitting seq 2 (equal) or a lower seq must be refused 409.

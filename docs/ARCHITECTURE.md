@@ -69,7 +69,7 @@ they meter identically.
 3. A provider-signed **Download** receipt is appended.
 
 Policy is set on a dedicated surface (`PUT/GET /{did}/policy` and
-`/{did}/objects/{cid}/policy`) by submitting an owner-authorized policy record
+`/{did}/assertion/policy/{cid}`) by submitting an owner-authorized policy assertion (the `policy` kind on the self-assertion substrate, `src/assertion.rs`)
 (`id:` owner self-signs; `did:` owner authorizes via a service-auth JWT that CISS
 provider-attests). `listBlobs` filters the same way — hidden cids are omitted.
 

@@ -14,7 +14,8 @@ use common::{TestServer, World, SERVICE_DID, SET_POLICY_LXM};
 
 use ciss::crypto::{derive_keypair, sha256_hex, Keypair};
 use ciss::identity::derive_id;
-use ciss::policy::{PolicyRecord, ReadClass};
+use ciss::assertion::SignedAssertion;
+use ciss::policy::{policy_body_fold, PolicyBody, ReadClass, POLICY_KIND};
 use ciss::server::{App, Blobs, Db};
 
 /// Unix seconds now (for minting custom-`exp` tokens in the Model-C flow).
@@ -37,6 +38,27 @@ fn actor(label: &str) -> (Keypair, String, String, String) {
 }
 
 /// A signed namespace policy record body (Model A), serialized for the wire.
+fn policy_assertion(
+    owner_did: &str,
+    cid: Option<&str>,
+    class: ReadClass,
+    readers: &[String],
+    seq: u64,
+    owner_kp: &Keypair,
+) -> Vec<u8> {
+    let body = PolicyBody { read_class: class, readers: readers.to_vec() };
+    let record = SignedAssertion::sign_owner(
+        POLICY_KIND,
+        owner_did,
+        cid,
+        seq,
+        serde_json::to_value(&body).expect("json"),
+        &policy_body_fold(&body),
+        owner_kp,
+    );
+    serde_json::to_vec(&record).expect("serialize policy assertion")
+}
+
 fn namespace_policy(
     owner_did: &str,
     class: ReadClass,
@@ -44,8 +66,7 @@ fn namespace_policy(
     seq: u64,
     owner_kp: &Keypair,
 ) -> Vec<u8> {
-    let record = PolicyRecord::sign_owner(owner_did, None, class, readers, seq, owner_kp);
-    serde_json::to_vec(&record).expect("serialize policy")
+    policy_assertion(owner_did, None, class, readers, seq, owner_kp)
 }
 
 #[tokio::test]
@@ -86,7 +107,7 @@ async fn id_owner_policy_lifecycle_over_http() {
     };
     let put_policy = |body: Vec<u8>| {
         client
-            .put(server.url(&format!("/{owner_did}/policy")))
+            .put(server.url(&format!("/{owner_did}/assertion/policy")))
             .body(body)
             .send()
     };
@@ -168,10 +189,10 @@ async fn id_owner_policy_lifecycle_over_http() {
 
     // --- Per-object world override: the public blob is exposed again. ---
     let override_record =
-        PolicyRecord::sign_owner(&owner_did, Some(&public_cid), ReadClass::World, &[], 1, &owner_kp);
+        policy_assertion(&owner_did, Some(&public_cid), ReadClass::World, &[], 1, &owner_kp);
     let set_obj = client
-        .put(server.url(&format!("/{owner_did}/objects/{public_cid}/policy")))
-        .body(serde_json::to_vec(&override_record).unwrap())
+        .put(server.url(&format!("/{owner_did}/assertion/policy/{public_cid}")))
+        .body(override_record)
         .send()
         .await
         .expect("object policy");
@@ -228,7 +249,7 @@ async fn id_owner_policy_lifecycle_over_http() {
 
     // --- Read-back (Q4 owner-only reader-set visibility). ---
     let read_policy = |pk: Option<(&str, &str)>| {
-        let mut req = client.get(server.url(&format!("/{owner_did}/policy")));
+        let mut req = client.get(server.url(&format!("/{owner_did}/assertion/policy")));
         if let Some((p, s)) = pk {
             req = req.header("x-croft-pubkey", p).header("x-croft-session", s);
         }
@@ -238,7 +259,11 @@ async fn id_owner_policy_lifecycle_over_http() {
     assert_eq!(owner_view.status().as_u16(), 200);
     let owner_json: serde_json::Value =
         serde_json::from_str(&owner_view.text().await.unwrap()).unwrap();
-    assert!(owner_json.get("readers").is_some(), "the owner sees the reader set");
+    assert!(
+        owner_json["assertion"]["body"].get("readers").is_some(),
+        "the owner sees the reader set"
+    );
+    assert!(owner_json.get("ack").is_some(), "the owner read-back carries the ack");
 
     let alice_view = read_policy(Some((&alice_pk, &alice_sess))).await.unwrap();
     assert_eq!(alice_view.status().as_u16(), 200);
@@ -280,9 +305,8 @@ async fn did_owner_policy_via_service_auth_jwt() {
 
     // The `did:` owner grants alice via a valid set-policy JWT (Model C).
     let intent = serde_json::json!({
-        "read_class": "grantees",
-        "readers": [alice.did()],
         "seq": 1,
+        "body": { "read_class": "grantees", "readers": [alice.did()] },
     })
     .to_string();
     owner
@@ -346,9 +370,8 @@ async fn did_owner_policy_via_service_auth_jwt() {
     // Replayed jti: the same token used twice — the second use is refused.
     let replay_tok = owner.valid_set_policy_token("jti-replay");
     let higher = serde_json::json!({
-        "read_class": "grantees",
-        "readers": [alice.did(), bob.did()],
         "seq": 2,
+        "body": { "read_class": "grantees", "readers": [alice.did(), bob.did()] },
     })
     .to_string();
     owner
@@ -399,9 +422,8 @@ async fn did_reader_reads_gated_blob_and_grants_do_not_cross_namespaces() {
     let cidv1_b = ciss::cidv1::blob_cid_string(&blob_b);
 
     let grant_reader = serde_json::json!({
-        "read_class": "grantees",
-        "readers": [reader.did()],
         "seq": 1,
+        "body": { "read_class": "grantees", "readers": [reader.did()] },
     })
     .to_string();
     // A gates to reader; B gates to nobody (owner-only).
@@ -409,7 +431,9 @@ async fn did_reader_reads_gated_blob_and_grants_do_not_cross_namespaces() {
         .put_policy_with_token(&did_a, &owner_a.valid_set_policy_token("jti-a"), &grant_reader)
         .await
         .ok();
-    let owner_only = serde_json::json!({ "read_class": "owner", "readers": [], "seq": 1 }).to_string();
+    let owner_only =
+        serde_json::json!({ "seq": 1, "body": { "read_class": "owner", "readers": [] } })
+            .to_string();
     owner_b
         .put_policy_with_token(&did_b, &owner_b.valid_set_policy_token("jti-b"), &owner_only)
         .await
@@ -456,9 +480,8 @@ async fn did_owner_reads_back_own_policy() {
 
     // The did: owner gates its namespace to the grantee (Model C).
     let intent = serde_json::json!({
-        "read_class": "grantees",
-        "readers": [grantee.did()],
         "seq": 1,
+        "body": { "read_class": "grantees", "readers": [grantee.did()] },
     })
     .to_string();
     owner
@@ -473,8 +496,12 @@ async fn did_owner_reads_back_own_policy() {
     owner_view.ok();
     let owner_json = owner_view.json();
     assert!(
-        owner_json.get("readers").is_some(),
+        owner_json["assertion"]["body"].get("readers").is_some(),
         "the did: owner sees the full reader set",
+    );
+    assert!(
+        owner_json.get("ack").is_some(),
+        "the owner read-back carries the provider ack (proof the assertion took effect)",
     );
 
     // A did: grantee sees only its own access, never the reader set.
