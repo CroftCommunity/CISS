@@ -102,18 +102,22 @@ a grant/revoke **never re-signs or touches the manifest** (no billing side-effec
 and per-object policy is first-class (a whole-namespace manifest cannot carry
 per-object ACLs without bloat).
 
-**The serialized record (the shipped wire form).** A `PolicyRecord` has exactly
-these fields (`deny_unknown_fields` — no extra keys, and `cid` is present as
-`null` for a namespace policy). The `authorization` is an **externally-tagged**
-object naming the form (§4.1). A Model-A (`id:` owner) namespace grant:
+**The serialized record (the shipped wire form — the `policy` kind on the
+self-assertion substrate since D1, 2026-08-08).** A policy is a
+`SignedAssertion` with `kind: "policy"`; a namespace policy carries no
+`subkey`, a per-object policy carries the object's content address as the
+`subkey`. `deny_unknown_fields`; the `authorization` is an
+**externally-tagged** object naming the form (§4.1). A Model-A (`id:` owner)
+namespace grant:
 
 ```json
 {
-  "did":        "id:8a1f…<64 hex>",            // the owning DID; id: for OwnerSigned
-  "cid":        null,                           // null = namespace; else the object's 64-hex content address
-  "read_class": "grantees",                     // "world" | "grantees" | "owner"
-  "readers":    ["did:plc:bob", "did:web:carol.example"],   // DIDs; empty for world/owner
-  "seq":        7,                              // monotonic per target (anti-rollback)
+  "did":    "id:8a1f…<64 hex>",              // the owning DID; id: for OwnerSigned
+  "kind":   "policy",
+  "subkey": null,                             // null = namespace; else the object's 64-hex content address
+  "seq":    7,                                // monotonic per (did, kind, subkey) — anti-rollback
+  "body":   { "read_class": "grantees",       // "world" | "grantees" | "owner"
+              "readers": ["did:plc:bob", "did:web:carol.example"] },
   "authorization": {
     "OwnerSigned": { "signer": "<owner ed25519 pubkey hex>", "sig": "<hex sig over the preimage>" }
   }
@@ -122,27 +126,32 @@ object naming the form (§4.1). A Model-A (`id:` owner) namespace grant:
 
 A Model-C (`did:` owner) record is identical except `did` is a `did:*` and the
 authorization is `{"ProviderAttested": {"owner_did", "authorizing_jti",
-"provider_sig"}}` — but an integrator **never builds this**: it submits a
-`PolicyIntent` + JWT and CISS constructs and attests the record (§6, §4.1).
+"provider_sig"}}` — but an integrator **never builds this**: it submits an
+intent + JWT and CISS constructs and attests the record (§6, §4.1).
 
 **The signing preimage (Model A — reproduce it exactly to sign).** The `sig` is an
-ed25519 signature over this UTF-8 string:
+ed25519 signature over this UTF-8 string (the substrate preimage with the
+policy kind's body fold):
 
 ```
-ciss/v1/policy:<target_tag>:<seq>:<read_class>:<len>:<readers_sorted_joined>
+ciss/v1/assertion:policy:<did>:<subkey_or_dash>:<seq>:class=<read_class>;readers=<len>:<readers_sorted_joined>
 ```
 
-- `<target_tag>` = `ns:<did>` for a namespace, or `obj:<did>:<cid>` for an object
-  (binding the cid, so an object policy's signature cannot be lifted to another object).
+- `<subkey_or_dash>` = the object cid for a per-object policy, or the literal
+  `-` for a namespace policy (binding the cid, so an object policy's signature
+  cannot be lifted to another object).
 - `<read_class>` = the literal `world`/`grantees`/`owner`.
 - `<len>` = the number of readers; `<readers_sorted_joined>` = the `readers`
   entries **sorted ascending**, joined by `,` (empty string when none).
 
 Example (namespace `id:8a1f…`, grantees `[did:plc:bob, did:web:carol.example]`, seq 7):
-`ciss/v1/policy:ns:id:8a1f…:7:grantees:2:did:plc:bob,did:web:carol.example`
+`ciss/v1/assertion:policy:id:8a1f…:-:7:class=grantees;readers=2:did:plc:bob,did:web:carol.example`
 
-(CISS's provider attestation signs a parallel `ciss/v1/policy-attest:<owner_did>:…`
-preimage with its dedicated attestation key — internal; integrators don't build it.)
+(CISS's provider attestation signs a parallel
+`ciss/v1/assertion-attest:policy:<owner_did>:…` preimage with its dedicated
+attestation key, and every accepted write is countersigned with an **ack**
+over `ciss/v1/assertion-ack:policy:…` — returned on write and read-back, so
+an owner can prove the record took effect.)
 
 **Verification (what CISS checks before honoring a policy):**
 
@@ -205,27 +214,29 @@ Integrators: a `404` from a CISS read is **not** proof of non-existence, and a
 
 ## 6. Wire API  **[LIVE]**
 
-Policy is written to a **dedicated endpoint**, never as part of a manifest write:
+Policy is written to the **generic assertion endpoint** (D1), never as part
+of a manifest write:
 
-- `PUT /{did}/policy` — set/replace the **namespace** policy.
-- `PUT /{did}/objects/{cid}/policy` — set/replace a **per-object** policy.
-- `GET` on either path — **read back** the current policy.
+- `PUT /{did}/assertion/policy` — set/replace the **namespace** policy.
+- `PUT /{did}/assertion/policy/{cid}` — set/replace a **per-object** policy.
+- `GET` on either path — **read back** the current policy (+ its ack).
 
 The request body depends on the owner's authorization form (§4.1):
 
-- **Model A (`id:` owner).** The body is a full **signed `PolicyRecord`** (JSON,
-  §4) carrying `authorization: {OwnerSigned: {signer, sig}}`. No auth header — the
-  record's own signature is the authorization. The record's `did`/`cid` must match
-  the route.
+- **Model A (`id:` owner).** The body is a full **signed assertion** (JSON,
+  §4) carrying `authorization: {OwnerSigned: {signer, sig}}`. No auth header —
+  the record's own signature is the authorization. The record's
+  `did`/`kind`/`subkey` must match the route.
 - **Model C (`did:` owner).** The request carries a `Bearer` service-auth JWT
-  (`Authorization: Bearer <jwt>`, with `lxm = ing.croft.ciss.setPolicy`,
-  `aud =` the CISS service DID, `iss =` the owning DID) and the body is a
-  **`PolicyIntent`**: `{"read_class":
-  "world|grantees|owner", "readers": ["did:…", …], "seq": <n>}`. CISS verifies the
-  JWT, asserts the authenticated DID equals the target DID, then builds and
-  provider-attests the record. A present-but-invalid JWT is a hard `403`.
+  (`Authorization: Bearer <jwt>`, with `lxm = ing.croft.ciss.putAssertion`,
+  `aud =` the CISS service DID, `iss =` the owning DID) and the body is an
+  **intent**: `{"seq": <n>, "body": {"read_class": "world|grantees|owner",
+  "readers": ["did:…", …]}}`. CISS verifies the JWT, asserts the authenticated
+  DID equals the target DID, then builds and provider-attests the record. A
+  present-but-invalid JWT is a hard `403`.
 
-On success both return `{"seq": <n>}`. Failures are distinct: `400` (malformed
+On success both return `{"seq": <n>, "ack": {signer, sig}}` — the ack is the
+provider's countersignature over the stored record's digest. Failures are distinct: `400` (malformed
 body / target-route mismatch), `403` (unauthorized — bad/forged signature, wrong
 signer, non-`id:` target for `OwnerSigned`, or a failed/wrong-target JWT), `409`
 (the `seq` does not supersede the stored policy — anti-rollback).
@@ -235,9 +246,9 @@ signer, non-`id:` target for `OwnerSigned`, or a failed/wrong-target JWT), `409`
 
 **Reference integrator.** The `ciss-ctl acl set|get` client
 (`crates/ciss-cli`) is the reference implementation of both models: Model A
-(`--identity id`) builds and PUTs a self-signed `PolicyRecord`; Model C
-(`--identity did`) relays a `setPolicy`/`getPolicy` service-auth JWT and PUTs a
-`PolicyIntent`. Both auto-select `seq = current + 1` (reading the policy back
+(`--identity id`) builds and PUTs a self-signed policy assertion; Model C
+(`--identity did`) relays a `putAssertion`/`getPolicy` service-auth JWT and
+PUTs an intent. Both auto-select `seq = current + 1` (reading the policy back
 first) so the happy path never trips the `409` anti-rollback.
 
 **Read-back visibility (owner-only, resolved).** On `GET`, the **owner** receives

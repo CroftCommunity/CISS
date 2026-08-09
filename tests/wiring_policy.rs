@@ -4,13 +4,15 @@
 //! default in place. Uses SQLite in-memory mode, so this exercises the REAL
 //! persistence path (same code, file-backed in production) with no mocking.
 //!
-//! This is the wiring proof that `save_policy` → `resolve_policy` is a live call
-//! chain, not two components tested only in isolation.
+//! This is the wiring proof that `save_assertion` → `resolve_policy` is a live
+//! call chain, not two components tested only in isolation (the policy kind on
+//! the self-assertion substrate, dials plan D1).
 
+use ciss::assertion::{make_ack, SignedAssertion};
 use ciss::crypto::derive_keypair;
 use ciss::identity::derive_id;
 use ciss::persist::Store;
-use ciss::policy::{PolicyRecord, ReadClass};
+use ciss::policy::{policy_body_fold, PolicyBody, ReadClass, POLICY_KIND};
 
 #[test]
 fn saved_policy_resolves_back_through_a_real_store() {
@@ -28,16 +30,19 @@ fn saved_policy_resolves_back_through_a_real_store() {
     assert_eq!(before.read_class(), ReadClass::World);
     assert!(before.allows(None, &did), "anon reads world by default");
 
-    // The owner grants alice at the namespace grain.
-    let grant = PolicyRecord::sign_owner(
+    // The owner grants alice at the namespace grain (a policy assertion).
+    let body = PolicyBody { read_class: ReadClass::Grantees, readers: vec![alice.clone()] };
+    let grant = SignedAssertion::sign_owner(
+        POLICY_KIND,
         &did,
         None,
-        ReadClass::Grantees,
-        std::slice::from_ref(&alice),
         1,
+        serde_json::to_value(&body).expect("json"),
+        &policy_body_fold(&body),
         &owner,
     );
-    store.save_policy(&grant).expect("save namespace grant");
+    let ack = make_ack(&grant, &derive_keypair("ciss::wiring_policy", "attest")).expect("ack");
+    store.save_assertion(&grant, &ack).expect("save namespace grant");
 
     // Resolve pulls the saved policy back, and membership reflects it.
     let resolved = store

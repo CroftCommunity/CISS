@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 
+pub mod assertion;
 pub mod audit;
 pub mod blobstore;
 pub mod canonical;

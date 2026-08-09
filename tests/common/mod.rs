@@ -29,9 +29,9 @@ pub const SERVICE_DID: &str = "did:web:ciss.test";
 /// The XRPC method the atproto upload path binds `lxm` to.
 pub const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
 
-/// The lexicon method a Model-C set-policy service-auth JWT binds to (mirrors
-/// `ciss::server::SET_POLICY_LXM`).
-pub const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+/// The lexicon method a Model-C put-assertion service-auth JWT binds to
+/// (mirrors `ciss::server::PUT_ASSERTION_LXM` — one lxm for every kind).
+pub const SET_POLICY_LXM: &str = "ing.croft.ciss.putAssertion";
 
 /// The lexicon method a `did:` owner's policy **read-back** JWT binds to (mirrors
 /// `ciss::server::GET_POLICY_LXM`).
@@ -481,7 +481,7 @@ impl AtprotoActor {
     /// `GET /{target_did}/policy` presenting `token` as the bearer — a `did:` owner
     /// (or grantee) reading its policy back.
     pub async fn get_policy_with_token(&self, target_did: &str, token: &str) -> Outcome {
-        let url = format!("{}/{target_did}/policy", self.base);
+        let url = format!("{}/{target_did}/assertion/policy", self.base);
         Actor::run(
             self.client
                 .get(url)
@@ -529,7 +529,7 @@ impl AtprotoActor {
         token: &str,
         intent_json: &str,
     ) -> Outcome {
-        let url = format!("{}/{target_did}/policy", self.base);
+        let url = format!("{}/{target_did}/assertion/policy", self.base);
         Actor::run(
             self.client
                 .put(url)

@@ -236,10 +236,10 @@ impl ManifestSlot for HttpCiss {
             heads,
         );
         self.client.put_manifest(&self.session, &manifest).await.map_err(|e| {
-            // The server's I5 refusal ("manifest seq is not newer…") is the
-            // frontier loop's retry signal. Text-matching our own server's
-            // message is a known seam, pinned by the flow tests.
-            if format!("{e:#}").contains("seq is not newer") {
+            // The server's I5 refusal is the frontier loop's retry signal —
+            // detected by the typed 409 status (the D1.4 uniform staleness),
+            // never by matching English (the M3 text-match wart, healed).
+            if format!("{e:#}").contains("HTTP 409") {
                 SyncError::StaleSeq { attempted: seq }
             } else {
                 transport_err(e)

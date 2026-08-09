@@ -44,7 +44,8 @@ use crate::identifiers::{ContentAddr, Did};
 use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
-use crate::policy::{verify_policy, Authorization, PolicyRecord, ReadClass, ResolvedPolicy};
+use crate::assertion::{make_ack, SignedAssertion};
+use crate::policy::{policy_body_fold, policy_body_valid, PolicyBody, ReadClass, ResolvedPolicy, POLICY_KIND};
 use crate::pricing::postage_cents;
 use crate::receipts::{
     make_unilateral_receipt, select_mode, Direction, Receipt, ReceiptCore, ReceiptMode,
@@ -69,7 +70,7 @@ const SESSION_CHALLENGE_PREFIX: &str = "ciss-session/v1/";
 /// (`lxm`). A CISS-defined method (Q2): the `did:` owner's provider signs a token
 /// authorizing exactly this action, so a token minted for another method cannot
 /// be replayed to set policy.
-pub(crate) const SET_POLICY_LXM: &str = "ing.croft.ciss.setPolicy";
+pub(crate) const PUT_ASSERTION_LXM: &str = "ing.croft.ciss.putAssertion";
 
 /// The lexicon method a `did:` caller's **policy read-back** JWT binds to. Lets a
 /// `did:` owner (whose key lives at an external provider, so it holds no `id:`
@@ -368,12 +369,12 @@ impl App {
                 put(put_manifest_handler).get(get_manifest_handler),
             )
             .route(
-                "/{did}/policy",
-                put(put_policy_handler).get(get_policy_handler),
+                "/{did}/assertion/{kind}",
+                put(put_assertion_handler).get(get_assertion_handler),
             )
             .route(
-                "/{did}/objects/{addr}/policy",
-                put(put_object_policy_handler).get(get_object_policy_handler),
+                "/{did}/assertion/{kind}/{subkey}",
+                put(put_assertion_subkey_handler).get(get_assertion_subkey_handler),
             )
             .route("/{did}/meter", get(get_meter_handler))
             .route("/{did}/du", get(du_handler))
@@ -573,16 +574,19 @@ pub(crate) enum Op {
     /// owner-signed [`crate::policy::PolicyRecord`]. Model C (`authed = Some`):
     /// `body` is a [`crate::policy::PolicyIntent`] and CISS builds + provider-
     /// attests the record for the JWT-authenticated `did:` owner.
-    PutPolicy {
+    PutAssertion {
         did: String,
-        cid: Option<String>,
+        kind: String,
+        subkey: Option<String>,
         body: Vec<u8>,
         authed: Option<AuthedWrite>,
     },
-    /// Read back a target's policy record (owner-only reader-set visibility, Q4).
-    GetPolicy {
+    /// Read back a stored assertion + its ack (kind-specific visibility; the
+    /// `policy` kind keeps its Q4 owner-only reader-set rule).
+    GetAssertion {
         did: String,
-        cid: Option<String>,
+        kind: String,
+        subkey: Option<String>,
     },
     /// Usage report for a DID: per-object sizes + total (ADR 0003). Always
     /// self-only; `CISS_ADMIN_ONLY_DU` further restricts to admins (checked in-handler).
@@ -608,8 +612,8 @@ impl Op {
             | Op::GetManifest { .. }
             | Op::GetMeter { .. }
             | Op::ListBlobs { .. }
-            | Op::PutPolicy { .. }
-            | Op::GetPolicy { .. }
+            | Op::PutAssertion { .. }
+            | Op::GetAssertion { .. }
             | Op::Du { .. } => false,
         }
     }
@@ -645,12 +649,15 @@ pub(crate) enum OpOutcome {
     BlobList {
         cids: Vec<String>,
     },
-    /// A policy record was accepted and stored, at sequence `seq`.
-    PolicySaved {
+    /// An assertion was accepted and stored, at sequence `seq`, with the
+    /// provider ack (pre-serialized JSON) the customer keeps as proof.
+    AssertionSaved {
         seq: u64,
+        ack_json: String,
     },
-    /// A policy read-back body — either the full signed record (owner) or the
-    /// grantee's limited `{read_class, may_read}` view (Q4). Pre-serialized JSON.
+    /// An assertion read-back body — the full `{assertion, ack}` (owner) or a
+    /// kind-limited view (e.g. the policy grantee's `{read_class, may_read}`,
+    /// Q4). Pre-serialized JSON.
     PolicyBody {
         json: String,
     },
@@ -866,12 +873,12 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
         | Op::ListBlobs { .. }
-        // PutPolicy is self-authorizing (the signed record proves owner authority
-        // in op_put_policy, like PutManifest); GetPolicy applies owner-only
-        // reader-set visibility inside op_get_policy. Du checks self-or-admin
-        // (ADR 0003) inside op_du. All checked in-handler.
-        | Op::PutPolicy { .. }
-        | Op::GetPolicy { .. }
+        // PutAssertion is self-authorizing (the signed record proves owner
+        // authority in op_put_assertion, like PutManifest); GetAssertion
+        // applies kind-specific visibility inside op_get_assertion. Du checks
+        // self-or-admin (ADR 0003) inside op_du. All checked in-handler.
+        | Op::PutAssertion { .. }
+        | Op::GetAssertion { .. }
         | Op::Du { .. } => Ok(()),
     }
 }
@@ -942,13 +949,16 @@ pub(crate) fn dispatch(
         Op::GetManifest { did } => op_get_manifest(state, &did),
         Op::GetMeter { did } => op_get_meter(state, &did),
         Op::ListBlobs { did } => op_list_blobs(state, principal, &did),
-        Op::PutPolicy {
+        Op::PutAssertion {
             did,
-            cid,
+            kind,
+            subkey,
             body,
             authed,
-        } => op_put_policy(state, &did, cid.as_deref(), &body, authed.as_ref()),
-        Op::GetPolicy { did, cid } => op_get_policy(state, principal, &did, cid.as_deref()),
+        } => op_put_assertion(state, &did, &kind, subkey.as_deref(), &body, authed.as_ref()),
+        Op::GetAssertion { did, kind, subkey } => {
+            op_get_assertion(state, principal, &did, &kind, subkey.as_deref())
+        }
         Op::Du { did } => op_du(state, principal, &did),
     }
 }
@@ -1173,9 +1183,13 @@ fn op_put_manifest(
     let store = lock_store(&state.store);
     if let Some(existing) = store.load_manifest(did)? {
         if manifest.seq() <= existing.seq() {
-            return Err(ServerError::BadManifest(
-                "manifest seq is not newer than the stored manifest",
-            ));
+            // The uniform typed staleness (D1.4): the manifest conforms to
+            // the substrate's refusal — a 409 the client detects by status,
+            // not by matching English (the M3 text-match wart, healed).
+            return Err(ServerError::AssertionStale {
+                kind: "manifest".to_owned(),
+                attempted: manifest.seq(),
+            });
         }
     }
     store.save_manifest(did, &manifest)?;
@@ -1307,127 +1321,167 @@ fn op_du(state: &AppState, principal: &Principal, did: &str) -> Result<OpOutcome
     Ok(OpOutcome::UsageBody { json })
 }
 
-/// Set/replace a target's read policy from an owner-authorized record (Model A:
-/// an `id:` owner submits a self-signed [`PolicyRecord`]). The record must name
-/// the routed target, advance the stored `seq`, and verify — otherwise a distinct
-/// 4xx is returned. Verified records are persisted; reads honor them immediately
-/// via the dispatch gate.
-fn op_put_policy(
+/// The kind registry: parse + structurally validate a kind's body and
+/// return its canonical fold. The substrate binds did/kind/subkey/seq; the
+/// fold binds everything kind-specific. An unknown kind is refused — kinds
+/// are code, not data.
+fn kind_fold(
+    kind: &str,
+    subkey: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<String, ServerError> {
+    match kind {
+        POLICY_KIND => {
+            // A per-object policy's subkey must be a well-formed content
+            // address (the old `obj:` target validation, structurally).
+            if let Some(sk) = subkey {
+                ContentAddr::parse(sk)
+                    .map_err(|_| ServerError::BadAssertion("policy subkey is not a content address"))?;
+            }
+            let body: PolicyBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid policy body"))?;
+            if !policy_body_valid(&body) {
+                return Err(ServerError::BadAssertion("policy readers do not fit the read class"));
+            }
+            Ok(policy_body_fold(&body))
+        }
+        _ => Err(ServerError::BadAssertion("unknown assertion kind")),
+    }
+}
+
+/// Store a customer assertion (Model A: a full self-signed record; Model C:
+/// a JWT-authorized intent CISS attests). The record must name the routed
+/// target, its body must satisfy its kind, its `seq` must advance the stored
+/// record's, and its authorization must verify — each failure a distinct
+/// status. Verified records are persisted with the provider ack; reads honor
+/// them immediately via the dispatch gate.
+fn op_put_assertion(
     state: &AppState,
     did: &str,
-    cid: Option<&str>,
+    kind: &str,
+    subkey: Option<&str>,
     body: &[u8],
     authed: Option<&AuthedWrite>,
 ) -> Result<OpOutcome, ServerError> {
+    /// The Model-C wire body: the JWT authorizes the *action*; CISS builds
+    /// and attests the record from these fields.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Intent {
+        seq: u64,
+        body: serde_json::Value,
+    }
     let record = if let Some(auth) = authed {
-        // Model C: a `did:` owner authorized the action via a service-auth JWT
-        // (verified in the async handler). CISS builds the record from the intent
-        // and counter-signs it with its dedicated attestation key, so the stored
-        // record is durably verifiable without re-checking the JWT.
-        //
-        // The JWT must have authenticated the DID that owns the target.
+        // Model C: the JWT authenticated the owner; the body is an intent
+        // `{seq, body}`; CISS builds and attests the record.
         if auth.did != did {
             tracing::info!(
                 actor = %auth.did, resource = %did, reason = "did != target",
-                "policy-set denied"
+                "assertion-put denied"
             );
-            return Err(ServerError::PolicyUnauthorized);
+            return Err(ServerError::AssertionUnauthorized);
         }
-        let intent: crate::policy::PolicyIntent = serde_json::from_slice(body)
-            .map_err(|_| ServerError::BadPolicy("body is not a valid policy intent"))?;
-        PolicyRecord::attest_provider(
+        let intent: Intent = serde_json::from_slice(body)
+            .map_err(|_| ServerError::BadAssertion("body is not a valid assertion intent"))?;
+        let fold = kind_fold(kind, subkey, &intent.body)?;
+        SignedAssertion::attest_provider(
+            kind,
             did,
-            cid,
-            intent.read_class,
-            &intent.readers,
+            subkey,
             intent.seq,
+            intent.body,
+            &fold,
             auth.jti.as_deref().unwrap_or(""),
             &state.provider.attest_keypair,
         )
     } else {
         // Model A: an `id:` owner submitted a full self-signed record.
-        let record: PolicyRecord = serde_json::from_slice(body)
-            .map_err(|_| ServerError::BadPolicy("body is not a valid policy record"))?;
-        if record.did() != did || record.cid() != cid {
-            return Err(ServerError::BadPolicy("policy target does not match the route"));
+        let record: SignedAssertion = serde_json::from_slice(body)
+            .map_err(|_| ServerError::BadAssertion("body is not a valid signed assertion"))?;
+        if record.did != did || record.kind != kind || record.subkey.as_deref() != subkey {
+            return Err(ServerError::BadAssertion("assertion target does not match the route"));
         }
         record
     };
 
+    let fold = kind_fold(kind, subkey, &record.body)?;
     let store = lock_store(&state.store);
-    let prior_seq = store.policy_seq(did, cid)?;
+    let prior_seq = store.assertion_seq(did, kind, subkey)?;
 
-    // Anti-rollback at verify time: a replayed/equal/lower seq is refused with a
-    // distinct status, named before the signature check.
+    // Anti-rollback at verify time: a replayed/equal/lower seq is refused
+    // with the uniform typed staleness, named before the signature check.
     if let Some(prior) = prior_seq {
-        if record.seq() <= prior {
+        if record.seq <= prior {
             tracing::info!(
-                resource = %did, cid = ?cid, seq = record.seq(), prior,
-                reason = "lower seq", "policy-set denied"
+                resource = %did, kind, subkey = ?subkey, seq = record.seq, prior,
+                reason = "lower seq", "assertion-put denied"
             );
-            return Err(ServerError::PolicyStale);
+            return Err(ServerError::AssertionStale { kind: kind.to_owned(), attempted: record.seq });
         }
     }
 
-    // Authorization + structural validation: the record must verify (OwnerSigned
-    // derives the id: target; ProviderAttested verifies under the provider's
-    // dedicated attestation key). This also enforces readers-well-formed, so a
-    // malformed Model-C intent is refused here. seq was checked above, so None.
-    if !verify_policy(&record, None, &state.provider.attest_verifying_key()) {
+    // Authorization + structural validation (seq was checked above, so None).
+    if !record.verify(&fold, None, &state.provider.attest_verifying_key()) {
         tracing::info!(
-            resource = %did, cid = ?cid, reason = "unauthorized policy",
-            "policy-set denied"
+            resource = %did, kind, subkey = ?subkey, reason = "unauthorized assertion",
+            "assertion-put denied"
         );
-        return Err(ServerError::PolicyUnauthorized);
+        return Err(ServerError::AssertionUnauthorized);
     }
 
-    store.save_policy(&record)?;
-    let form = match record.authorization() {
-        Authorization::OwnerSigned(_) => "OwnerSigned",
-        Authorization::ProviderAttested(_) => "ProviderAttested",
-    };
+    // The provider acknowledgment: the countersignature that lets the
+    // customer prove — not merely hope — that the assertion took effect.
+    let ack = make_ack(&record, &state.provider.attest_keypair)?;
+    store.save_assertion(&record, &ack)?;
     tracing::debug!(
-        resource = %did, cid = ?cid, seq = record.seq(), form,
-        read_class = ?record.read_class(), "policy stored"
+        resource = %did, kind, subkey = ?subkey, seq = record.seq, "assertion stored"
     );
-    Ok(OpOutcome::PolicySaved { seq: record.seq() })
+    Ok(OpOutcome::AssertionSaved {
+        seq: record.seq,
+        ack_json: serde_json::to_string(&ack)?,
+    })
 }
 
-/// Read back a target's policy record, with **owner-only reader-set visibility**
-/// (Q4): the owner sees the full signed record; a grantee sees only that it may
-/// read (its read class, never the reader set); anyone else who cannot read the
-/// target gets a 404 — the same oracle-free denial as a gated blob read.
-fn op_get_policy(
+/// Read back a stored assertion + ack, with kind-specific visibility. The
+/// `policy` kind keeps its Q4 rule: the owner sees the full signed record;
+/// a grantee sees only that it may read (never the reader set); anyone else
+/// gets the oracle-free 404. Every other kind is owner-only (a dial is
+/// nobody's business but the parties').
+fn op_get_assertion(
     state: &AppState,
     principal: &Principal,
     did: &str,
-    cid: Option<&str>,
+    kind: &str,
+    subkey: Option<&str>,
 ) -> Result<OpOutcome, ServerError> {
-    let record = lock_store(&state.store)
-        .load_policy(did, cid)?
+    let (record, ack) = lock_store(&state.store)
+        .load_assertion(did, kind, subkey)?
         .ok_or(ServerError::NotFound)?;
     let caller = principal.did();
 
     if caller == Some(did) {
-        // The owner: the full signed record, including readers[].
-        return Ok(OpOutcome::PolicyBody {
-            json: serde_json::to_string(&record)?,
+        let full = serde_json::json!({
+            "assertion": record,
+            "ack": ack,
         });
+        return Ok(OpOutcome::PolicyBody { json: full.to_string() });
     }
 
-    // A non-owner sees the record only if it may read the target, and then only
-    // its own access — never the reader set.
-    if ResolvedPolicy::from_record(&record).allows(caller, did) {
-        let view = serde_json::json!({
-            "read_class": record.read_class(),
-            "may_read": true,
-        });
-        Ok(OpOutcome::PolicyBody {
-            json: view.to_string(),
-        })
-    } else {
-        Err(ServerError::NotFound)
+    if kind == POLICY_KIND {
+        // A non-owner sees a policy only if it may read the target, and then
+        // only its own access — never the reader set.
+        let body = serde_json::from_value::<PolicyBody>(record.body.clone()).ok();
+        if let Some(body) = body {
+            if ResolvedPolicy::from_body(&body).allows(caller, did) {
+                let view = serde_json::json!({
+                    "read_class": body.read_class,
+                    "may_read": true,
+                });
+                return Ok(OpOutcome::PolicyBody { json: view.to_string() });
+            }
+        }
     }
+    Err(ServerError::NotFound)
 }
 
 // ---- HTTP handlers: extract inputs, route through the dispatch boundary. ----
@@ -1516,45 +1570,47 @@ async fn get_manifest_handler(
 
 /// Resolve the set-policy authorization from the request headers. A `Bearer`
 /// service-auth JWT selects **Model C** (a `did:` owner): it is verified here
-/// (async — DID resolution) against the `SET_POLICY_LXM` method, yielding the
+/// (async — DID resolution) against the `PUT_ASSERTION_LXM` method, yielding the
 /// authenticated DID + `jti`. A present-but-invalid JWT is a hard 403. No bearer
 /// selects **Model A** (the body carries a self-signed record instead).
-async fn policy_write_auth(
+async fn assertion_write_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<AuthedWrite>, ServerError> {
     match bearer_token(headers) {
         Some(jwt) => {
-            let (principal, jti) = verify_service_auth_full(state, jwt, SET_POLICY_LXM).await;
+            let (principal, jti) = verify_service_auth_full(state, jwt, PUT_ASSERTION_LXM).await;
             match principal.did() {
                 Some(did) => Ok(Some(AuthedWrite {
                     did: did.to_owned(),
                     jti,
                 })),
-                None => Err(ServerError::PolicyUnauthorized),
+                None => Err(ServerError::AssertionUnauthorized),
             }
         }
         None => Ok(None),
     }
 }
 
-/// `PUT /{did}/policy` — set the namespace read policy. Model A: the body is a
-/// self-signed [`PolicyRecord`]. Model C: a `Bearer` service-auth JWT authorizes
-/// a `did:` owner and the body is a [`crate::policy::PolicyIntent`].
-async fn put_policy_handler(
+/// `PUT /{did}/assertion/{kind}` (and `…/{kind}/{subkey}`) — store a
+/// customer assertion. Model A: the body is a self-signed
+/// [`SignedAssertion`]. Model C: a `Bearer` service-auth JWT authorizes a
+/// `did:` owner and the body is an intent `{seq, body}` CISS attests.
+async fn put_assertion_handler(
     State(state): State<AppState>,
-    Path(did): Path<String>,
+    Path((did, kind)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    let authed = policy_write_auth(&state, &headers).await?;
+    let authed = assertion_write_auth(&state, &headers).await?;
     dispatch_blocking(
         &state,
         Principal::Anonymous,
-        Op::PutPolicy {
+        Op::PutAssertion {
             did: did.into_string(),
-            cid: None,
+            kind,
+            subkey: None,
             body: body.to_vec(),
             authed,
         },
@@ -1562,22 +1618,23 @@ async fn put_policy_handler(
     .await
 }
 
-/// `PUT /{did}/objects/{addr}/policy` — set a per-object read policy (Model A or C).
-async fn put_object_policy_handler(
+/// `PUT /{did}/assertion/{kind}/{subkey}` — the subkeyed form (e.g. a
+/// per-object policy, whose subkey is the object cid).
+async fn put_assertion_subkey_handler(
     State(state): State<AppState>,
-    Path((did, addr)): Path<(String, String)>,
+    Path((did, kind, subkey)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    let addr = ContentAddr::parse(&addr)?;
-    let authed = policy_write_auth(&state, &headers).await?;
+    let authed = assertion_write_auth(&state, &headers).await?;
     dispatch_blocking(
         &state,
         Principal::Anonymous,
-        Op::PutPolicy {
+        Op::PutAssertion {
             did: did.into_string(),
-            cid: Some(addr.into_string()),
+            kind,
+            subkey: Some(subkey),
             body: body.to_vec(),
             authed,
         },
@@ -1585,13 +1642,12 @@ async fn put_object_policy_handler(
     .await
 }
 
-/// `GET /{did}/policy` — read back the namespace policy. Authenticated so the
-/// owner sees the full record and a grantee its limited view (Q4). Accepts either
-/// a `did:` service-auth JWT (`lxm = getPolicy`) or an `id:` session, so a `did:`
-/// owner can read its own policy back.
-async fn get_policy_handler(
+/// `GET /{did}/assertion/{kind}` — read back an assertion + ack.
+/// Authenticated so the owner sees the full record; the `policy` kind keeps
+/// its Q4 grantee view. Accepts a `did:` service-auth JWT or an `id:` session.
+async fn get_assertion_handler(
     State(state): State<AppState>,
-    Path(did): Path<String>,
+    Path((did, kind)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
@@ -1599,29 +1655,30 @@ async fn get_policy_handler(
     dispatch_blocking(
         &state,
         principal,
-        Op::GetPolicy {
+        Op::GetAssertion {
             did: did.into_string(),
-            cid: None,
+            kind,
+            subkey: None,
         },
     )
     .await
 }
 
-/// `GET /{did}/objects/{addr}/policy` — read back a per-object policy (Q4).
-async fn get_object_policy_handler(
+/// `GET /{did}/assertion/{kind}/{subkey}` — the subkeyed read-back.
+async fn get_assertion_subkey_handler(
     State(state): State<AppState>,
-    Path((did, addr)): Path<(String, String)>,
+    Path((did, kind, subkey)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    let addr = ContentAddr::parse(&addr)?;
     let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
     dispatch_blocking(
         &state,
         principal,
-        Op::GetPolicy {
+        Op::GetAssertion {
             did: did.into_string(),
-            cid: Some(addr.into_string()),
+            kind,
+            subkey: Some(subkey),
         },
     )
     .await
@@ -1739,9 +1796,12 @@ impl IntoResponse for OpOutcome {
             OpOutcome::BlobList { cids } => {
                 Json(serde_json::json!({ "cids": cids })).into_response()
             }
-            OpOutcome::PolicySaved { seq } => {
-                Json(serde_json::json!({ "seq": seq })).into_response()
-            }
+            OpOutcome::AssertionSaved { seq, ack_json } => Json(serde_json::json!({
+                "seq": seq,
+                "ack": serde_json::from_str::<serde_json::Value>(&ack_json)
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+            .into_response(),
         }
     }
 }
@@ -1824,16 +1884,24 @@ pub enum ServerError {
     /// A blocking dispatch task failed to join (e.g. panicked) — never expected.
     #[error("internal task failure")]
     TaskJoin,
-    /// A policy record was malformed or its target did not match the route.
-    #[error("invalid policy: {0}")]
-    BadPolicy(&'static str),
-    /// A policy record failed authorization (bad/forged signature, wrong signer,
+    /// An assertion was malformed, of an unknown kind, or its target did not
+    /// match the route.
+    #[error("invalid assertion: {0}")]
+    BadAssertion(&'static str),
+    /// An assertion failed authorization (bad/forged signature, wrong signer,
     /// or an `OwnerSigned` record naming a non-`id:` target).
-    #[error("forbidden: policy record is not authorized for this target")]
-    PolicyUnauthorized,
-    /// A policy write did not advance the stored sequence (anti-rollback).
-    #[error("conflict: policy seq does not supersede the stored policy")]
-    PolicyStale,
+    #[error("forbidden: assertion is not authorized for this target")]
+    AssertionUnauthorized,
+    /// A write did not advance the stored sequence (anti-rollback) — the
+    /// uniform typed staleness every self-assertion kind (and the manifest)
+    /// surfaces as HTTP 409.
+    #[error("conflict: stale {kind} seq {attempted} does not supersede the stored record")]
+    AssertionStale {
+        /// Which record kind was stale (`policy`, `dial/…`, or `manifest`).
+        kind: String,
+        /// The refused sequence number.
+        attempted: u64,
+    },
 }
 
 impl IntoResponse for ServerError {
@@ -1843,12 +1911,12 @@ impl IntoResponse for ServerError {
             ServerError::BadManifest(_)
             | ServerError::BadPubkey
             | ServerError::BadCid(_)
-            | ServerError::BadPolicy(_)
+            | ServerError::BadAssertion(_)
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
             ServerError::DidKeyMismatch
             | ServerError::Forbidden
-            | ServerError::PolicyUnauthorized => StatusCode::FORBIDDEN,
-            ServerError::PolicyStale => StatusCode::CONFLICT,
+            | ServerError::AssertionUnauthorized => StatusCode::FORBIDDEN,
+            ServerError::AssertionStale { .. } => StatusCode::CONFLICT,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -2024,7 +2092,32 @@ mod tests {
         use super::super::{dispatch, lock_store, App, Blobs, Db, Op, OpOutcome, ServerError};
         use crate::crypto::derive_keypair;
         use crate::identity::derive_id;
-        use crate::policy::{PolicyRecord, ReadClass};
+        use crate::assertion::{make_ack, SignedAssertion};
+        use crate::policy::{policy_body_fold, PolicyBody, ReadClass, POLICY_KIND};
+
+        /// Model-A-sign a policy assertion + ack (test helper on the substrate).
+        fn signed_policy(
+            did: &str,
+            cid: Option<&str>,
+            class: ReadClass,
+            readers: &[String],
+            seq: u64,
+            owner: &crate::crypto::Keypair,
+        ) -> (SignedAssertion, crate::assertion::Ack) {
+            let body = PolicyBody { read_class: class, readers: readers.to_vec() };
+            let record = SignedAssertion::sign_owner(
+                POLICY_KIND,
+                did,
+                cid,
+                seq,
+                serde_json::to_value(&body).expect("json"),
+                &policy_body_fold(&body),
+                owner,
+            );
+            let ack =
+                make_ack(&record, &crate::crypto::derive_keypair("m", "attest")).expect("ack");
+            (record, ack)
+        }
         use ciss_auth::Principal;
 
         fn upload(app: &App, owner: &Principal, did: &str, bytes: &[u8]) -> String {
@@ -2075,16 +2168,14 @@ mod tests {
             let cid = upload(&app, &owner, &did, b"secret bytes");
 
             // The owner gates the whole namespace to grantees:[alice].
-            let policy = PolicyRecord::sign_owner(
-                &did,
+            let (policy, ack) = signed_policy(&did,
                 None,
                 ReadClass::Grantees,
                 std::slice::from_ref(&alice),
                 1,
-                &owner_kp,
-            );
+                &owner_kp,);
             lock_store(&app.state.store)
-                .save_policy(&policy)
+                .save_assertion(&policy, &ack)
                 .expect("seed policy");
 
             let get = |p: &Principal| {
@@ -2123,10 +2214,10 @@ mod tests {
             let owner = Principal::Authenticated(did.clone());
             let cid = upload(&app, &owner, &did, b"owner-only bytes");
 
-            let policy =
-                PolicyRecord::sign_owner(&did, None, ReadClass::Owner, &[], 1, &owner_kp);
+            let (policy, ack) =
+                signed_policy(&did, None, ReadClass::Owner, &[], 1, &owner_kp);
             lock_store(&app.state.store)
-                .save_policy(&policy)
+                .save_assertion(&policy, &ack)
                 .expect("seed policy");
 
             let get = |p: &Principal| {
@@ -2181,16 +2272,14 @@ mod tests {
 
             let public = upload(&app, &owner, &did, b"public blob");
             let secret = upload(&app, &owner, &did, b"secret blob");
-            let policy = PolicyRecord::sign_owner(
-                &did,
+            let (policy, ack) = signed_policy(&did,
                 Some(&secret),
                 ReadClass::Grantees,
                 std::slice::from_ref(&alice),
                 1,
-                &owner_kp,
-            );
+                &owner_kp,);
             lock_store(&app.state.store)
-                .save_policy(&policy)
+                .save_assertion(&policy, &ack)
                 .expect("seed object policy");
 
             assert_eq!(
@@ -2223,16 +2312,14 @@ mod tests {
 
             upload(&app, &owner, &did, b"one");
             upload(&app, &owner, &did, b"two");
-            let policy = PolicyRecord::sign_owner(
-                &did,
+            let (policy, ack) = signed_policy(&did,
                 None,
                 ReadClass::Grantees,
                 std::slice::from_ref(&alice),
                 1,
-                &owner_kp,
-            );
+                &owner_kp,);
             lock_store(&app.state.store)
-                .save_policy(&policy)
+                .save_assertion(&policy, &ack)
                 .expect("seed namespace policy");
 
             assert!(
