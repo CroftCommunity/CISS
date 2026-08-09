@@ -472,6 +472,51 @@ mod tests {
         assert!(!hijack.verify(FOLD, None, &attest().verifying_key()));
     }
 
+    /// Model-C attestations are domain-separated and fully bound too: an
+    /// attested record does not verify with its kind, seq, or body fold
+    /// altered — the attestation preimage binds them all (a constant
+    /// preimage would round-trip and is exactly what this refutes).
+    #[test]
+    fn model_c_binds_every_field() {
+        let a = SignedAssertion::attest_provider(
+            "dial/ceiling",
+            "did:web:alice.example",
+            None,
+            7,
+            body(),
+            FOLD,
+            "jti-123",
+            &attest(),
+        );
+        let key = attest().verifying_key();
+        assert!(a.verify(FOLD, None, &key));
+
+        let mut kind = a.clone();
+        kind.kind = "dial/account-mode".to_owned();
+        assert!(!kind.verify(FOLD, None, &key), "the kind is bound (Model C domain separation)");
+
+        let mut seq = a.clone();
+        seq.seq = 8;
+        assert!(!seq.verify(FOLD, None, &key), "the seq is bound");
+
+        assert!(!a.verify("ceiling_cents=9999", None, &key), "the body fold is bound");
+
+        let mut sub = a.clone();
+        sub.subkey = Some("aabb".to_owned());
+        assert!(!sub.verify(FOLD, None, &key), "the subkey is bound");
+    }
+
+    /// The kind must be structurally sound: empty and `:`-bearing kinds are
+    /// refused outright (`:` is the preimage field separator).
+    #[test]
+    fn malformed_kinds_are_refused() {
+        let key = attest().verifying_key();
+        for bad in ["", "a:b", "ciss/v1/assertion:sneaky"] {
+            let a = SignedAssertion::sign_owner(bad, &owner_did(), None, 1, body(), FOLD, &owner());
+            assert!(!a.verify(FOLD, None, &key), "kind {bad:?} must be refused");
+        }
+    }
+
     /// The seq must strictly advance past the prior: equal and lower fail.
     #[test]
     fn seq_strictly_advances() {
