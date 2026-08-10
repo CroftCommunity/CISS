@@ -363,6 +363,8 @@ inside the hardened sandbox (§11).
 | B3 | no manifest rollback | `op_put_manifest` (seq) |
 | B4/B5 | receipts tamper-evident; cache = ledger | `receipts` / `persist::running_totals` |
 | B6 | billing state never gates self-egress (exit-exempt) | server: spend/drawdown gates in `op_put_object`/`op_put_manifest` only — no read op consults billing state; client twin: `ciss-sync::backup::push_tree` (ceiling on push only) |
+| D1–D4 | assertions bound whole; monotonic seq (typed 409); Model A/C only; every accept acknowledged | `assertion.rs` / `op_put_assertion` / `save_assertion` |
+| D5/D6 | dials fail closed toward the customer; provider bounds supersede (`min()`) | `persist::{at_rest_dial,spend_dial,account_mode,receipt_mode_dial}` / `provider_at_rest_bound` |
 | K1–K4 | strict verify, domain sep, full DID, zeroize | `crypto` / `identity` / `manifest` |
 | S1/S2 | private key off-store; pubkey durable | `with_provider_from_secret` |
 | V1–V3 | bounded read/concurrency/timeout; no blocking | `blobstore` / `server::router` / `dispatch_blocking` |
@@ -400,3 +402,44 @@ inside the hardened sandbox (§11).
 Each gap is a place where "the code is correct per this document, but this
 document's guarantee is incomplete" — i.e. a design item, tracked in the plan and
 ADRs, not a code bug.
+
+## 15. Self-assertion integrity (the D-series — the dials substrate)
+
+**Design.** Every customer setting is a **self-assertion**: the customer signs
+their own requirement; the server verifies and obeys it. There is no operator
+write path to any customer setting — nothing for support staff to type, secure,
+or abuse. One substrate (`src/assertion.rs`) serves every kind: the read policy,
+the ceiling dial (at-rest + spend), the period dial, the account-mode dial, the
+receipt-mode dial — and the manifest conforms to its refusal discipline.
+
+**Invariant D1 — an assertion is bound whole.** The signature covers a
+domain-separated preimage over `(kind, did, subkey, seq, kind-fold(body))` —
+`ciss/v1/assertion:<kind>:…` — so no field can change, and a signature for one
+kind, target, or seq can never verify as another (both Model A and Model C;
+every binding mutation-tested).
+
+**Invariant D2 — seq is strictly monotonic per `(did, kind, subkey)`.** Checked
+before the signature with the uniform typed 409 staleness (shared with the
+manifest since D1.4), and re-guarded in-transaction at persistence — a
+replayed or lower-seq assertion can never roll a customer back.
+
+**Invariant D3 — authorization is Model A or Model C only.** An `OwnerSigned`
+record verifies only when the signing key *derives* the target DID; a
+`ProviderAttested` record only under the dedicated attestation key after a
+verified service-auth JWT. No third path exists.
+
+**Invariant D4 — every accepted assertion is acknowledged.** The server
+countersigns the stored record's digest (`ciss/v1/assertion-ack:<kind>`) with
+the attestation key — published in `/.well-known/did.json` — and returns the
+ack on write and read-back. A customer can *prove* a setting took effect;
+success is discernible from failure.
+
+**Invariant D5 — dials fail closed, toward the customer.** An unparseable
+stored dial resolves to the customer-protective extreme — at-rest cap 0, spend
+cap 0¢, drawdown mode, bilateral receipts — loudly, never silently
+permissive. (Reads are never affected: B6.)
+
+**Invariant D6 — provider bounds supersede dials.** A dial asserting past the
+provider's effective bound is refused at set with the bound quoted, and
+enforcement applies `min(provider, dial)` regardless — neither party's limit
+can loosen the other's.
