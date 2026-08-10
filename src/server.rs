@@ -46,8 +46,10 @@ use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
 use crate::assertion::{make_ack, SignedAssertion};
 use crate::dials::{
-    account_mode_body_fold, ceiling_body_fold, AccountMode, AccountModeBody, CeilingDialBody,
+    account_mode_body_fold, ceiling_body_fold, receipt_mode_body_fold, AccountMode,
+    AccountModeBody, CeilingDialBody, ReceiptModeBody, ReceiptModeChoice,
     ACCOUNT_MODE_DIAL_KIND, CEILING_DIAL_KIND, PERIOD_BODY_FOLD, PERIOD_DIAL_KIND,
+    RECEIPT_MODE_DIAL_KIND,
 };
 use crate::policy::{policy_body_fold, policy_body_valid, PolicyBody, ReadClass, ResolvedPolicy, POLICY_KIND};
 use crate::pricing::postage_cents;
@@ -386,6 +388,10 @@ impl App {
                 "/{did}/assertion/{kind}/{subkey}",
                 put(put_assertion_subkey_handler).get(get_assertion_subkey_handler),
             )
+            .route(
+                "/{did}/receipt/{hash}/countersign",
+                axum::routing::post(countersign_receipt_handler),
+            )
             .route("/{did}/meter", get(get_meter_handler))
             .route("/{did}/du", get(du_handler))
             // The atproto PDS blob surface (Phase 8) — a thin layer over the
@@ -598,6 +604,13 @@ pub(crate) enum Op {
         kind: String,
         subkey: Option<String>,
     },
+    /// The customer countersigns a bilateral receipt (self-authorizing: the
+    /// signature must verify under the key deriving the DID).
+    CountersignReceipt {
+        did: String,
+        content_hash: String,
+        sig: String,
+    },
     /// Usage report for a DID: per-object sizes + total (ADR 0003). Always
     /// self-only; `CISS_ADMIN_ONLY_DU` further restricts to admins (checked in-handler).
     Du {
@@ -624,6 +637,7 @@ impl Op {
             | Op::ListBlobs { .. }
             | Op::PutAssertion { .. }
             | Op::GetAssertion { .. }
+            | Op::CountersignReceipt { .. }
             | Op::Du { .. } => false,
         }
     }
@@ -635,6 +649,7 @@ pub(crate) enum OpOutcome {
         cid: String,
         bytes: u64,
         mode: ReceiptMode,
+        receipt_hash: String,
     },
     Bytes {
         cid: String,
@@ -844,6 +859,13 @@ async fn well_known_did_handler(State(state): State<AppState>) -> Response {
             "type": "Ed25519VerificationKey2020",
             "controller": did,
             "publicKeyHex": state.provider.attest_verifying_key_hex(),
+        }, {
+            // The receipt/billing key: what unilateral receipts and the
+            // provider half of bilateral receipts verify under (D4).
+            "id": format!("{did}#receipts"),
+            "type": "Ed25519VerificationKey2020",
+            "controller": did,
+            "publicKeyHex": state.provider.public_key_hex(),
         }],
         "service": [{
             "id": "#ciss_storage",
@@ -898,6 +920,9 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         // self-or-admin (ADR 0003) inside op_du. All checked in-handler.
         | Op::PutAssertion { .. }
         | Op::GetAssertion { .. }
+        // CountersignReceipt is self-authorizing (the countersignature must
+        // verify under the DID's own key, checked in-op).
+        | Op::CountersignReceipt { .. }
         | Op::Du { .. } => Ok(()),
     }
 }
@@ -977,6 +1002,9 @@ pub(crate) fn dispatch(
         } => op_put_assertion(state, &did, &kind, subkey.as_deref(), &body, authed.as_ref()),
         Op::GetAssertion { did, kind, subkey } => {
             op_get_assertion(state, principal, &did, &kind, subkey.as_deref())
+        }
+        Op::CountersignReceipt { did, content_hash, sig } => {
+            op_countersign_receipt(state, &did, &content_hash, &sig)
         }
         Op::Du { did } => op_du(state, principal, &did),
     }
@@ -1104,14 +1132,18 @@ fn op_put_object(
         &state.provider.id,
         did,
     );
+    let default_mode = match store.receipt_mode_dial(did)? {
+        ReceiptModeChoice::Bilateral => ReceiptMode::Bilateral,
+        ReceiptModeChoice::Unilateral => ReceiptMode::Unilateral,
+    };
     let mode = select_mode(
         &TransferContext {
             bytes: boundary,
             trust_distance: None,
         },
-        ReceiptMode::Unilateral,
+        default_mode,
     );
-    let receipt = build_boundary_receipt(state, core, mode)?;
+    let receipt = build_boundary_receipt(state, core, mode);
     // A new store adds to the DID's distinct bytes at rest; a dedup store does not.
     if is_new_store {
         store.add_stored_bytes(did, as_u64(boundary))?;
@@ -1127,6 +1159,7 @@ fn op_put_object(
         cid,
         bytes: as_u64(boundary),
         mode: receipt.mode(),
+        receipt_hash: receipt.content_hash().to_owned(),
     })
 }
 
@@ -1166,14 +1199,18 @@ fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, Se
         did,
         &state.provider.id,
     );
+    let default_mode = match store.receipt_mode_dial(did)? {
+        ReceiptModeChoice::Bilateral => ReceiptMode::Bilateral,
+        ReceiptModeChoice::Unilateral => ReceiptMode::Unilateral,
+    };
     let mode = select_mode(
         &TransferContext {
             bytes: boundary,
             trust_distance: None,
         },
-        ReceiptMode::Unilateral,
+        default_mode,
     );
-    let receipt = build_boundary_receipt(state, core, mode)?;
+    let receipt = build_boundary_receipt(state, core, mode);
     store.append_receipt(did, &receipt)?;
     tracing::info!(
         %did, %cid, receipt = receipt.content_hash(), mode = ?receipt.mode(),
@@ -1187,11 +1224,13 @@ fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, Se
     })
 }
 
-/// Build the boundary receipt for a transfer. v0 supports only the
-/// provider-signed `Unilateral` (our-side measurement) mode: the raw S3
-/// boundary has no channel for the customer's in-band signature.
+/// Build the boundary receipt for a transfer. `Unilateral` is the
+/// provider-signed default; `Bilateral` (customer-asserted via the
+/// receipt-mode dial, D4) produces a provider-signed receipt **awaiting the
+/// customer's countersignature** — the walkaway-tolerant partial the receipt
+/// model already carries; `POST …/countersign` completes it.
 ///
-/// `SEAM:` `Bilateral` co-signing needs the customer to countersign in-band —
+/// (Historical `SEAM:` note — `Bilateral` used to be a `501`; the dial +
 /// the Phase-8 auth handshake / a later client-signing spike. Until then a
 /// policy that selects `Bilateral` is a loud error, never a silent downgrade to
 /// unilateral.
@@ -1199,14 +1238,22 @@ fn build_boundary_receipt(
     state: &AppState,
     core: ReceiptCore,
     mode: ReceiptMode,
-) -> Result<Receipt, ServerError> {
+) -> Receipt {
     match mode {
-        ReceiptMode::Unilateral => Ok(make_unilateral_receipt(
-            core,
-            &state.provider.id,
-            &state.provider.keypair,
-        )),
-        ReceiptMode::Bilateral => Err(ServerError::BilateralUnsupported),
+        ReceiptMode::Unilateral => {
+            make_unilateral_receipt(core, &state.provider.id, &state.provider.keypair)
+        }
+        ReceiptMode::Bilateral => {
+            // Provider-signed, awaiting the customer countersign (a partial
+            // bilateral — the walkaway-tolerant shape the model carries).
+            let content_hash = core.content_hash();
+            let mut sigs = std::collections::BTreeMap::new();
+            sigs.insert(
+                state.provider.id.clone(),
+                state.provider.keypair.sign_message(&content_hash),
+            );
+            Receipt::from_parts(core, content_hash, ReceiptMode::Bilateral, sigs)
+        }
     }
 }
 
@@ -1437,6 +1484,14 @@ fn kind_fold(
                 .map_err(|_| ServerError::BadAssertion("body is not a valid account-mode dial"))?;
             Ok(account_mode_body_fold(&body))
         }
+        RECEIPT_MODE_DIAL_KIND => {
+            if subkey.is_some() {
+                return Err(ServerError::BadAssertion("the receipt-mode dial takes no subkey"));
+            }
+            let body: ReceiptModeBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid receipt-mode dial"))?;
+            Ok(receipt_mode_body_fold(&body))
+        }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
 }
@@ -1609,6 +1664,40 @@ fn op_get_assertion(
     Err(ServerError::NotFound)
 }
 
+/// The customer's countersignature on a bilateral receipt: verify the sig
+/// over the content hash under the key deriving the DID (self-authorizing —
+/// no session needed beyond the signature itself), then complete the stored
+/// receipt. The completed receipt is returned: a doubly-signed fact.
+fn op_countersign_receipt(
+    state: &AppState,
+    did: &str,
+    content_hash: &str,
+    sig_payload: &str,
+) -> Result<OpOutcome, ServerError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Countersign {
+        signer: String,
+        sig: String,
+    }
+    let body: Countersign = serde_json::from_str(sig_payload)
+        .map_err(|_| ServerError::BadAssertion("body is not a valid countersign"))?;
+    let key = public_key_from_hex(&body.signer).map_err(|_| ServerError::BadPubkey)?;
+    if derive_id(&key) != did {
+        return Err(ServerError::AssertionUnauthorized);
+    }
+    if !crate::crypto::verify_message(&key, content_hash, &body.sig) {
+        tracing::info!(%did, content_hash, "countersign denied: bad signature");
+        return Err(ServerError::AssertionUnauthorized);
+    }
+    let store = lock_store(&state.store);
+    let completed = store
+        .countersign_receipt(did, content_hash, did, &body.sig)?
+        .ok_or(ServerError::NotFound)?;
+    tracing::info!(%did, content_hash, "receipt countersigned — doubly-signed");
+    Ok(OpOutcome::PolicyBody { json: serde_json::to_string(&completed)? })
+}
+
 // ---- HTTP handlers: extract inputs, route through the dispatch boundary. ----
 
 async fn put_object_handler(
@@ -1767,6 +1856,26 @@ async fn put_assertion_subkey_handler(
     .await
 }
 
+/// `POST /{did}/receipt/{hash}/countersign` — the customer completes a
+/// bilateral receipt with its countersignature (body: `{signer, sig}`).
+async fn countersign_receipt_handler(
+    State(state): State<AppState>,
+    Path((did, hash)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    dispatch_blocking(
+        &state,
+        Principal::Anonymous,
+        Op::CountersignReceipt {
+            did: did.into_string(),
+            content_hash: hash,
+            sig: String::from_utf8_lossy(&body).into_owned(),
+        },
+    )
+    .await
+}
+
 /// `GET /{did}/assertion/{kind}` — read back an assertion + ack.
 /// Authenticated so the owner sees the full record; the `policy` kind keeps
 /// its Q4 grantee view. Accepts a `did:` service-auth JWT or an `id:` session.
@@ -1871,7 +1980,7 @@ fn etag(cid: &str) -> HeaderValue {
 impl IntoResponse for OpOutcome {
     fn into_response(self) -> Response {
         match self {
-            OpOutcome::Stored { cid, bytes, mode } => {
+            OpOutcome::Stored { cid, bytes, mode, receipt_hash } => {
                 let mode_str = match mode {
                     ReceiptMode::Unilateral => "unilateral",
                     ReceiptMode::Bilateral => "bilateral",
@@ -1880,6 +1989,7 @@ impl IntoResponse for OpOutcome {
                     "cid": cid,
                     "bytes": bytes,
                     "receipt_mode": mode_str,
+                    "receipt_hash": receipt_hash,
                 }))
                 .into_response();
                 resp.headers_mut().insert("etag", etag(&cid));
@@ -1960,9 +2070,6 @@ pub enum ServerError {
     /// The presented key does not derive the claimed DID.
     #[error("public key does not derive the claimed DID")]
     DidKeyMismatch,
-    /// A bilateral receipt was requested at the raw S3 boundary (unsupported).
-    #[error("bilateral co-signing is not supported at the raw S3 boundary (SEAM)")]
-    BilateralUnsupported,
     /// The request needs a verified session and none was presented.
     #[error("unauthorized: a verified session is required")]
     Unauthorized,
@@ -2080,7 +2187,6 @@ impl IntoResponse for ServerError {
             }
             ServerError::SpendCeiling { .. } => StatusCode::PAYMENT_REQUIRED,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
-            ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::StoreFull | ServerError::DidQuotaExceeded => {
                 StatusCode::INSUFFICIENT_STORAGE

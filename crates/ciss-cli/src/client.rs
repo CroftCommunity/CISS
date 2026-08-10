@@ -65,6 +65,8 @@ pub struct PutResult {
     pub receipt_mode: String,
     /// The `etag` response header, if present.
     pub etag: Option<String>,
+    /// The receipt's content hash (countersign target when bilateral).
+    pub receipt_hash: Option<String>,
 }
 
 /// The result of an S3 `GET`: the bytes (already verified against the requested
@@ -182,6 +184,7 @@ impl Client {
             cid: v["cid"].as_str().context("upload response missing cid")?.to_owned(),
             bytes: v["bytes"].as_u64().context("upload response missing bytes")?,
             receipt_mode: v["receipt_mode"].as_str().unwrap_or_default().to_owned(),
+            receipt_hash: v["receipt_hash"].as_str().map(str::to_owned),
             etag,
         })
     }
@@ -379,6 +382,28 @@ impl Client {
                     .map_err(|e| anyhow!("bridge CIDv1 -> sha256 hex failed for {link:?}: {e}"))
             })
             .collect()
+    }
+
+    /// `POST /{did}/receipt/{hash}/countersign` — complete a bilateral
+    /// receipt with the customer's countersignature over its content hash.
+    /// Returns the completed (doubly-signed) receipt.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures, 403 (forged/wrong-signer), or 404 (no such
+    /// receipt).
+    pub async fn countersign_receipt(
+        &self,
+        session: &Session,
+        did: &str,
+        content_hash: &str,
+        sig: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/receipt/{}/countersign", self.base, did, content_hash);
+        let body = serde_json::json!({ "signer": session.pubkey, "sig": sig }).to_string();
+        let resp = self.send(self.http.post(&url).body(body), "countersign receipt").await?;
+        let resp = self.ensure_success(resp, "countersign receipt").await?;
+        resp.json().await.context("parse countersigned receipt")
     }
 
     /// `PUT /{did}/assertion/{kind}[/{subkey}]` with a self-signed

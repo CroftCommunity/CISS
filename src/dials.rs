@@ -116,3 +116,38 @@ mod tests {
         );
     }
 }
+
+/// The receipt-mode dial kind (D4): `bilateral` is opt-in by customer
+/// assertion — and seq'd, so the provider can never silently revert a
+/// customer to unilateral (the E89 mode-change-only-with-customer-signature
+/// rule, structural). With bilateral in force, every metered transfer's
+/// receipt awaits the customer's countersignature; a completed receipt is
+/// a doubly-signed fact neither side can dispute.
+pub const RECEIPT_MODE_DIAL_KIND: &str = "dial.receipt-mode";
+
+/// The two receipt modes a customer may assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptModeChoice {
+    /// Provider-signed only (the default).
+    Unilateral,
+    /// Co-signed by both parties.
+    Bilateral,
+}
+
+/// The receipt-mode dial's body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptModeBody {
+    /// The asserted mode.
+    pub mode: ReceiptModeChoice,
+}
+
+/// The canonical fold of a receipt-mode body.
+#[must_use]
+pub fn receipt_mode_body_fold(body: &ReceiptModeBody) -> String {
+    match body.mode {
+        ReceiptModeChoice::Unilateral => "mode=unilateral".to_owned(),
+        ReceiptModeChoice::Bilateral => "mode=bilateral".to_owned(),
+    }
+}
