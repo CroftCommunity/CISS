@@ -184,16 +184,36 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum DialCommand {
-    /// Show or set your at-rest storage cap (the ceiling dial). Provider
-    /// limits supersede: a cap above them is refused with the real bound.
+    /// Show or set your ceiling dial: the at-rest storage cap and/or the
+    /// per-period spend (postage) cap. Provider limits supersede the
+    /// at-rest half; the spend half is refused-with-quote (402) at the
+    /// server before any billable write serves. Owner egress is never
+    /// gated (B6) — served and billed.
     Ceiling {
         /// Assert this at-rest cap in bytes.
         #[arg(long, conflicts_with = "clear")]
         at_rest_bytes: Option<u64>,
-        /// Clear the cap (itself a signed dial — absence of enforcement is
-        /// only ever customer-authorized).
+        /// Assert this per-period spend cap in integer cents.
+        #[arg(long, conflicts_with = "clear")]
+        spend_cents: Option<u64>,
+        /// Clear both caps (itself a signed dial — absence of enforcement
+        /// is only ever customer-authorized).
         #[arg(long)]
         clear: bool,
+    },
+    /// Start a new spend period (a signed dial; acceptance snapshots the
+    /// meter baseline — monotonic, never clock-derived).
+    Period,
+    /// Set the account mode: drawdown closes the books to new writes
+    /// (keep-set shrink-only; egress served and metered); active re-opens
+    /// them — reversible by dial, every transition on the record.
+    AccountMode {
+        /// Enter drawdown.
+        #[arg(long, conflicts_with = "active")]
+        drawdown: bool,
+        /// Return to active.
+        #[arg(long)]
+        active: bool,
     },
 }
 
@@ -811,14 +831,20 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_acl_get(&cli.global, &config, &cid).await,
         },
-        Commands::Dial(DialCommand::Ceiling { at_rest_bytes, clear }) => {
-            match cli.global.identity {
-                IdentityKind::Id => dial_ceiling(&cli.global, &config, at_rest_bytes, clear).await,
-                IdentityKind::Did => anyhow::bail!(
-                    "dials use the id: identity in v1 (Model C intent support is a follow-on)"
-                ),
-            }
-        }
+        Commands::Dial(cmd) => match cli.global.identity {
+            IdentityKind::Id => match cmd {
+                DialCommand::Ceiling { at_rest_bytes, spend_cents, clear } => {
+                    dial_ceiling(&cli.global, &config, at_rest_bytes, spend_cents, clear).await
+                }
+                DialCommand::Period => dial_period(&cli.global, &config).await,
+                DialCommand::AccountMode { drawdown, active } => {
+                    dial_account_mode(&cli.global, &config, drawdown, active).await
+                }
+            },
+            IdentityKind::Did => anyhow::bail!(
+                "dials use the id: identity in v1 (Model C intent support is a follow-on)"
+            ),
+        },
         Commands::Man => emit_man_page(),
     }
 }
@@ -1133,11 +1159,12 @@ async fn sync_ceiling(
     Ok(())
 }
 
-/// Show or set the at-rest ceiling dial (Model A: self-signed, auto-seq).
+/// Show or set the ceiling dial (Model A: self-signed, auto-seq).
 async fn dial_ceiling(
     global: &GlobalArgs,
     config: &config::Config,
     at_rest_bytes: Option<u64>,
+    spend_cents: Option<u64>,
     clear: bool,
 ) -> anyhow::Result<()> {
     use ciss::dials::{ceiling_body_fold, CeilingDialBody, CEILING_DIAL_KIND};
@@ -1147,25 +1174,40 @@ async fn dial_ceiling(
     let http = server_client(global);
 
     let current = http.get_assertion(Some(&session), &did, CEILING_DIAL_KIND, None).await?;
-    if at_rest_bytes.is_none() && !clear {
+    if at_rest_bytes.is_none() && spend_cents.is_none() && !clear {
         // Show.
         match &current {
             Some(v) => {
                 if global.json {
                     println!("{v}");
                 } else {
-                    let cap = &v["assertion"]["body"]["at_rest_bytes"];
+                    let at_rest = &v["assertion"]["body"]["at_rest_bytes"];
+                    let spend = &v["assertion"]["body"]["spend_cents"];
                     let seq = v["assertion"]["seq"].as_u64().unwrap_or(0);
-                    println!("at-rest cap: {cap} (seq {seq}; ack held)");
+                    println!("ceiling dial: at_rest={at_rest} spend_cents={spend} (seq {seq}; ack held)");
                 }
             }
-            None => println!("at-rest cap: none asserted"),
+            None => println!("ceiling dial: none asserted"),
         }
         return Ok(());
     }
 
     let next_seq = current.as_ref().and_then(|v| v["assertion"]["seq"].as_u64()).unwrap_or(0) + 1;
-    let body = CeilingDialBody { at_rest_bytes: if clear { None } else { at_rest_bytes } };
+    // Setting one half keeps the other's current value (a dial replaces the
+    // whole record — carry forward what wasn't named).
+    let existing_at_rest = current
+        .as_ref()
+        .and_then(|v| v["assertion"]["body"]["at_rest_bytes"].as_u64());
+    let existing_spend =
+        current.as_ref().and_then(|v| v["assertion"]["body"]["spend_cents"].as_u64());
+    let body = if clear {
+        CeilingDialBody { at_rest_bytes: None, spend_cents: None }
+    } else {
+        CeilingDialBody {
+            at_rest_bytes: at_rest_bytes.or(existing_at_rest),
+            spend_cents: spend_cents.or(existing_spend),
+        }
+    };
     let record = ciss::assertion::SignedAssertion::sign_owner(
         CEILING_DIAL_KIND,
         &did,
@@ -1178,12 +1220,84 @@ async fn dial_ceiling(
     let (seq, ack) =
         http.put_assertion(&did, CEILING_DIAL_KIND, None, &serde_json::to_vec(&record)?).await?;
     if global.json {
-        println!("{}", serde_json::json!({"seq": seq, "ack": ack, "at_rest_bytes": body.at_rest_bytes}));
+        println!(
+            "{}",
+            serde_json::json!({
+                "seq": seq, "ack": ack,
+                "at_rest_bytes": body.at_rest_bytes, "spend_cents": body.spend_cents,
+            })
+        );
     } else {
-        match body.at_rest_bytes {
-            Some(v) => println!("at-rest cap asserted: {v} bytes (seq {seq}; ack received)"),
-            None => println!("at-rest cap cleared (seq {seq}; ack received)"),
-        }
+        println!(
+            "ceiling dial asserted: at_rest={:?} spend_cents={:?} (seq {seq}; ack received)",
+            body.at_rest_bytes, body.spend_cents
+        );
+    }
+    Ok(())
+}
+
+/// Start a new spend period (Model A, auto-seq).
+async fn dial_period(global: &GlobalArgs, config: &config::Config) -> anyhow::Result<()> {
+    use ciss::dials::{PERIOD_BODY_FOLD, PERIOD_DIAL_KIND};
+    let keypair = identity::load_keypair(config)?;
+    let did = ciss::identity::derive_id(&keypair.verifying_key());
+    let session = client::session_for(&keypair);
+    let http = server_client(global);
+    let current = http.get_assertion(Some(&session), &did, PERIOD_DIAL_KIND, None).await?;
+    let next_seq = current.as_ref().and_then(|v| v["assertion"]["seq"].as_u64()).unwrap_or(0) + 1;
+    let record = ciss::assertion::SignedAssertion::sign_owner(
+        PERIOD_DIAL_KIND,
+        &did,
+        None,
+        next_seq,
+        serde_json::json!({}),
+        PERIOD_BODY_FOLD,
+        &keypair,
+    );
+    let (seq, ack) =
+        http.put_assertion(&did, PERIOD_DIAL_KIND, None, &serde_json::to_vec(&record)?).await?;
+    if global.json {
+        println!("{}", serde_json::json!({"period": seq, "ack": ack}));
+    } else {
+        println!("spend period {seq} started (baseline snapshotted; ack received)");
+    }
+    Ok(())
+}
+
+/// Set the account mode (Model A, auto-seq).
+async fn dial_account_mode(
+    global: &GlobalArgs,
+    config: &config::Config,
+    drawdown: bool,
+    active: bool,
+) -> anyhow::Result<()> {
+    use ciss::dials::{account_mode_body_fold, AccountMode, AccountModeBody, ACCOUNT_MODE_DIAL_KIND};
+    anyhow::ensure!(drawdown ^ active, "pass exactly one of --drawdown | --active");
+    let keypair = identity::load_keypair(config)?;
+    let did = ciss::identity::derive_id(&keypair.verifying_key());
+    let session = client::session_for(&keypair);
+    let http = server_client(global);
+    let current = http.get_assertion(Some(&session), &did, ACCOUNT_MODE_DIAL_KIND, None).await?;
+    let next_seq = current.as_ref().and_then(|v| v["assertion"]["seq"].as_u64()).unwrap_or(0) + 1;
+    let body =
+        AccountModeBody { mode: if drawdown { AccountMode::Drawdown } else { AccountMode::Active } };
+    let record = ciss::assertion::SignedAssertion::sign_owner(
+        ACCOUNT_MODE_DIAL_KIND,
+        &did,
+        None,
+        next_seq,
+        serde_json::to_value(body)?,
+        &account_mode_body_fold(&body),
+        &keypair,
+    );
+    let (seq, ack) = http
+        .put_assertion(&did, ACCOUNT_MODE_DIAL_KIND, None, &serde_json::to_vec(&record)?)
+        .await?;
+    if global.json {
+        println!("{}", serde_json::json!({"mode": body.mode, "seq": seq, "ack": ack}));
+    } else {
+        let m = if drawdown { "drawdown (books closed; egress serves)" } else { "active" };
+        println!("account mode: {m} (seq {seq}; ack received)");
     }
     Ok(())
 }
