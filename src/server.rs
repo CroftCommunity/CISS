@@ -45,7 +45,10 @@ use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
 use crate::assertion::{make_ack, SignedAssertion};
-use crate::dials::{ceiling_body_fold, CeilingDialBody, CEILING_DIAL_KIND};
+use crate::dials::{
+    account_mode_body_fold, ceiling_body_fold, AccountMode, AccountModeBody, CeilingDialBody,
+    ACCOUNT_MODE_DIAL_KIND, CEILING_DIAL_KIND, PERIOD_BODY_FOLD, PERIOD_DIAL_KIND,
+};
 use crate::policy::{policy_body_fold, policy_body_valid, PolicyBody, ReadClass, ResolvedPolicy, POLICY_KIND};
 use crate::pricing::postage_cents;
 use crate::receipts::{
@@ -1014,6 +1017,33 @@ fn op_put_object(
     // Storage quota (V5): a *new* (non-dedup) store consumes disk, so it is gated
     // before writing; a dedup store adds no disk and is always allowed. The
     // whole-store ceiling is always enforced; the per-DID cap only if configured.
+    // D3 gates, comparison-before-serving. Drawdown closes the books to new
+    // blobs entirely; the spend ceiling refuses a billable write that would
+    // take the period's postage past the customer's asserted cap (marginal
+    // rules mirror the client twin: 0¢-marginal never blocked, exactly-at-X
+    // passes). Reads never pass through here — B6.
+    {
+        let store = lock_store(&state.store);
+        if store.account_mode(did)? == AccountMode::Drawdown {
+            return Err(ServerError::DrawdownActive);
+        }
+        if let Some(ceiling_cents) = store.spend_dial(did)? {
+            let baseline = store.period_baseline(did)?;
+            let period_bytes =
+                store.running_totals(did)?.total_bytes().saturating_sub(baseline);
+            let spent_cents = crate::pricing::postage_cents(period_bytes);
+            let needed_cents =
+                crate::pricing::postage_cents(period_bytes.saturating_add(as_u64(boundary)));
+            if needed_cents > ceiling_cents && needed_cents > spent_cents {
+                return Err(ServerError::SpendCeiling {
+                    needed_cents,
+                    spent_cents,
+                    ceiling_cents,
+                });
+            }
+        }
+    }
+
     let is_new_store = !state.blobs.has(did, &cid);
     if is_new_store {
         let size = as_u64(boundary);
@@ -1210,6 +1240,14 @@ fn op_put_manifest(
     // strictly-newer one. Load + compare + save under one lock so the check is
     // atomic against a concurrent writer.
     let store = lock_store(&state.store);
+    // Drawdown: the keep-set may only shrink (draining reduces rent on the
+    // way out); growth re-opens the books, which only a mode dial may do.
+    if store.account_mode(did)? == AccountMode::Drawdown {
+        let existing_total = store.load_manifest(did)?.map_or(0, |m| m.total_bytes());
+        if manifest.total_bytes() > existing_total {
+            return Err(ServerError::DrawdownActive);
+        }
+    }
     if let Some(existing) = store.load_manifest(did)? {
         if manifest.seq() <= existing.seq() {
             // The uniform typed staleness (D1.4): the manifest conforms to
@@ -1382,6 +1420,23 @@ fn kind_fold(
                 .map_err(|_| ServerError::BadAssertion("body is not a valid ceiling dial"))?;
             Ok(ceiling_body_fold(&body))
         }
+        PERIOD_DIAL_KIND => {
+            if subkey.is_some() {
+                return Err(ServerError::BadAssertion("the period dial takes no subkey"));
+            }
+            if body.as_object().is_none_or(|o| !o.is_empty()) {
+                return Err(ServerError::BadAssertion("the period dial body is empty ({})"));
+            }
+            Ok(PERIOD_BODY_FOLD.to_owned())
+        }
+        ACCOUNT_MODE_DIAL_KIND => {
+            if subkey.is_some() {
+                return Err(ServerError::BadAssertion("the account-mode dial takes no subkey"));
+            }
+            let body: AccountModeBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid account-mode dial"))?;
+            Ok(account_mode_body_fold(&body))
+        }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
 }
@@ -1494,6 +1549,15 @@ fn op_put_assertion(
     // customer prove — not merely hope — that the assertion took effect.
     let ack = make_ack(&record, &state.provider.attest_keypair)?;
     store.save_assertion(&record, &ack)?;
+
+    // Accepting a period dial snapshots the meter's cumulative total as the
+    // new period's baseline — a monotonic byte-count marker (never a clock);
+    // the dial's own seq is the period ordinal.
+    if kind == PERIOD_DIAL_KIND {
+        let baseline = store.running_totals(did)?.total_bytes();
+        store.put_meta(&format!("period_baseline:{did}"), &baseline.to_string())?;
+        tracing::info!(%did, baseline, period = record.seq, "spend period started");
+    }
     tracing::debug!(
         resource = %did, kind, subkey = ?subkey, seq = record.seq, "assertion stored"
     );
@@ -1964,6 +2028,28 @@ pub enum ServerError {
         /// The effective provider bound (`min(store_ceiling, did_cap)`).
         bound: u64,
     },
+    /// A billable write would take the period's postage past the customer's
+    /// asserted spend ceiling — refused BEFORE serving, with the quote
+    /// (E89: throttle/defer, never mint debt). Owner egress is exempt
+    /// (B6): served and billed, never refused.
+    #[error(
+        "spend ceiling: this transfer would reach {needed_cents}¢ \
+         (spent {spent_cents}¢, ceiling {ceiling_cents}¢) — deferred, nothing served"
+    )]
+    SpendCeiling {
+        /// The cents the period would reach if this transfer served.
+        needed_cents: u64,
+        /// Cents already spent this period.
+        spent_cents: u64,
+        /// The customer's asserted ceiling.
+        ceiling_cents: u64,
+    },
+    /// The account is in drawdown (a customer-asserted mode dial): the
+    /// books are closed to new writes — no new blobs, keep-set commits
+    /// only with a non-increasing total. Egress is unaffected. Reversible
+    /// by a new mode dial.
+    #[error("account in drawdown: the books are closed to new writes (egress unaffected); re-enable with a new account-mode dial")]
+    DrawdownActive,
     /// A write did not advance the stored sequence (anti-rollback) — the
     /// uniform typed staleness every self-assertion kind (and the manifest)
     /// surfaces as HTTP 409.
@@ -1989,7 +2075,10 @@ impl IntoResponse for ServerError {
             ServerError::DidKeyMismatch
             | ServerError::Forbidden
             | ServerError::AssertionUnauthorized => StatusCode::FORBIDDEN,
-            ServerError::AssertionStale { .. } => StatusCode::CONFLICT,
+            ServerError::AssertionStale { .. } | ServerError::DrawdownActive => {
+                StatusCode::CONFLICT
+            }
+            ServerError::SpendCeiling { .. } => StatusCode::PAYMENT_REQUIRED,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::BilateralUnsupported => StatusCode::NOT_IMPLEMENTED,
             ServerError::ObjectTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,

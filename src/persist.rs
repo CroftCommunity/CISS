@@ -442,6 +442,66 @@ impl Store {
         Ok(Some(0))
     }
 
+    /// The customer's per-period spend cap from their ceiling dial, if set.
+    /// An unparseable dial fails closed to 0¢ (loud write refusals; egress
+    /// untouched).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn spend_dial(&self, did: &str) -> Result<Option<u64>, PersistError> {
+        let Some((json, _)) = self.assertion_json(did, crate::dials::CEILING_DIAL_KIND, None)?
+        else {
+            return Ok(None);
+        };
+        let parsed = serde_json::from_str::<SignedAssertion>(&json)
+            .ok()
+            .and_then(|a| serde_json::from_value::<crate::dials::CeilingDialBody>(a.body).ok());
+        if let Some(body) = parsed {
+            return Ok(body.spend_cents);
+        }
+        tracing::warn!(%did, "unparseable ceiling dial — failing closed to 0¢ spend");
+        Ok(Some(0))
+    }
+
+    /// The account's asserted mode (`active` unless a drawdown dial is in
+    /// force). An unparseable mode dial fails closed to **drawdown** —
+    /// books shut loudly rather than silently open.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn account_mode(&self, did: &str) -> Result<crate::dials::AccountMode, PersistError> {
+        let Some((json, _)) =
+            self.assertion_json(did, crate::dials::ACCOUNT_MODE_DIAL_KIND, None)?
+        else {
+            return Ok(crate::dials::AccountMode::Active);
+        };
+        let parsed = serde_json::from_str::<SignedAssertion>(&json)
+            .ok()
+            .and_then(|a| serde_json::from_value::<crate::dials::AccountModeBody>(a.body).ok());
+        if let Some(body) = parsed {
+            return Ok(body.mode);
+        }
+        tracing::warn!(%did, "unparseable account-mode dial — failing closed to drawdown");
+        Ok(crate::dials::AccountMode::Drawdown)
+    }
+
+    /// The current spend period's meter baseline (0 = no period dial ever —
+    /// the period is the whole history).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure; a non-numeric stored value.
+    pub fn period_baseline(&self, did: &str) -> Result<u64, PersistError> {
+        match self.get_meta(&format!("period_baseline:{did}"))? {
+            Some(v) => v.parse::<u64>().map_err(|e| {
+                PersistError::Json(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("period_baseline:{did}: {e}"),
+                )))
+            }),
+            None => Ok(0),
+        }
+    }
+
     /// Whether `did` has any per-object policy rows at all — a single `EXISTS`
     /// query that lets `listBlobs` skip per-cid checks entirely for the common
     /// fully-ungated DID.

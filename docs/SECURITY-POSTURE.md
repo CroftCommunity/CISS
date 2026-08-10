@@ -243,14 +243,15 @@ ever disagrees with a ledger scan, that is a bug.*
 **Invariant B6 — billing state never gates self-egress (exit-exempt).** No
 billing condition — balance, spending ceiling, throttle, dial mode — may ever
 block a customer's self-directed egress of their own manifest and blobs ("they
-can never keep your furniture"; discovery E89). Today the server has no
-billing-conditioned read path at all, and B6 pins that this must remain true as
-ceilings and dials arrive: any future throttle mechanism must carry an explicit
-exit exemption. The client cost twin honors the same rule from its side — the
-M5 spending ceiling defers *uploads* whole (never partial, never billed) and is
-structurally absent from the restore/hydrate paths (`ciss-sync`: the check
-lives only in the push planner; guarded by a regression test that restores
-under an exhausted ceiling).
+can never keep your furniture"; discovery E89). **Enforced in code since D3**:
+the server's spend-ceiling and drawdown gates live only in the *write* paths
+(`op_put_object`, `op_put_manifest`) — no read op consults billing state, and
+the flow tests pin it (egress serves past an exhausted ceiling and in
+drawdown; the postage it accrues still bills — served, metered, never
+refused, so a statement may exceed the ceiling via exempt egress by design).
+The client cost twin honors the same rule from its side — its ceiling defers
+*uploads* whole and is structurally absent from the restore/hydrate paths,
+guarded by a regression test that restores under an exhausted ceiling.
 
 ## 8. Cryptographic posture
 
@@ -361,7 +362,7 @@ inside the hardened sandbox (§11).
 | B2 | unambiguous Merkle + no dup cids | `merkle_root` / `has_duplicate_cids` |
 | B3 | no manifest rollback | `op_put_manifest` (seq) |
 | B4/B5 | receipts tamper-evident; cache = ledger | `receipts` / `persist::running_totals` |
-| B6 | billing state never gates self-egress (exit-exempt) | no billing-conditioned read path exists (design rule for future dials); client twin: `ciss-sync::backup::push_tree` (ceiling on push only) |
+| B6 | billing state never gates self-egress (exit-exempt) | server: spend/drawdown gates in `op_put_object`/`op_put_manifest` only — no read op consults billing state; client twin: `ciss-sync::backup::push_tree` (ceiling on push only) |
 | K1–K4 | strict verify, domain sep, full DID, zeroize | `crypto` / `identity` / `manifest` |
 | S1/S2 | private key off-store; pubkey durable | `with_provider_from_secret` |
 | V1–V3 | bounded read/concurrency/timeout; no blocking | `blobstore` / `server::router` / `dispatch_blocking` |

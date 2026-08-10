@@ -15,7 +15,7 @@ use ciss_cli::client::{session_for, Client};
 use common::World;
 
 fn dial(did: &str, seq: u64, at_rest: Option<u64>, kp: &ciss::crypto::Keypair) -> SignedAssertion {
-    let body = CeilingDialBody { at_rest_bytes: at_rest };
+    let body = CeilingDialBody { at_rest_bytes: at_rest, spend_cents: None };
     SignedAssertion::sign_owner(
         CEILING_DIAL_KIND,
         did,
