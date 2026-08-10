@@ -420,6 +420,28 @@ impl Store {
             .map(|(json, _)| resolved_from_json(&json)))
     }
 
+    /// The customer's at-rest cap from their ceiling dial, if one is set.
+    /// A stored dial that fails to parse **fails closed to a cap of 0** —
+    /// new stores refuse loudly (egress is untouched, B6) rather than
+    /// silently dropping the customer's protection.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn at_rest_dial(&self, did: &str) -> Result<Option<u64>, PersistError> {
+        let Some((json, _)) = self.assertion_json(did, crate::dials::CEILING_DIAL_KIND, None)?
+        else {
+            return Ok(None);
+        };
+        let parsed = serde_json::from_str::<SignedAssertion>(&json)
+            .ok()
+            .and_then(|a| serde_json::from_value::<crate::dials::CeilingDialBody>(a.body).ok());
+        if let Some(body) = parsed {
+            return Ok(body.at_rest_bytes);
+        }
+        tracing::warn!(%did, "unparseable ceiling dial — failing closed to cap 0");
+        Ok(Some(0))
+    }
+
     /// Whether `did` has any per-object policy rows at all — a single `EXISTS`
     /// query that lets `listBlobs` skip per-cid checks entirely for the common
     /// fully-ungated DID.

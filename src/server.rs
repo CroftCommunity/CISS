@@ -45,6 +45,7 @@ use crate::identity::derive_id;
 use crate::manifest::Manifest;
 use crate::persist::{PersistError, Store};
 use crate::assertion::{make_ack, SignedAssertion};
+use crate::dials::{ceiling_body_fold, CeilingDialBody, CEILING_DIAL_KIND};
 use crate::policy::{policy_body_fold, policy_body_valid, PolicyBody, ReadClass, ResolvedPolicy, POLICY_KIND};
 use crate::pricing::postage_cents;
 use crate::receipts::{
@@ -124,10 +125,16 @@ impl Provider {
         self.keypair.public_key_hex()
     }
 
-    /// The provider's policy-attestation public key — the key `verify_policy`
-    /// checks a `ProviderAttested` record under (never the receipt key).
+    /// The provider's attestation public key — the key `ProviderAttested`
+    /// records and every assertion ack verify under (never the receipt key).
     fn attest_verifying_key(&self) -> ed25519_dalek::VerifyingKey {
         self.attest_keypair.verifying_key()
+    }
+
+    /// The attestation public key, hex — published in the well-known
+    /// document so customers can verify acks offline (D2).
+    fn attest_verifying_key_hex(&self) -> String {
+        self.attest_keypair.public_key_hex()
     }
 }
 
@@ -826,6 +833,15 @@ async fn well_known_did_handler(State(state): State<AppState>) -> Response {
     let doc = serde_json::json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did,
+        // The attestation key: what Model-C records and every assertion ACK
+        // verify against — published so a customer can prove, offline, that
+        // an assertion took effect (D2).
+        "verificationMethod": [{
+            "id": format!("{did}#assertion-ack"),
+            "type": "Ed25519VerificationKey2020",
+            "controller": did,
+            "publicKeyHex": state.provider.attest_verifying_key_hex(),
+        }],
         "service": [{
             "id": "#ciss_storage",
             "type": "CissItemStorage",
@@ -1009,7 +1025,20 @@ fn op_put_object(
             tracing::warn!(%did, store_used, ceiling = state.limits.store_ceiling, "store at capacity");
             return Err(ServerError::StoreFull);
         }
-        if let Some(cap) = state.limits.did_cap {
+        // The effective per-DID cap is min(provider cap, the customer's own
+        // at-rest dial) — the provider's protects the box, the customer's
+        // protects themselves; neither loosens the other (D2).
+        let dial_cap = {
+            let store = lock_store(&state.store);
+            store.at_rest_dial(did)?
+        };
+        let effective = match (state.limits.did_cap, dial_cap) {
+            (Some(p), Some(d)) => Some(p.min(d)),
+            (Some(p), None) => Some(p),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        };
+        if let Some(cap) = effective {
             if did_stored.saturating_add(size) > cap {
                 tracing::warn!(%did, did_stored, cap, "did storage quota exceeded");
                 return Err(ServerError::DidQuotaExceeded);
@@ -1345,8 +1374,25 @@ fn kind_fold(
             }
             Ok(policy_body_fold(&body))
         }
+        CEILING_DIAL_KIND => {
+            if subkey.is_some() {
+                return Err(ServerError::BadAssertion("the ceiling dial takes no subkey"));
+            }
+            let body: CeilingDialBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid ceiling dial"))?;
+            Ok(ceiling_body_fold(&body))
+        }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
+}
+
+/// The effective provider bound a customer's at-rest dial may not exceed:
+/// `min(store_ceiling, did_cap-if-set)`. Provider limits supersede — a dial
+/// above this is refused at set (no point storing an unreachable number),
+/// and enforcement applies `min()` regardless (provider caps can change
+/// after a dial was accepted).
+fn provider_at_rest_bound(limits: &Limits) -> u64 {
+    limits.did_cap.map_or(limits.store_ceiling, |cap| cap.min(limits.store_ceiling))
 }
 
 /// Store a customer assertion (Model A: a full self-signed record; Model C:
@@ -1405,6 +1451,21 @@ fn op_put_assertion(
     };
 
     let fold = kind_fold(kind, subkey, &record.body)?;
+
+    // Kind-specific set-time enforcement: the ceiling dial cannot assert
+    // above the provider's effective bound (user ruling: provider limits
+    // supersede). The refusal quotes the real bound so the customer can act.
+    if kind == CEILING_DIAL_KIND {
+        if let Ok(body) = serde_json::from_value::<CeilingDialBody>(record.body.clone()) {
+            if let Some(asserted) = body.at_rest_bytes {
+                let bound = provider_at_rest_bound(&state.limits);
+                if asserted > bound {
+                    return Err(ServerError::AssertionAboveBound { asserted, bound });
+                }
+            }
+        }
+    }
+
     let store = lock_store(&state.store);
     let prior_seq = store.assertion_seq(did, kind, subkey)?;
 
@@ -1892,6 +1953,17 @@ pub enum ServerError {
     /// or an `OwnerSigned` record naming a non-`id:` target).
     #[error("forbidden: assertion is not authorized for this target")]
     AssertionUnauthorized,
+    /// A dial asserted a limit above the provider's effective bound —
+    /// provider limits supersede, so the dial is refused at set time with
+    /// the real bound quoted (there is no point storing an unreachable
+    /// number; enforcement applies `min()` regardless).
+    #[error("assertion refused: {asserted} exceeds the provider bound {bound}")]
+    AssertionAboveBound {
+        /// The customer's asserted limit.
+        asserted: u64,
+        /// The effective provider bound (`min(store_ceiling, did_cap)`).
+        bound: u64,
+    },
     /// A write did not advance the stored sequence (anti-rollback) — the
     /// uniform typed staleness every self-assertion kind (and the manifest)
     /// surfaces as HTTP 409.
@@ -1912,6 +1984,7 @@ impl IntoResponse for ServerError {
             | ServerError::BadPubkey
             | ServerError::BadCid(_)
             | ServerError::BadAssertion(_)
+            | ServerError::AssertionAboveBound { .. }
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
             ServerError::DidKeyMismatch
             | ServerError::Forbidden

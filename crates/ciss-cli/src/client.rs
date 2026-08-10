@@ -381,6 +381,60 @@ impl Client {
             .collect()
     }
 
+    /// `PUT /{did}/assertion/{kind}[/{subkey}]` with a self-signed
+    /// `SignedAssertion` body (Model A). Returns `(seq, ack)` — the ack is
+    /// the provider's countersignature proving the assertion took effect.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures or a non-2xx status (400 malformed/over-bound,
+    /// 403 unauthorized, 409 stale seq).
+    pub async fn put_assertion(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+        record_json: &[u8],
+    ) -> Result<(u64, serde_json::Value)> {
+        let url = match subkey {
+            None => format!("{}/{}/assertion/{}", self.base, did, kind),
+            Some(sk) => format!("{}/{}/assertion/{}/{}", self.base, did, kind, sk),
+        };
+        let resp = self
+            .send(self.http.put(&url).body(record_json.to_vec()), "put assertion")
+            .await?;
+        let resp = self.ensure_success(resp, "put assertion").await?;
+        let v: serde_json::Value = resp.json().await.context("parse assertion response")?;
+        let seq = v["seq"].as_u64().context("assertion response missing seq")?;
+        Ok((seq, v["ack"].clone()))
+    }
+
+    /// `GET /{did}/assertion/{kind}[/{subkey}]` with the caller's session —
+    /// the owner's read-back: `{assertion, ack}`; `None` on 404.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures or a non-2xx, non-404 status.
+    pub async fn get_assertion(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        let url = match subkey {
+            None => format!("{}/{}/assertion/{}", self.base, did, kind),
+            Some(sk) => format!("{}/{}/assertion/{}/{}", self.base, did, kind, sk),
+        };
+        let req = with_session(self.http.get(&url), session);
+        let resp = self.send(req, "get assertion").await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let resp = self.ensure_success(resp, "get assertion").await?;
+        Ok(Some(resp.json().await.context("parse assertion body")?))
+    }
+
     /// `PUT /{did}/assertion/policy/{cid}` with a self-signed `SignedAssertion` body
     /// (Model A — the record self-authorizes, so no session header is needed).
     /// Returns the stored `seq`.
