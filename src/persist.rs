@@ -502,6 +502,80 @@ impl Store {
         }
     }
 
+    /// The customer's asserted receipt mode (`unilateral` unless a
+    /// bilateral dial is in force). An unparseable dial fails toward
+    /// **bilateral** — the stronger non-repudiation the customer signed
+    /// *something* asking for; it never weakens silently.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn receipt_mode_dial(
+        &self,
+        did: &str,
+    ) -> Result<crate::dials::ReceiptModeChoice, PersistError> {
+        let Some((json, _)) =
+            self.assertion_json(did, crate::dials::RECEIPT_MODE_DIAL_KIND, None)?
+        else {
+            return Ok(crate::dials::ReceiptModeChoice::Unilateral);
+        };
+        let parsed = serde_json::from_str::<SignedAssertion>(&json)
+            .ok()
+            .and_then(|a| serde_json::from_value::<crate::dials::ReceiptModeBody>(a.body).ok());
+        if let Some(body) = parsed {
+            return Ok(body.mode);
+        }
+        tracing::warn!(%did, "unparseable receipt-mode dial — failing toward bilateral");
+        Ok(crate::dials::ReceiptModeChoice::Bilateral)
+    }
+
+    /// Add `signer`'s countersignature to the stored receipt whose content
+    /// hash is `content_hash`. Returns the completed receipt. `None` if no
+    /// such receipt exists for `did`.
+    ///
+    /// The caller verifies the signature *before* calling this; persistence
+    /// is not a trust boundary.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite or (de)serialization failure.
+    pub fn countersign_receipt(
+        &self,
+        did: &str,
+        content_hash: &str,
+        signer: &str,
+        sig: &str,
+    ) -> Result<Option<crate::receipts::Receipt>, PersistError> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT rowid, json FROM receipt
+                  WHERE did = ?1 AND json LIKE ?2
+                  ORDER BY rowid DESC LIMIT 1",
+                rusqlite::params![did, format!("%{content_hash}%")],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((rowid, json)) = row else {
+            return Ok(None);
+        };
+        let receipt: crate::receipts::Receipt = serde_json::from_str(&json)?;
+        if receipt.content_hash() != content_hash {
+            return Ok(None);
+        }
+        let mut sigs = receipt.sigs().clone();
+        sigs.insert(signer.to_owned(), sig.to_owned());
+        let completed = crate::receipts::Receipt::from_parts(
+            receipt.core().clone(),
+            receipt.content_hash().to_owned(),
+            receipt.mode(),
+            sigs,
+        );
+        self.conn.execute(
+            "UPDATE receipt SET json = ?2 WHERE rowid = ?1",
+            rusqlite::params![rowid, serde_json::to_string(&completed)?],
+        )?;
+        Ok(Some(completed))
+    }
+
     /// Whether `did` has any per-object policy rows at all — a single `EXISTS`
     /// query that lets `listBlobs` skip per-cid checks entirely for the common
     /// fully-ungated DID.

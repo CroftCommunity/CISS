@@ -215,6 +215,24 @@ enum DialCommand {
         #[arg(long)]
         active: bool,
     },
+    /// Set the receipt mode: bilateral makes every transfer's receipt a
+    /// countersign target — completed receipts are doubly-signed facts
+    /// neither side can dispute. Seq'd: the provider can never silently
+    /// revert you to unilateral.
+    ReceiptMode {
+        /// Opt in to bilateral receipts.
+        #[arg(long, conflicts_with = "unilateral")]
+        bilateral: bool,
+        /// Return to provider-signed-only receipts.
+        #[arg(long)]
+        unilateral: bool,
+    },
+    /// Countersign a bilateral receipt by its content hash (printed by
+    /// `put` when the receipt mode is bilateral).
+    Countersign {
+        /// The receipt's content hash.
+        hash: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -840,6 +858,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 DialCommand::AccountMode { drawdown, active } => {
                     dial_account_mode(&cli.global, &config, drawdown, active).await
                 }
+                DialCommand::ReceiptMode { bilateral, unilateral } => {
+                    dial_receipt_mode(&cli.global, &config, bilateral, unilateral).await
+                }
+                DialCommand::Countersign { hash } => {
+                    dial_countersign(&cli.global, &config, &hash).await
+                }
             },
             IdentityKind::Did => anyhow::bail!(
                 "dials use the id: identity in v1 (Model C intent support is a follow-on)"
@@ -1298,6 +1322,68 @@ async fn dial_account_mode(
     } else {
         let m = if drawdown { "drawdown (books closed; egress serves)" } else { "active" };
         println!("account mode: {m} (seq {seq}; ack received)");
+    }
+    Ok(())
+}
+
+/// Set the receipt mode (Model A, auto-seq).
+async fn dial_receipt_mode(
+    global: &GlobalArgs,
+    config: &config::Config,
+    bilateral: bool,
+    unilateral: bool,
+) -> anyhow::Result<()> {
+    use ciss::dials::{
+        receipt_mode_body_fold, ReceiptModeBody, ReceiptModeChoice, RECEIPT_MODE_DIAL_KIND,
+    };
+    anyhow::ensure!(bilateral ^ unilateral, "pass exactly one of --bilateral | --unilateral");
+    let keypair = identity::load_keypair(config)?;
+    let did = ciss::identity::derive_id(&keypair.verifying_key());
+    let session = client::session_for(&keypair);
+    let http = server_client(global);
+    let current = http.get_assertion(Some(&session), &did, RECEIPT_MODE_DIAL_KIND, None).await?;
+    let next_seq = current.as_ref().and_then(|v| v["assertion"]["seq"].as_u64()).unwrap_or(0) + 1;
+    let body = ReceiptModeBody {
+        mode: if bilateral { ReceiptModeChoice::Bilateral } else { ReceiptModeChoice::Unilateral },
+    };
+    let record = ciss::assertion::SignedAssertion::sign_owner(
+        RECEIPT_MODE_DIAL_KIND,
+        &did,
+        None,
+        next_seq,
+        serde_json::to_value(body)?,
+        &receipt_mode_body_fold(&body),
+        &keypair,
+    );
+    let (seq, ack) = http
+        .put_assertion(&did, RECEIPT_MODE_DIAL_KIND, None, &serde_json::to_vec(&record)?)
+        .await?;
+    if global.json {
+        println!("{}", serde_json::json!({"mode": body.mode, "seq": seq, "ack": ack}));
+    } else {
+        let m = if bilateral { "bilateral (countersign each receipt)" } else { "unilateral" };
+        println!("receipt mode: {m} (seq {seq}; ack received)");
+    }
+    Ok(())
+}
+
+/// Countersign a bilateral receipt: sig over its content hash.
+async fn dial_countersign(
+    global: &GlobalArgs,
+    config: &config::Config,
+    hash: &str,
+) -> anyhow::Result<()> {
+    let keypair = identity::load_keypair(config)?;
+    let did = ciss::identity::derive_id(&keypair.verifying_key());
+    let session = client::session_for(&keypair);
+    let http = server_client(global);
+    let sig = keypair.sign_message(hash);
+    let completed = http.countersign_receipt(&session, &did, hash, &sig).await?;
+    if global.json {
+        println!("{completed}");
+    } else {
+        let sigs = completed["sigs"].as_object().map_or(0, serde_json::Map::len);
+        println!("receipt {hash} countersigned — {sigs} signatures (doubly-signed fact)");
     }
     Ok(())
 }
