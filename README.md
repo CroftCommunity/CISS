@@ -218,6 +218,23 @@ everything else itself:
   (`LISTEN_FDS`/`LISTEN_PID`); **SIGTERM** triggers a graceful drain + a WAL
   checkpoint before exit.
 
+## Downstream consumers (pinned — API drift needs a deliberate bump)
+
+Repos that depend on this one do so by **git pin to a commit** (the workspace's
+standing rule: ours → git pin; not ours → vendor + CI checks). A pinned
+consumer does **not** see changes here until it deliberately bumps — so an API
+or wire-format change in CISS is invisible downstream until someone moves the
+pin, and CI over there proves the bump. When changing a surface a consumer
+uses, note it in the CHANGELOG so the bump PR has something to read.
+
+Known consumers:
+
+| Consumer | What it pins | Surface it uses |
+|---|---|---|
+| `croft-stack/relay/source` (croft-relay-admit) | `ciss-auth` (Phase 8) and `ciss` lib + binary (Phase 6) | service-auth JWT verify; the assertion API (`/{did}/assertion/{kind}/{subkey}`, Model A signing) as its private membership/accounting store; the binary in persistence tests |
+
+(Plan: `discovery/alpha/plans/2026-08-07-1-plan-croft-relay-tiered-admission.md`.)
+
 ## Repository layout
 
 ```
