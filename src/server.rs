@@ -1492,6 +1492,22 @@ fn kind_fold(
                 .map_err(|_| ServerError::BadAssertion("body is not a valid receipt-mode dial"))?;
             Ok(receipt_mode_body_fold(&body))
         }
+        crate::kv::FLAG_KIND => {
+            if !crate::kv::subkey_valid(subkey) {
+                return Err(ServerError::BadAssertion("kv kinds require a valid subkey"));
+            }
+            let body: crate::kv::FlagBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid kv flag"))?;
+            Ok(crate::kv::flag_body_fold(&body))
+        }
+        crate::kv::COUNTER_KIND => {
+            if !crate::kv::subkey_valid(subkey) {
+                return Err(ServerError::BadAssertion("kv kinds require a valid subkey"));
+            }
+            let body: crate::kv::CounterBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid kv counter"))?;
+            Ok(crate::kv::counter_body_fold(&body))
+        }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
 }

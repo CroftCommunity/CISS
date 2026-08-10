@@ -10,6 +10,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/); one entry per tagged
 release, written at release time as part of the release flow (the entry is the
 GitHub release notes).
 
+## [Unreleased]
+
+### Added
+- **Generic KV kinds on the self-assertion substrate** (`src/kv.rs`):
+  `kv.flag` (a per-subkey boolean) and `kv.counter` (a per-subkey total,
+  ordered by the substrate's strictly-monotonic `seq`). Both require a
+  bounded, charset-checked subkey; bodies are typed and folded like every
+  other kind, and unregistered kinds remain refused. No consumer vocabulary —
+  any tenant can use a flag or a counter. First consumer:
+  `croft-stack/relay/source` (croft-relay-admit's membership/accounting store
+  on a private instance; see README "Downstream consumers" — that pin does
+  not see this change until it deliberately bumps to a commit including it).
+
 ## [0.7.0] — 2026-08-09
 
 The self-assertion release: one substrate for every customer-signed setting
