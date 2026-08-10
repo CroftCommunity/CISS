@@ -172,9 +172,29 @@ enum Commands {
     #[command(subcommand)]
     Sync(SyncCommand),
 
+    /// Customer dials — signed, seq'd settings the server countersigns
+    /// (the self-assertion substrate). `id:` plane.
+    #[command(subcommand)]
+    Dial(DialCommand),
+
     /// Emit a roff man page for `ciss-ctl` to stdout (used by packaging).
     #[command(hide = true)]
     Man,
+}
+
+#[derive(Subcommand, Debug)]
+enum DialCommand {
+    /// Show or set your at-rest storage cap (the ceiling dial). Provider
+    /// limits supersede: a cap above them is refused with the real bound.
+    Ceiling {
+        /// Assert this at-rest cap in bytes.
+        #[arg(long, conflicts_with = "clear")]
+        at_rest_bytes: Option<u64>,
+        /// Clear the cap (itself a signed dial — absence of enforcement is
+        /// only ever customer-authorized).
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -791,6 +811,14 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             IdentityKind::Did => did_acl_get(&cli.global, &config, &cid).await,
         },
+        Commands::Dial(DialCommand::Ceiling { at_rest_bytes, clear }) => {
+            match cli.global.identity {
+                IdentityKind::Id => dial_ceiling(&cli.global, &config, at_rest_bytes, clear).await,
+                IdentityKind::Did => anyhow::bail!(
+                    "dials use the id: identity in v1 (Model C intent support is a follow-on)"
+                ),
+            }
+        }
         Commands::Man => emit_man_page(),
     }
 }
@@ -1100,6 +1128,61 @@ async fn sync_ceiling(
                     l.scope()
                 ),
             }
+        }
+    }
+    Ok(())
+}
+
+/// Show or set the at-rest ceiling dial (Model A: self-signed, auto-seq).
+async fn dial_ceiling(
+    global: &GlobalArgs,
+    config: &config::Config,
+    at_rest_bytes: Option<u64>,
+    clear: bool,
+) -> anyhow::Result<()> {
+    use ciss::dials::{ceiling_body_fold, CeilingDialBody, CEILING_DIAL_KIND};
+    let keypair = identity::load_keypair(config)?;
+    let did = ciss::identity::derive_id(&keypair.verifying_key());
+    let session = client::session_for(&keypair);
+    let http = server_client(global);
+
+    let current = http.get_assertion(Some(&session), &did, CEILING_DIAL_KIND, None).await?;
+    if at_rest_bytes.is_none() && !clear {
+        // Show.
+        match &current {
+            Some(v) => {
+                if global.json {
+                    println!("{v}");
+                } else {
+                    let cap = &v["assertion"]["body"]["at_rest_bytes"];
+                    let seq = v["assertion"]["seq"].as_u64().unwrap_or(0);
+                    println!("at-rest cap: {cap} (seq {seq}; ack held)");
+                }
+            }
+            None => println!("at-rest cap: none asserted"),
+        }
+        return Ok(());
+    }
+
+    let next_seq = current.as_ref().and_then(|v| v["assertion"]["seq"].as_u64()).unwrap_or(0) + 1;
+    let body = CeilingDialBody { at_rest_bytes: if clear { None } else { at_rest_bytes } };
+    let record = ciss::assertion::SignedAssertion::sign_owner(
+        CEILING_DIAL_KIND,
+        &did,
+        None,
+        next_seq,
+        serde_json::to_value(body)?,
+        &ceiling_body_fold(&body),
+        &keypair,
+    );
+    let (seq, ack) =
+        http.put_assertion(&did, CEILING_DIAL_KIND, None, &serde_json::to_vec(&record)?).await?;
+    if global.json {
+        println!("{}", serde_json::json!({"seq": seq, "ack": ack, "at_rest_bytes": body.at_rest_bytes}));
+    } else {
+        match body.at_rest_bytes {
+            Some(v) => println!("at-rest cap asserted: {v} bytes (seq {seq}; ack received)"),
+            None => println!("at-rest cap cleared (seq {seq}; ack received)"),
         }
     }
     Ok(())
