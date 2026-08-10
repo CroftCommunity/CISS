@@ -1,7 +1,6 @@
 # Self-assertion dials: one substrate for every customer-signed setting
 
-**Status:** READY TO BUILD — Passes 1+2 applied and three review rounds
-folded in (2026-08-07); every open question closed; nothing is built yet
+**Status:** CLOSED — D1–D5 shipped 2026-08-08/09 (PRs #29–#33)
 **Grounds:** ADR 0004 (co-signed ceiling, Proposed — amended to build on this),
 ADR 0001 (policy records), discovery E89.
 **Server change:** yes — the first shared-substrate refactor since gated reads,
@@ -433,3 +432,37 @@ egress exempt; mode-rollback refused), `cargo test --workspace` +
 clippy-pedantic clean, mutants on the new verify/CAS/composition logic, no
 `cargo fmt`. The live box migrates in place at each step — no stored
 record ever stops verifying.
+
+## Outcome Summary
+
+All five milestones shipped, one PR each, every gate green:
+
+- **D1 (PR #29)** — `src/assertion.rs`: the substrate (Model A/C, acks,
+  typed 409); policy re-homed as the first kind on
+  `PUT/GET /{did}/assertion/…` (old tables wiped per the pre-1.0 ruling);
+  the manifest conforms and the M3 client text-match is deleted. Mutants:
+  51 → 3 real gaps found (Model-C binding unpinned, kind-check flip) and
+  killed.
+- **D2 (PR #30)** — `dial.ceiling` at-rest half: refuse-at-set above
+  `min(store_ceiling, did_cap)` with the bound quoted; `min()` at the V5
+  quota gate; the attest key published as `did.json`'s first
+  `verificationMethod`; acks verified offline in the flow test.
+- **D3 (PR #31)** — the spend half (postage per period — the
+  transfer-is-the-threshold ruling; rent enforcement awaits the
+  statement-scheduler SEAM): 402 refuse-with-quote, marginal rules
+  mirroring the client twin; `dial.period` (baseline snapshot at accept —
+  monotonic, never a clock); `dial.account-mode` (drawdown: new blobs
+  409'd, keep-set shrink-only, egress served AND billed; reversible by
+  dial); **B6 enforced in code** and POSTURE updated.
+- **D4 (PR #32)** — `dial.receipt-mode` (seq'd bilateral opt-in) +
+  bilateral receipts: the `501` seam unstubbed; provider-signed partials
+  completed by `POST …/countersign`; the receipt key published beside the
+  ack key; a completed receipt verified offline under both published keys
+  in the flow test.
+- **D5 (PR #33)** — POSTURE §15 (invariants D1–D6) + checklist rows; ADR
+  0004 flipped Accepted-as-amended; this close-out.
+
+Deferred, recorded: Model-C (did:) dial submission via the CLI; the
+manifest-on-substrate migration (did:-plane sync); rent inside the server
+ceiling (statement-scheduler SEAM); the monotonic period-gate for drawdown
+re-open (in reserve); auto-countersign batching in the sync client.
