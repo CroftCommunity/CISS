@@ -253,6 +253,22 @@ The client cost twin honors the same rule from its side — its ceiling defers
 *uploads* whole and is structurally absent from the restore/hydrate paths,
 guarded by a regression test that restores under an exhausted ceiling.
 
+*Design principle behind B6 (ruled 2026-08-11): CISS makes no forward price
+commitments — a put-time promise about future egress or rent rates is a
+liability the provider cannot underwrite, so it is ruled out entirely. The
+only guarantee attempted is the exit right: prices float freely and visibly,
+and the customer's protection is that they can always close the books
+(drawdown) and take their data out. Drawdown egress is always METERED at the
+going rate; whether it is billed in full, prorated, or at a special rate is
+a human utility judgment made at statement time — never an automatic
+exemption, because automatic free exit invites the abuse of freezing a
+large account to use it as an unmetered fileshare. The system's job is
+scaffolding for that judgment: egress that occurs while the account is in
+drawdown is tagged as such on its receipts, so a statement can separate
+"drawdown drain" from ordinary traffic and a human can adjust it. (The ADR
+0004 reserve shape — unmetered drawdown behind a one-way commitment —
+remains in reserve if judgment-at-statement-time proves insufficient.)*
+
 ## 8. Cryptographic posture
 
 - **Primitives:** Ed25519 signatures, SHA-256 fingerprints. Deterministic key

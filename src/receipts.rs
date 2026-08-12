@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canonical::to_canonical_bytes;
 use crate::crypto::{sha256_hex, verify_message, Keypair};
+use crate::dials::AccountMode;
 
 /// Which way the bytes crossed the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +64,18 @@ pub struct ReceiptCore {
     pub running_total: usize,
     /// The day the transfer occurred (byte-day accounting uses this).
     pub day: u64,
+    /// The account mode in effect at transfer time (drawdown legibility,
+    /// POSTURE B6): signed, so "this egress was a drawdown drain" is an
+    /// attested fact the statement-time human billing judgment can rely on.
+    /// Defaults to [`AccountMode::Active`] on deserialization — receipts
+    /// written before the tag existed all predate drawdown.
+    ///
+    /// More generally, this is where a transfer's **accounting class**
+    /// rides: future modes (service, bot, staff — see [`AccountMode`])
+    /// classify traffic the same way, as a signed fact per receipt rather
+    /// than a mutable server-side annotation.
+    #[serde(default)]
+    pub account_mode: AccountMode,
     /// The party receiving the bytes.
     pub receiver_id: String,
     /// The party sending the bytes.
@@ -73,12 +86,14 @@ impl ReceiptCore {
     /// Build a receipt core; `bytes` is derived from the byte range so it cannot
     /// disagree with it.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // one positional core, built in two places
     pub fn new(
         direction: Direction,
         cid: &str,
         byte_range: (usize, usize),
         running_total: usize,
         day: u64,
+        account_mode: AccountMode,
         receiver_id: &str,
         sender_id: &str,
     ) -> Self {
@@ -91,6 +106,7 @@ impl ReceiptCore {
             bytes: byte_end - byte_start,
             running_total,
             day,
+            account_mode,
             receiver_id: receiver_id.to_owned(),
             sender_id: sender_id.to_owned(),
         }
@@ -287,8 +303,8 @@ pub fn make_unilateral_receipt(
 #[cfg(test)]
 mod tests {
     use super::{
-        make_bilateral_receipt, make_unilateral_receipt, Direction, Receipt, ReceiptCore,
-        ReceiptMode,
+        make_bilateral_receipt, make_unilateral_receipt, AccountMode, Direction, Receipt,
+        ReceiptCore, ReceiptMode,
     };
     use crate::crypto::derive_keypair;
     use crate::identity::derive_id;
@@ -319,7 +335,7 @@ mod tests {
     fn bilateral_receipt_verifies_and_detects_tampering() {
         let (rid, receiver, sid, sender) = parties();
         let ring = ring(&[(&rid, &receiver), (&sid, &sender)]);
-        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, &rid, &sid);
+        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, AccountMode::Active, &rid, &sid);
         let receipt = make_bilateral_receipt(core, Some(&receiver), &sender);
         assert!(receipt.verify_bilateral(&ring));
         assert!(receipt.is_acknowledged());
@@ -341,7 +357,7 @@ mod tests {
     #[test]
     fn walkaway_receipt_carries_no_signatures() {
         let (rid, receiver, sid, sender) = parties();
-        let core = ReceiptCore::new(Direction::Download, "cid", (0, 100), 100, 1, &rid, &sid);
+        let core = ReceiptCore::new(Direction::Download, "cid", (0, 100), 100, 1, AccountMode::Active, &rid, &sid);
         let _ = &receiver;
         let receipt = make_bilateral_receipt(core, None, &sender);
         assert!(!receipt.is_acknowledged());
@@ -357,7 +373,7 @@ mod tests {
         // verify_bilateral must reject (a lone valid sig is not enough).
         let (rid, receiver, sid, sender) = parties();
         let ring = ring(&[(&rid, &receiver), (&sid, &sender)]);
-        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, &rid, &sid);
+        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, AccountMode::Active, &rid, &sid);
         let good = make_bilateral_receipt(core, Some(&receiver), &sender);
 
         let mut sigs = good.sigs().clone();
@@ -378,7 +394,7 @@ mod tests {
     #[test]
     fn bilateral_with_only_one_signature_is_not_acknowledged_or_co_attested() {
         let (rid, receiver, sid, sender) = parties();
-        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, &rid, &sid);
+        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, AccountMode::Active, &rid, &sid);
         let good = make_bilateral_receipt(core, Some(&receiver), &sender);
 
         // Drop the sender's signature — only the receiver's remains.
@@ -401,9 +417,43 @@ mod tests {
     }
 
     #[test]
+    fn account_mode_is_signed_into_the_content_hash() {
+        // The drawdown-legibility scaffolding (POSTURE B6, ruled 2026-08-11):
+        // the account mode a transfer occurred under is part of the SIGNED
+        // core, so "this egress was a drawdown drain" is an attested fact a
+        // later human billing judgment can rely on — not a mutable annotation.
+        let (rid, _, sid, _) = parties();
+        let active = ReceiptCore::new(
+            Direction::Download,
+            "cid",
+            (0, 100),
+            100,
+            1,
+            AccountMode::Active,
+            &rid,
+            &sid,
+        );
+        let drawdown = ReceiptCore::new(
+            Direction::Download,
+            "cid",
+            (0, 100),
+            100,
+            1,
+            AccountMode::Drawdown,
+            &rid,
+            &sid,
+        );
+        assert_ne!(
+            active.content_hash(),
+            drawdown.content_hash(),
+            "the account-mode tag must alter the signed content"
+        );
+    }
+
+    #[test]
     fn acknowledged_bilateral_receipt_is_co_attested() {
         let (rid, receiver, sid, sender) = parties();
-        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, &rid, &sid);
+        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, AccountMode::Active, &rid, &sid);
         let receipt = make_bilateral_receipt(core, Some(&receiver), &sender);
         assert!(
             receipt.is_co_attested(),
@@ -415,7 +465,7 @@ mod tests {
     fn unilateral_rejection_paths() {
         let (rid, receiver, sid, sender) = parties();
         let ring = ring(&[(&rid, &receiver), (&sid, &sender)]);
-        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, &rid, &sid);
+        let core = ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 1, AccountMode::Active, &rid, &sid);
 
         // A valid unilateral (provider = sender here) measurement verifies.
         let good = make_unilateral_receipt(core.clone(), &sid, &sender);
