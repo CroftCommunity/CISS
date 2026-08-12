@@ -1,9 +1,10 @@
 # ADR 0005 — Kind semantics classes, and the accounting chain
 
-- Status: **Proposed** — owner-initiated 2026-08-11; axes, checkpoint design,
-  and classifications **walked through and agreed with the owner 2026-08-11**
-  (hashing + sizing axes added at the owner's direction). Implementation
-  gated on final acceptance.
+- Status: **Accepted** (owner, 2026-08-11 — "we need to go ahead and do the
+  sys server plan ... we should implement one, then the other so that it's
+  all in line"). Axes, checkpoint design, and classifications walked through
+  with the owner; borne out by the full-store cross-inspection (appendix).
+  Implementation plan: `docs/plans/2026-08-11-kind-semantics-implementation.md`.
 - Context: the assertion substrate (D1) + the first external-consumer kinds
   (`kv.flag`/`kv.counter`, PR #35) + the deletion-semantics question the
   croft-relay-admit integration surfaced

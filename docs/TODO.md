@@ -7,7 +7,7 @@ server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
 
 ---
 
-## 0. ADR 0005: kind semantics classes + the accounting chain — walked through with the owner, ready to implement on final acceptance
+## 0. ADR 0005 ACCEPTED — implementation plan ready: `docs/plans/2026-08-11-kind-semantics-implementation.md`
 
 Scoped + owner-reviewed 2026-08-11
 (`docs/adr/0005-kind-semantics-and-accounting-chain.md`): **five** declared
@@ -18,8 +18,10 @@ algorithm; the BLAKE3/SHA-256 ecosystem split stated per kind)**, and
 **checkpoint/compaction under the ack-before-shred rule** (balance-forward,
 per the statements pattern). Agreed calls: `kv.flag` erasable+listable;
 `kv.counter` REMOVED when the chain lands (no deprecated 2am traps).
-Implementation order is in the ADR; croft-relay-admit's usage moves over on
-a pin bump as step 5.
+Six phases, two milestones, strictly sequential (A1 KindSpec+ceilings → A2
+DELETE/LIST endpoints → A3 chain.counter → A4 checkpoints+compaction → A5
+remove kv.counter + release → B1 consumer pin bump retiring all three
+recorded workarounds). Closes at B1.
 
 
 ## 1. Redeploy the VPS to v0.5.6 — blocks `du` and any post-v0.4.0 server change  ⟵ biggest
