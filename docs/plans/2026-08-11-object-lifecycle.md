@@ -247,6 +247,11 @@ assertions, commit the green state before mutating.
 
 ### Phase 0 — Discovery (blocking)
 
+- [ ] **D0: Correct the README so it stops asserting more than the boundary does.** Not discovery —
+      it is here because it is independent of everything else, costs an hour, and is the specific
+      inaccuracy that led us to plan against machinery that was not running. Mark the library-only
+      layer as such in the architecture diagram.
+
 - [x] **D1: Can an object be PUT and never manifested?** **ANSWERED 2026-08-11: yes, and it is the
       ordinary case.** `op_put_object` (`src/server.rs:1030`) never touches the manifest; `op_du`
       (`:1399`) reads receipts. Corroborated by `meer-queue/src/bin/d2_ciss_put.rs`. **A is not safe
@@ -318,6 +323,13 @@ the new reclamation path and its authority argument; note the retention dial in 
 
 ## Documentation impact
 
+- **`README.md` — the architecture diagram overstates what the service does.** It lists
+  *"statements · audit · seal · grace"* as part of the running system and calls the E0–E9 core
+  *"proven"*. All four are **library-only with zero callers**
+  (`docs/notes/2026-08-11-reachability-audit.md`). "Proven" is true of the library; the diagram
+  invites the false next clause. **This is the smallest and most urgent item in this plan** — it
+  costs an hour, it is the thing that misled us, and it does not depend on any other phase.
+  **Do it first, in Phase 0.**
 - `docs/SECURITY-POSTURE.md` — reclamation is a new state transition; its authority (B1/B3 via the
   manifest, `seq`-monotonic assertion for the dial) belongs beside the existing invariants. Phase 4.
 - `docs/` API surface — the new assertion kind. Phase 1.
