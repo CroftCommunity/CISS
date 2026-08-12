@@ -28,7 +28,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -86,6 +86,18 @@ pub(crate) const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
 /// The lexicon method a `did:` caller's usage-inspection (`du`) service-auth JWT
 /// must bind to (ADR 0003).
 pub(crate) const DU_LXM: &str = "ing.croft.ciss.du";
+
+/// The lexicon method a `did:` caller's **assertion erasure** JWT binds to
+/// (ADR 0005 / A2). Owner-only, like the write it undoes.
+pub(crate) const DELETE_ASSERTION_LXM: &str = "ing.croft.ciss.deleteAssertion";
+
+/// The lexicon method a `did:` caller's **assertion listing** JWT binds to
+/// (ADR 0005 / A2). Owner-only and self-only (the `du` discipline).
+pub(crate) const LIST_ASSERTIONS_LXM: &str = "ing.croft.ciss.listAssertions";
+
+/// The lexicon method a `did:` caller's **chain compaction** JWT binds to
+/// (ADR 0005 / A4 — the billing-marker shred). Owner-only.
+pub(crate) const COMPACT_CHAIN_LXM: &str = "ing.croft.ciss.compactChain";
 
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -209,6 +221,19 @@ impl Limits {
 /// guard. `SEAM:` a real deployment shards a `Store` per DID (one SQLite file
 /// each) behind a small pool; here every DID co-locates in one connection,
 /// keyed by the `did` column.
+/// When chain compaction fires (ADR 0005 / A4) — a configured policy, because
+/// compaction is the one irreversible, history-destroying act. Automatic on
+/// checkpoint ack for dev/tests and the starting case; deferred to a deliberate
+/// compaction call (a billing marker) in production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionPolicy {
+    /// Compact behind a checkpoint the moment it is written and acked (default).
+    #[default]
+    OnAck,
+    /// Never compact on write; only an explicit compaction call shreds history.
+    Deferred,
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     provider: Arc<Provider>,
@@ -237,6 +262,8 @@ pub(crate) struct AppState {
     /// `admin_dids` may run `du` — still only for its own namespace. Off by
     /// default: any authenticated caller may `du` its own namespace.
     admin_only_du: bool,
+    /// When chain compaction fires (ADR 0005 / A4). `OnAck` by default.
+    compaction: CompactionPolicy,
 }
 
 /// The cooperative metered-storage server.
@@ -322,8 +349,21 @@ impl App {
                 // default; an operator locks `du` to admins via `with_admin_only_du`.
                 admin_dids: Arc::new(std::collections::HashSet::new()),
                 admin_only_du: false,
+                // Compaction defaults to on-ack (the starting case / tests);
+                // production sets Deferred to shred only at a billing marker.
+                compaction: CompactionPolicy::default(),
             },
         }
+    }
+
+    /// Set the chain compaction policy (ADR 0005 / A4). Default [`CompactionPolicy::OnAck`]
+    /// compacts a chain the moment a checkpoint is acked; [`CompactionPolicy::Deferred`]
+    /// leaves compaction to an explicit call (a billing marker) so a checkpoint
+    /// write never destroys history on its own.
+    #[must_use]
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.state.compaction = policy;
+        self
     }
 
     /// Lock `du` to admins (`CISS_ADMIN_ONLY_DU`, ADR 0003 / invariant Z9). `du` is
@@ -382,11 +422,23 @@ impl App {
             )
             .route(
                 "/{did}/assertion/{kind}",
-                put(put_assertion_handler).get(get_assertion_handler),
+                put(put_assertion_handler)
+                    .get(get_assertion_handler)
+                    .delete(delete_assertion_handler),
             )
             .route(
                 "/{did}/assertion/{kind}/{subkey}",
-                put(put_assertion_subkey_handler).get(get_assertion_subkey_handler),
+                put(put_assertion_subkey_handler)
+                    .get(get_assertion_subkey_handler)
+                    .delete(delete_assertion_subkey_handler),
+            )
+            // The owner-only subkey listing (A2) — plural `assertions`, distinct
+            // from the singular read-back route above.
+            .route("/{did}/assertions/{kind}", get(list_assertions_handler))
+            // Explicit chain compaction (A4, the billing-marker path).
+            .route(
+                "/{did}/assertion/{kind}/{subkey}/compact",
+                axum::routing::post(compact_chain_handler),
             )
             .route(
                 "/{did}/receipt/{hash}/countersign",
@@ -604,6 +656,34 @@ pub(crate) enum Op {
         kind: String,
         subkey: Option<String>,
     },
+    /// Erase a stored assertion (ADR 0005 / A2). Owner-only; allowed only for a
+    /// kind declaring `Erasable`. A `Permanent` kind is refused with its reason.
+    DeleteAssertion {
+        did: String,
+        kind: String,
+        subkey: Option<String>,
+    },
+    /// List the subkeys a DID holds for one kind (ADR 0005 / A2). Owner-only and
+    /// self-only (no existence oracle); allowed only for a `Listable` kind.
+    ListAssertions {
+        did: String,
+        kind: String,
+    },
+    /// Read a chain's full entry history plus its recomputed, verified total
+    /// (ADR 0005 / A3 — the `?chain=1` read). Owner-only.
+    GetChain {
+        did: String,
+        kind: String,
+        subkey: Option<String>,
+    },
+    /// Compact a chain behind its latest acknowledged checkpoint (ADR 0005 / A4 —
+    /// the explicit billing-marker path). Owner-only; refused if no checkpoint
+    /// exists to compact behind (no shredding before agreement).
+    CompactChain {
+        did: String,
+        kind: String,
+        subkey: Option<String>,
+    },
     /// The customer countersigns a bilateral receipt (self-authorizing: the
     /// signature must verify under the key deriving the DID).
     CountersignReceipt {
@@ -637,6 +717,10 @@ impl Op {
             | Op::ListBlobs { .. }
             | Op::PutAssertion { .. }
             | Op::GetAssertion { .. }
+            | Op::DeleteAssertion { .. }
+            | Op::ListAssertions { .. }
+            | Op::GetChain { .. }
+            | Op::CompactChain { .. }
             | Op::CountersignReceipt { .. }
             | Op::Du { .. } => false,
         }
@@ -691,6 +775,23 @@ pub(crate) enum OpOutcome {
     /// Pre-serialized JSON.
     UsageBody {
         json: String,
+    },
+    /// A chain read (ADR 0005 / A3): `{entries: [...], total}` — the full signed
+    /// history and the recomputed, verified total. Pre-serialized JSON.
+    ChainBody {
+        json: String,
+    },
+    /// A chain was compacted behind its checkpoint at `behind` (ADR 0005 / A4).
+    /// Renders `{compacted_behind: seq}` at 200.
+    ChainCompacted {
+        behind: u64,
+    },
+    /// An assertion was erased (ADR 0005 / A2). Renders `{erased: true}` at 200.
+    AssertionErased,
+    /// The subkeys a DID holds for a listable kind (ADR 0005 / A2). Renders
+    /// `{subkeys: [...]}` at 200 — the owner's own keys, never a cross-DID view.
+    AssertionSubkeys {
+        subkeys: Vec<String>,
     },
 }
 
@@ -910,7 +1011,15 @@ fn require_owner(principal: &Principal, did: &str) -> Result<(), ServerError> {
 /// reads for the history-convergence tier); v0 is the flat PDS-compat default.
 fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
     match op {
-        Op::PutObject { did, .. } | Op::GetMeter { did } => require_owner(principal, did),
+        // Owner-only mutation/inspection: the billing meter, and the A2
+        // assertion lifecycle (erase, list). DELETE and LIST are gated here,
+        // before any existence check, so a non-owner LIST is never an oracle.
+        Op::PutObject { did, .. }
+        | Op::GetMeter { did }
+        | Op::DeleteAssertion { did, .. }
+        | Op::ListAssertions { did, .. }
+        | Op::GetChain { did, .. }
+        | Op::CompactChain { did, .. } => require_owner(principal, did),
         Op::GetObject { .. }
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
@@ -1004,6 +1113,12 @@ pub(crate) fn dispatch(
         Op::GetAssertion { did, kind, subkey } => {
             op_get_assertion(state, principal, &did, &kind, subkey.as_deref())
         }
+        Op::DeleteAssertion { did, kind, subkey } => {
+            op_delete_assertion(state, &did, &kind, subkey.as_deref())
+        }
+        Op::ListAssertions { did, kind } => op_list_assertions(state, &did, &kind),
+        Op::GetChain { did, kind, subkey } => op_get_chain(state, &did, &kind, subkey.as_deref()),
+        Op::CompactChain { did, kind, subkey } => op_compact_chain(state, &did, &kind, subkey.as_deref()),
         Op::CountersignReceipt { did, content_hash, sig } => {
             op_countersign_receipt(state, &did, &content_hash, &sig)
         }
@@ -1510,13 +1625,17 @@ fn kind_fold(
                 .map_err(|_| ServerError::BadAssertion("body is not a valid kv flag"))?;
             Ok(crate::kv::flag_body_fold(&body))
         }
-        crate::kv::COUNTER_KIND => {
+        crate::chain_kind::CHAIN_COUNTER_KIND => {
+            // A chain totals a per-subkey account, so a subkey is required (the
+            // same discipline as the kv kinds). The body is either a step or a
+            // checkpoint (ADR 0005 / A4); the fold differs so the two can never be
+            // confused.
             if !crate::kv::subkey_valid(subkey) {
-                return Err(ServerError::BadAssertion("kv kinds require a valid subkey"));
+                return Err(ServerError::BadAssertion("chain.counter requires a valid subkey"));
             }
-            let body: crate::kv::CounterBody = serde_json::from_value(body.clone())
-                .map_err(|_| ServerError::BadAssertion("body is not a valid kv counter"))?;
-            Ok(crate::kv::counter_body_fold(&body))
+            let step: crate::chain_kind::ChainStep = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
+            Ok(step.fold())
         }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
@@ -1588,6 +1707,20 @@ fn op_put_assertion(
 
     let fold = kind_fold(kind, subkey, &record.body)?;
 
+    // Body ceiling (ADR 0005, the sizing axis): every kind declares a
+    // body-byte ceiling; a body above it is refused at the boundary with the
+    // limit quoted. An independent bound from the kind's count guards (e.g.
+    // policy's MAX_READERS) — a reader set can be valid by count and oversized
+    // by bytes. kind_fold above already refused unknown kinds, so the spec
+    // lookup succeeds for every kind that reaches here.
+    if let Some(spec) = crate::kind_spec::kind_spec(kind) {
+        let bytes = serde_json::to_vec(&record.body).map_or(usize::MAX, |v| v.len());
+        let ceiling = spec.sizing.body_ceiling;
+        if bytes > ceiling {
+            return Err(ServerError::BodyAboveCeiling { kind: kind.to_owned(), bytes, ceiling });
+        }
+    }
+
     // Kind-specific set-time enforcement: the ceiling dial cannot assert
     // above the provider's effective bound (user ruling: provider limits
     // supersede). The refusal quotes the real bound so the customer can act.
@@ -1629,6 +1762,16 @@ fn op_put_assertion(
     // The provider acknowledgment: the countersignature that lets the
     // customer prove — not merely hope — that the assertion took effect.
     let ack = make_ack(&record, &state.provider.attest_keypair)?;
+
+    // Chain kinds (ADR 0005 / A3) append verified history rather than upsert a
+    // latest value. The signature and seq anti-rollback above already hold; the
+    // entry must also *follow* the chain, checked in the helper.
+    if crate::kind_spec::kind_spec(kind)
+        .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
+    {
+        return append_verified_chain_entry(&store, state.compaction, did, kind, subkey, &record, &ack);
+    }
+
     store.save_assertion(&record, &ack)?;
 
     // Accepting a period dial snapshots the meter's cumulative total as the
@@ -1646,6 +1789,62 @@ fn op_put_assertion(
         seq: record.seq,
         ack_json: serde_json::to_string(&ack)?,
     })
+}
+
+/// Append a verified `chain.counter` entry (ADR 0005 / A3). The entry must
+/// continue the stored chain — its total follows `prev.total + delta`, its seq is
+/// contiguous, and it links the current head's hash — or it is refused with the
+/// real values quoted. Extracted from [`op_put_assertion`], which has already
+/// verified the signature and the seq anti-rollback before calling here.
+fn append_verified_chain_entry(
+    store: &Store,
+    compaction: CompactionPolicy,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+    record: &SignedAssertion,
+    ack: &crate::assertion::Ack,
+) -> Result<OpOutcome, ServerError> {
+    use crate::chain_kind::{
+        checkpoint_hash, entry_hash, verify_checkpoint, verify_step, ChainStep, GENESIS_PREV_HASH,
+    };
+    let step: ChainStep = serde_json::from_value(record.body.clone())
+        .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
+    match step {
+        ChainStep::Step(body) => {
+            let prev = store.latest_chain_entry(did, kind, subkey)?;
+            verify_step(prev.as_ref(), &body, record.seq)
+                .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+            let hash = entry_hash(did, kind, subkey, record.seq, &body);
+            store.append_chain_entry(record, ack, &body, &hash)?;
+        }
+        ChainStep::Checkpoint(body) => {
+            // A checkpoint closes over a real predecessor; an empty chain has
+            // nothing to close.
+            let prev = store.latest_chain_entry(did, kind, subkey)?.ok_or_else(|| {
+                ServerError::ChainBroken("a checkpoint needs a chain to close (none exists)".to_owned())
+            })?;
+            let expected_prev = store
+                .latest_checkpoint_hash(did, kind, subkey)?
+                .unwrap_or_else(|| GENESIS_PREV_HASH.to_owned());
+            verify_checkpoint(&prev, &expected_prev, &body, record.seq)
+                .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+            let hash = checkpoint_hash(did, kind, subkey, record.seq, &body);
+            store.append_checkpoint_entry(record, ack, &body, &hash)?;
+            // On-ack compaction (the default / starting case): the checkpoint's
+            // provider ack is the agreement, so entries behind it may be shredded
+            // now. Deferred policy leaves this to an explicit billing-marker call.
+            if compaction == CompactionPolicy::OnAck {
+                let compacted = store.compact_behind_latest_checkpoint(did, kind, subkey)?;
+                tracing::debug!(
+                    resource = %did, kind, subkey = ?subkey, behind = ?compacted,
+                    "chain compacted on checkpoint ack"
+                );
+            }
+        }
+    }
+    tracing::debug!(resource = %did, kind, subkey = ?subkey, seq = record.seq, "chain entry appended");
+    Ok(OpOutcome::AssertionSaved { seq: record.seq, ack_json: serde_json::to_string(ack)? })
 }
 
 /// Read back a stored assertion + ack, with kind-specific visibility. The
@@ -1688,6 +1887,98 @@ fn op_get_assertion(
         }
     }
     Err(ServerError::NotFound)
+}
+
+/// Erase a stored assertion (ADR 0005 / A2). Allowed only for a kind declaring
+/// `Erasable`; a `Permanent` kind is refused with its reason. Owner authority is
+/// checked upstream (`require_owner`). A hard delete leaves **no residue** — the
+/// row and its seq are gone, so a re-write starts fresh at seq 1 (the pinned
+/// post-erase semantics). The erasable kinds are the private-instance kv kinds,
+/// whose write boundary is loopback; post-erase replay of an old signed record is
+/// out of that threat model (a loopback attacker already holds the tenant key).
+fn op_delete_assertion(
+    state: &AppState,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    let spec =
+        crate::kind_spec::kind_spec(kind).ok_or(ServerError::BadAssertion("unknown assertion kind"))?;
+    if spec.erasure == crate::kind_spec::Erasure::Permanent {
+        return Err(ServerError::ErasureNotAllowed { kind: kind.to_owned() });
+    }
+    if lock_store(&state.store).delete_assertion(did, kind, subkey)? {
+        Ok(OpOutcome::AssertionErased)
+    } else {
+        Err(ServerError::NotFound)
+    }
+}
+
+/// List the subkeys a DID holds for one kind (ADR 0005 / A2). Allowed only for a
+/// kind declaring `Listable`; a `PointOnly` kind is refused. Owner-and-self-only
+/// is enforced upstream (`require_owner` runs before this op), so the result is
+/// always the caller's own keys and a non-owner's refusal is never an existence
+/// oracle — it is decided before any row is consulted.
+fn op_list_assertions(state: &AppState, did: &str, kind: &str) -> Result<OpOutcome, ServerError> {
+    let spec =
+        crate::kind_spec::kind_spec(kind).ok_or(ServerError::BadAssertion("unknown assertion kind"))?;
+    if spec.enumeration == crate::kind_spec::Enumeration::PointOnly {
+        return Err(ServerError::EnumerationNotAllowed { kind: kind.to_owned() });
+    }
+    let subkeys = lock_store(&state.store).list_assertion_subkeys(did, kind)?;
+    Ok(OpOutcome::AssertionSubkeys { subkeys })
+}
+
+/// Read a chain's entries and its recomputed, verified total (ADR 0005 / A3 —
+/// the `?chain=1` read). Owner-only (checked upstream). Recomputation walks the
+/// stored history and re-derives every hash link, so a chain tampered with in the
+/// store — not just at write time — is caught here and surfaced, not served as if
+/// sound. (A4 will bound the walk to the nearest checkpoint; A3 returns all.)
+fn op_get_chain(
+    state: &AppState,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    if !crate::kind_spec::kind_spec(kind)
+        .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
+    {
+        return Err(ServerError::BadAssertion("kind does not support a chain read"));
+    }
+    let entries = lock_store(&state.store).chain_entries(did, kind, subkey)?;
+    let chain: Vec<crate::chain_kind::ChainEntry> = entries.iter().map(|(e, _)| e.clone()).collect();
+    let total = crate::chain_kind::recompute_total(&chain)
+        .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+    let records: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(_, json)| serde_json::from_str(json).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let json = serde_json::json!({ "entries": records, "total": total }).to_string();
+    Ok(OpOutcome::ChainBody { json })
+}
+
+/// Compact a chain behind its latest acknowledged checkpoint (ADR 0005 / A4 — the
+/// explicit billing-marker path). Owner-only (checked upstream). Refused if the
+/// chain has no checkpoint to compact behind — the no-shredding-before-agreement
+/// rule, surfaced as a 409. Used directly under the `Deferred` policy, and always
+/// available to trigger a compaction at a business boundary.
+fn op_compact_chain(
+    state: &AppState,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    if !crate::kind_spec::kind_spec(kind)
+        .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
+    {
+        return Err(ServerError::BadAssertion("kind does not support compaction"));
+    }
+    match lock_store(&state.store).compact_behind_latest_checkpoint(did, kind, subkey)? {
+        Some(behind) => Ok(OpOutcome::ChainCompacted { behind }),
+        None => Err(ServerError::ChainBroken(
+            "no acknowledged checkpoint to compact behind".to_owned(),
+        )),
+    }
 }
 
 /// The customer's countersignature on a bilateral receipt: verify the sig
@@ -1924,22 +2215,98 @@ async fn get_assertion_handler(
     .await
 }
 
-/// `GET /{did}/assertion/{kind}/{subkey}` — the subkeyed read-back.
+/// The `?chain=1` switch on the subkeyed read: present → the full chain read
+/// (entries + recomputed total), absent → the ordinary latest-record read-back.
+#[derive(serde::Deserialize)]
+struct AssertionReadQuery {
+    chain: Option<String>,
+}
+
+/// `GET /{did}/assertion/{kind}/{subkey}` — the subkeyed read-back. With
+/// `?chain=1` on a chain kind it returns the entry history and the recomputed,
+/// verified total (A3) instead of just the latest record.
 async fn get_assertion_subkey_handler(
+    State(state): State<AppState>,
+    Path((did, kind, subkey)): Path<(String, String, String)>,
+    Query(query): Query<AssertionReadQuery>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
+    let op = if query.chain.is_some() {
+        Op::GetChain { did: did.into_string(), kind, subkey: Some(subkey) }
+    } else {
+        Op::GetAssertion { did: did.into_string(), kind, subkey: Some(subkey) }
+    };
+    dispatch_blocking(&state, principal, op).await
+}
+
+/// `DELETE /{did}/assertion/{kind}` — erase a namespace-scoped assertion (no
+/// subkey). Owner-only; refused for a `Permanent` kind (A2).
+async fn delete_assertion_handler(
+    State(state): State<AppState>,
+    Path((did, kind)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, DELETE_ASSERTION_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::DeleteAssertion { did: did.into_string(), kind, subkey: None },
+    )
+    .await
+}
+
+/// `DELETE /{did}/assertion/{kind}/{subkey}` — erase a subkeyed assertion (e.g. a
+/// `kv.flag`). Owner-only; refused for a `Permanent` kind (A2).
+async fn delete_assertion_subkey_handler(
     State(state): State<AppState>,
     Path((did, kind, subkey)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
-    let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
+    let principal = authenticate_atproto(&state, &headers, DELETE_ASSERTION_LXM).await;
     dispatch_blocking(
         &state,
         principal,
-        Op::GetAssertion {
-            did: did.into_string(),
-            kind,
-            subkey: Some(subkey),
-        },
+        Op::DeleteAssertion { did: did.into_string(), kind, subkey: Some(subkey) },
+    )
+    .await
+}
+
+/// `GET /{did}/assertions/{kind}` — the owner-only subkey listing for a
+/// `Listable` kind (A2). Self-only, no existence oracle; refused for a
+/// `PointOnly` kind.
+async fn list_assertions_handler(
+    State(state): State<AppState>,
+    Path((did, kind)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, LIST_ASSERTIONS_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::ListAssertions { did: did.into_string(), kind },
+    )
+    .await
+}
+
+/// `POST /{did}/assertion/{kind}/{subkey}/compact` — compact the chain behind its
+/// latest acknowledged checkpoint (A4, the explicit billing-marker path).
+/// Owner-only; refused if there is no checkpoint to compact behind.
+async fn compact_chain_handler(
+    State(state): State<AppState>,
+    Path((did, kind, subkey)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, COMPACT_CHAIN_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::CompactChain { did: did.into_string(), kind, subkey: Some(subkey) },
     )
     .await
 }
@@ -2037,7 +2404,8 @@ impl IntoResponse for OpOutcome {
             .into_response(),
             OpOutcome::ManifestBody { json }
             | OpOutcome::PolicyBody { json }
-            | OpOutcome::UsageBody { json } => {
+            | OpOutcome::UsageBody { json }
+            | OpOutcome::ChainBody { json } => {
                 ([("content-type", "application/json")], json).into_response()
             }
             OpOutcome::Meter {
@@ -2065,6 +2433,13 @@ impl IntoResponse for OpOutcome {
                     .unwrap_or(serde_json::Value::Null),
             }))
             .into_response(),
+            OpOutcome::ChainCompacted { behind } => {
+                Json(serde_json::json!({ "compacted_behind": behind })).into_response()
+            }
+            OpOutcome::AssertionErased => Json(serde_json::json!({ "erased": true })).into_response(),
+            OpOutcome::AssertionSubkeys { subkeys } => {
+                Json(serde_json::json!({ "subkeys": subkeys })).into_response()
+            }
         }
     }
 }
@@ -2163,6 +2538,37 @@ pub enum ServerError {
         /// The effective provider bound (`min(store_ceiling, did_cap)`).
         bound: u64,
     },
+    /// An assertion body exceeded the kind's declared body ceiling (ADR 0005,
+    /// the sizing axis). Refused at the write boundary with the limit quoted —
+    /// the ceiling-dial refusal pattern, generalized to every kind.
+    #[error("assertion refused: {kind} body is {bytes} bytes, over the {ceiling}-byte ceiling")]
+    BodyAboveCeiling {
+        /// The kind whose ceiling was exceeded.
+        kind: String,
+        /// The serialized body size that was refused.
+        bytes: usize,
+        /// The kind's declared body ceiling.
+        ceiling: usize,
+    },
+    /// DELETE was attempted on a kind that declares `Permanent` erasure (ADR
+    /// 0005): the record is superseded by a higher-seq write, never deleted.
+    #[error("{kind} is permanent (ADR 0005): superseded by a new record, never deleted")]
+    ErasureNotAllowed {
+        /// The permanent kind whose erasure was refused.
+        kind: String,
+    },
+    /// LIST was attempted on a kind that declares `PointOnly` enumeration (ADR
+    /// 0005): the key is the price of asking; the kind is not enumerable.
+    #[error("{kind} is point-only (ADR 0005): address it by key, it does not enumerate")]
+    EnumerationNotAllowed {
+        /// The point-only kind whose listing was refused.
+        kind: String,
+    },
+    /// A `chain.counter` entry does not continue the stored chain (ADR 0005 / A3):
+    /// its total does not follow, its seq is not the successor's, or it links to
+    /// the wrong head. The reason quotes the real values.
+    #[error("chain.counter refused: {0}")]
+    ChainBroken(String),
     /// A billable write would take the period's postage past the customer's
     /// asserted spend ceiling — refused BEFORE serving, with the quote
     /// (E89: throttle/defer, never mint debt). Owner egress is exempt
@@ -2206,12 +2612,16 @@ impl IntoResponse for ServerError {
             | ServerError::BadCid(_)
             | ServerError::BadAssertion(_)
             | ServerError::AssertionAboveBound { .. }
+            | ServerError::BodyAboveCeiling { .. }
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
             ServerError::DidKeyMismatch
             | ServerError::Forbidden
             | ServerError::AssertionUnauthorized => StatusCode::FORBIDDEN,
-            ServerError::AssertionStale { .. } | ServerError::DrawdownActive => {
-                StatusCode::CONFLICT
+            ServerError::AssertionStale { .. }
+            | ServerError::DrawdownActive
+            | ServerError::ChainBroken(_) => StatusCode::CONFLICT,
+            ServerError::ErasureNotAllowed { .. } | ServerError::EnumerationNotAllowed { .. } => {
+                StatusCode::METHOD_NOT_ALLOWED
             }
             ServerError::SpendCeiling { .. } => StatusCode::PAYMENT_REQUIRED,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,

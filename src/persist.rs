@@ -211,6 +211,21 @@ impl Store {
                  ack    TEXT NOT NULL,
                  PRIMARY KEY (did, kind, subkey)
              );
+             CREATE TABLE IF NOT EXISTS chain_entry (
+                 did             TEXT NOT NULL,
+                 kind            TEXT NOT NULL,
+                 subkey          TEXT NOT NULL DEFAULT '',
+                 seq             INTEGER NOT NULL,
+                 delta           INTEGER NOT NULL,
+                 total           INTEGER NOT NULL,
+                 prev_entry_hash TEXT NOT NULL,
+                 entry_hash      TEXT NOT NULL,
+                 is_checkpoint   INTEGER NOT NULL DEFAULT 0,
+                 prev_checkpoint TEXT NOT NULL DEFAULT '',
+                 json            TEXT NOT NULL,
+                 ack             TEXT NOT NULL,
+                 PRIMARY KEY (did, kind, subkey, seq)
+             );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);
              CREATE VIEW IF NOT EXISTS did_usage AS
@@ -363,6 +378,287 @@ impl Store {
             )
             .optional()?;
         Ok(seq.map(|s| u64::try_from(s).unwrap_or(0)))
+    }
+
+    /// Erase the assertion at `(did, kind, subkey)` — a hard delete leaving no
+    /// row and **no seq residue** (ADR 0005 / A2), so a re-write starts fresh at
+    /// seq 1. Returns whether a row was removed (so the caller can 404 an absent
+    /// target). Erasability is a kind-declaration check made upstream; this is the
+    /// raw removal.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn delete_assertion(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<bool, PersistError> {
+        let n = self.conn.execute(
+            "DELETE FROM assertion WHERE did = ?1 AND kind = ?2 AND subkey = ?3",
+            rusqlite::params![did, kind, subkey.unwrap_or("")],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The subkeys a DID holds for one kind, sorted (ADR 0005 / A2). A namespace
+    /// row (no subkey) is stored as `''` and returned as-is when present. Self-only
+    /// enumeration is enforced upstream (owner-authz); this is the raw query.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn list_assertion_subkeys(&self, did: &str, kind: &str) -> Result<Vec<String>, PersistError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT subkey FROM assertion WHERE did = ?1 AND kind = ?2 ORDER BY subkey")?;
+        let rows = stmt.query_map(rusqlite::params![did, kind], |row| row.get::<_, String>(0))?;
+        let mut subkeys = Vec::new();
+        for row in rows {
+            subkeys.push(row?);
+        }
+        Ok(subkeys)
+    }
+
+    /// The head of a chain (ADR 0005 / A3) — the highest-seq entry's seq, total,
+    /// and hash, which a proposed successor must follow and link to. `None` for an
+    /// empty chain (the next entry is genesis).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn latest_chain_entry(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<crate::chain_kind::PrevEntry>, PersistError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT seq, total, entry_hash FROM chain_entry
+                 WHERE did = ?1 AND kind = ?2 AND subkey = ?3
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![did, kind, subkey.unwrap_or("")],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(seq, total, entry_hash)| crate::chain_kind::PrevEntry {
+            seq: u64::try_from(seq).unwrap_or(0),
+            total: u64::try_from(total).unwrap_or(0),
+            entry_hash,
+        }))
+    }
+
+    /// Append a verified chain entry (ADR 0005 / A3) in one transaction: the entry
+    /// is inserted into the append-only `chain_entry` history, and the `assertion`
+    /// row is upserted to the same signed record so a point read returns the latest
+    /// total. The seq's uniqueness in the chain PRIMARY KEY is the last-line fork
+    /// guard. Verification (`verify_step`) is the caller's; this is the durable
+    /// write.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite/serialization failure (including a
+    /// duplicate seq — a fork — surfaced as a constraint violation).
+    pub fn append_chain_entry(
+        &self,
+        record: &SignedAssertion,
+        ack: &Ack,
+        body: &crate::chain_kind::ChainCounterBody,
+        entry_hash: &str,
+    ) -> Result<(), PersistError> {
+        let json = serde_json::to_string(record)?;
+        let ack_json = serde_json::to_string(ack)?;
+        let seq = i64::try_from(record.seq).unwrap_or(i64::MAX);
+        let total = i64::try_from(body.total).unwrap_or(i64::MAX);
+        let subkey = record.subkey.as_deref().unwrap_or("");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO chain_entry
+                 (did, kind, subkey, seq, delta, total, prev_entry_hash, entry_hash, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                record.did, record.kind, subkey, seq, body.delta, total,
+                body.prev_entry_hash, entry_hash, json, ack_json
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO assertion (did, kind, subkey, seq, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(did, kind, subkey) DO UPDATE
+                 SET seq = excluded.seq, json = excluded.json, ack = excluded.ack
+             WHERE excluded.seq > assertion.seq",
+            rusqlite::params![record.did, record.kind, subkey, seq, json, ack_json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every entry of a chain, seq-ordered, each with its signed JSON (ADR 0005 /
+    /// A3–A4) — the input to recomputation and the `?chain=1` read. Steps and
+    /// checkpoints both appear; after compaction the leading row is the checkpoint
+    /// anchor.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn chain_entries(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Vec<(crate::chain_kind::ChainEntry, String)>, PersistError> {
+        let sk = subkey.unwrap_or("");
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, delta, total, prev_entry_hash, is_checkpoint, prev_checkpoint, json
+             FROM chain_entry WHERE did = ?1 AND kind = ?2 AND subkey = ?3 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![did, kind, sk], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, delta, total, prev_entry_hash, is_checkpoint, prev_checkpoint, json) = row?;
+            let total = u64::try_from(total).unwrap_or(0);
+            // A checkpoint row stores closing_total in `total` and the head hash
+            // it closes over in `prev_entry_hash` (see append_checkpoint_entry).
+            let step = if is_checkpoint != 0 {
+                crate::chain_kind::ChainStep::Checkpoint(crate::chain_kind::CheckpointBody {
+                    closing_total: total,
+                    chain_head_hash: prev_entry_hash,
+                    prev_checkpoint,
+                })
+            } else {
+                crate::chain_kind::ChainStep::Step(crate::chain_kind::ChainCounterBody {
+                    delta,
+                    total,
+                    prev_entry_hash,
+                })
+            };
+            out.push((
+                crate::chain_kind::ChainEntry {
+                    did: did.to_owned(),
+                    kind: kind.to_owned(),
+                    subkey: subkey.map(str::to_owned),
+                    seq: u64::try_from(seq).unwrap_or(0),
+                    step,
+                },
+                json,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The hash of the chain's latest checkpoint, if any (ADR 0005 / A4) — the
+    /// value the next checkpoint must name as `prev_checkpoint`. `None` when the
+    /// chain has no checkpoint yet (the next one links [`GENESIS`]).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn latest_checkpoint_hash(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<String>, PersistError> {
+        let hash: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM chain_entry
+                 WHERE did = ?1 AND kind = ?2 AND subkey = ?3 AND is_checkpoint = 1
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![did, kind, subkey.unwrap_or("")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hash)
+    }
+
+    /// Append a verified checkpoint entry (ADR 0005 / A4) in one transaction: the
+    /// checkpoint row goes into `chain_entry` (its `total` column is the
+    /// `closing_total`, its `prev_entry_hash` column the `chain_head_hash`), and
+    /// the `assertion` row is upserted so a point read reflects it. Compaction is a
+    /// **separate** step ([`compact_behind_latest_checkpoint`]) — writing a
+    /// checkpoint never deletes on its own.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite/serialization failure.
+    pub fn append_checkpoint_entry(
+        &self,
+        record: &SignedAssertion,
+        ack: &Ack,
+        body: &crate::chain_kind::CheckpointBody,
+        checkpoint_hash: &str,
+    ) -> Result<(), PersistError> {
+        let json = serde_json::to_string(record)?;
+        let ack_json = serde_json::to_string(ack)?;
+        let seq = i64::try_from(record.seq).unwrap_or(i64::MAX);
+        let closing = i64::try_from(body.closing_total).unwrap_or(i64::MAX);
+        let subkey = record.subkey.as_deref().unwrap_or("");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO chain_entry
+                 (did, kind, subkey, seq, delta, total, prev_entry_hash, entry_hash,
+                  is_checkpoint, prev_checkpoint, json, ack)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 1, ?8, ?9, ?10)",
+            rusqlite::params![
+                record.did, record.kind, subkey, seq, closing, body.chain_head_hash,
+                checkpoint_hash, body.prev_checkpoint, json, ack_json
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO assertion (did, kind, subkey, seq, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(did, kind, subkey) DO UPDATE
+                 SET seq = excluded.seq, json = excluded.json, ack = excluded.ack
+             WHERE excluded.seq > assertion.seq",
+            rusqlite::params![record.did, record.kind, subkey, seq, json, ack_json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Compact a chain behind its latest acknowledged checkpoint (ADR 0005 / A4):
+    /// delete every entry before that checkpoint, leaving it as the new anchor.
+    /// Returns the checkpoint's seq if it compacted, or `None` when the chain has
+    /// **no** checkpoint to compact behind — the caller turns that into the
+    /// no-shredding-before-agreement refusal. Every stored checkpoint is already
+    /// provider-acked (only acked writes are persisted), so a present checkpoint
+    /// *is* the agreement.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn compact_behind_latest_checkpoint(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<u64>, PersistError> {
+        let sk = subkey.unwrap_or("");
+        let checkpoint_seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM chain_entry
+                 WHERE did = ?1 AND kind = ?2 AND subkey = ?3 AND is_checkpoint = 1
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![did, kind, sk],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(seq) = checkpoint_seq else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "DELETE FROM chain_entry
+             WHERE did = ?1 AND kind = ?2 AND subkey = ?3 AND seq < ?4",
+            rusqlite::params![did, kind, sk, seq],
+        )?;
+        Ok(Some(u64::try_from(seq).unwrap_or(0)))
     }
 
     /// Load a stored assertion + its ack, if present — the durable signed

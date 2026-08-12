@@ -11,6 +11,11 @@ repo root. Versions move in lockstep with the server; the Homebrew tap
 - `Meter` (from `GET /{did}/meter`) now carries `drawdown_download_bytes` —
   the separable drawdown "drain" line (fully counted in `download_bytes`
   too; see the server changelog's drawdown-legibility entry).
+- The kind-semantics client surface (ADR 0005): `Client::delete_assertion` /
+  `Client::list_assertions` — the generic owner-only `DELETE` and subkey `LIST`
+  (return the HTTP status so refusals are observable); `Client::get_chain` — the
+  `?chain=1` read (entry history + recomputed total); `Client::compact_chain` —
+  the explicit `POST .../compact` billing-marker path.
 
 ## [0.7.0] — 2026-08-09
 

@@ -12,9 +12,33 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kind_spec::{
+    Authorship, Enumeration, Erasure, Growth, HashAlgorithm, HashPosture, Hashing, KindSpec,
+    Retention, Sizing, SMALL_BODY_CEILING_BYTES,
+};
+
+/// The shared six-axis point for every dial kind (ADR 0005, §5a): a customer's
+/// latest-wins setting (`Setting`), superseded by a new seq rather than deleted
+/// (`Permanent`), addressed by its fixed kind tag rather than listed
+/// (`PointOnly`), fold-bound over SHA-256, with a small fixed-shape body.
+const fn dial_spec(kind: &'static str) -> KindSpec {
+    KindSpec {
+        kind,
+        retention: Retention::Setting,
+        authorship: Authorship::OwnerSigned,
+        erasure: Erasure::Permanent,
+        enumeration: Enumeration::PointOnly,
+        hashing: Hashing { posture: HashPosture::FoldBound, algorithm: HashAlgorithm::Sha256 },
+        sizing: Sizing { body_ceiling: SMALL_BODY_CEILING_BYTES, growth: Growth::Bounded },
+    }
+}
+
 /// The assertion kind tag for the ceiling dial. Dotted (not slashed): kind
 /// tags ride URL path segments.
 pub const CEILING_DIAL_KIND: &str = "dial.ceiling";
+
+/// The ceiling dial's six-axis declaration.
+pub const CEILING_DIAL_SPEC: KindSpec = dial_spec(CEILING_DIAL_KIND);
 
 /// The ceiling dial's body: the at-rest half (D2) and the spend-period
 /// half (D3). Either may be `None` — clearing is itself a signed, seq'd
@@ -50,6 +74,9 @@ pub fn ceiling_body_fold(body: &CeilingDialBody) -> String {
 /// authority). The dial's own seq is the period ordinal.
 pub const PERIOD_DIAL_KIND: &str = "dial.period";
 
+/// The period dial's six-axis declaration.
+pub const PERIOD_DIAL_SPEC: KindSpec = dial_spec(PERIOD_DIAL_KIND);
+
 /// The period dial's canonical fold (the body is `{}` — the assertion's
 /// own did/kind/seq carry all the meaning).
 pub const PERIOD_BODY_FOLD: &str = "new_period";
@@ -63,6 +90,9 @@ pub const PERIOD_BODY_FOLD: &str = "new_period";
 /// within the declaring period) is held in reserve for when privileges
 /// attach.
 pub const ACCOUNT_MODE_DIAL_KIND: &str = "dial.account-mode";
+
+/// The account-mode dial's six-axis declaration.
+pub const ACCOUNT_MODE_DIAL_SPEC: KindSpec = dial_spec(ACCOUNT_MODE_DIAL_KIND);
 
 /// The two account modes.
 ///
@@ -142,6 +172,9 @@ mod tests {
 /// receipt awaits the customer's countersignature; a completed receipt is
 /// a doubly-signed fact neither side can dispute.
 pub const RECEIPT_MODE_DIAL_KIND: &str = "dial.receipt-mode";
+
+/// The receipt-mode dial's six-axis declaration.
+pub const RECEIPT_MODE_DIAL_SPEC: KindSpec = dial_spec(RECEIPT_MODE_DIAL_KIND);
 
 /// The two receipt modes a customer may assert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

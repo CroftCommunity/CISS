@@ -243,7 +243,7 @@ The whole store, classified:
 | `meta` | setting | derived / provider-internal | erasable | n/a | none | bounded |
 | assertions (`policy`, `dial.*`, `kv.flag`) | setting | owner-signed or provider-attested, provider-acked | per kind (ADR 0005) | per kind | fold-bound / SHA-256 | small ceiling, bounded |
 | seal declarations | setting | owner-signed | tombstone tier: **capability destroyed** | point-only | fold-bound over a pinned root | bounded |
-| `chain.counter` (ADR 0005, pending) | chain | owner-signed, provider-acked | permanent | listable | chain-linked / SHA-256 | rolling (checkpoint + ack-before-shred) |
+| `chain.counter` (ADR 0005, A3–A4) | chain | owner-signed, provider-acked | permanent | listable | chain-linked / SHA-256 | rolling — checkpoints compact behind an acked checkpoint; policy `on_ack` (default) or `deferred` to a billing-marker call |
 
 What the cross-inspection taught (and fed back into ADR 0005): retention needed
 four values, not two (blobs are `immutable`, receipts are a `log`); authorship

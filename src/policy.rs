@@ -22,6 +22,10 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::identifiers::Did;
+use crate::kind_spec::{
+    Authorship, Enumeration, Erasure, Growth, HashAlgorithm, HashPosture, Hashing, KindSpec,
+    Retention, Sizing,
+};
 
 /// The assertion kind tag for read policies.
 pub const POLICY_KIND: &str = "policy";
@@ -30,6 +34,27 @@ pub const POLICY_KIND: &str = "policy";
 /// a deferred design item; an explicit list is bounded so a single record
 /// cannot be made unboundedly large.
 const MAX_READERS: usize = 1024;
+
+/// The policy body ceiling: the one assertion kind with a variable-length body
+/// (its reader list). Bodies are bounded by *both* count (`MAX_READERS`) and
+/// bytes (this ceiling), whichever binds first — long DIDs can be valid by count
+/// and oversized by bytes. 64 KiB clears every ordinary grantees policy while
+/// refusing the pathological (ADR 0005, the sizing axis).
+pub const POLICY_BODY_CEILING_BYTES: usize = 64 * 1024;
+
+/// The policy kind's declared point on the six axes (ADR 0005, §5a). A policy is
+/// the owner's signed statement of who may read; latest-wins (`Setting`), never
+/// deleted but superseded by a new seq (`Permanent`), owner-listable, fold-bound
+/// over SHA-256.
+pub const POLICY_SPEC: KindSpec = KindSpec {
+    kind: POLICY_KIND,
+    retention: Retention::Setting,
+    authorship: Authorship::OwnerSigned,
+    erasure: Erasure::Permanent,
+    enumeration: Enumeration::Listable,
+    hashing: Hashing { posture: HashPosture::FoldBound, algorithm: HashAlgorithm::Sha256 },
+    sizing: Sizing { body_ceiling: POLICY_BODY_CEILING_BYTES, growth: Growth::Bounded },
+};
 
 /// The read-visibility class of a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

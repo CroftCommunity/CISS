@@ -464,6 +464,101 @@ impl Client {
         Ok(Some(resp.json().await.context("parse assertion body")?))
     }
 
+    /// `DELETE /{did}/assertion/{kind}[/{subkey}]` — owner-authorized erasure of
+    /// an `Erasable` kind (ADR 0005 / A2). Returns the raw HTTP status so callers
+    /// and tests can distinguish 200 (erased), 404 (absent), 401/403 (not the
+    /// owner), and 405 (the kind is `Permanent`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only on a connection error; a non-2xx status is returned, not raised.
+    pub async fn delete_assertion(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<u16> {
+        let url = match subkey {
+            None => format!("{}/{}/assertion/{}", self.base, did, kind),
+            Some(sk) => format!("{}/{}/assertion/{}/{}", self.base, did, kind, sk),
+        };
+        let req = with_session(self.http.delete(&url), session);
+        let resp = self.send(req, "delete assertion").await?;
+        Ok(resp.status().as_u16())
+    }
+
+    /// `GET /{did}/assertions/{kind}` — the owner-only subkey listing for a
+    /// `Listable` kind (ADR 0005 / A2). Returns `(status, subkeys)`; the subkeys
+    /// are parsed only on 200 (empty otherwise), so a refusal (401/403/405) is
+    /// observable without any key ever crossing the boundary.
+    ///
+    /// # Errors
+    ///
+    /// Fails only on a connection error or an unparseable 200 body.
+    pub async fn list_assertions(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+    ) -> Result<(u16, Vec<String>)> {
+        let url = format!("{}/{}/assertions/{}", self.base, did, kind);
+        let req = with_session(self.http.get(&url), session);
+        let resp = self.send(req, "list assertions").await?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Ok((status, Vec::new()));
+        }
+        let v: serde_json::Value = resp.json().await.context("parse subkey list")?;
+        let subkeys = v["subkeys"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        Ok((status, subkeys))
+    }
+
+    /// `GET /{did}/assertion/{kind}/{subkey}?chain=1` — the chain read (ADR 0005 /
+    /// A3): the full entry history plus the server-recomputed, verified `total`.
+    /// Owner-only. Returns the parsed `{entries, total}` body.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures, a non-2xx status, or an unparseable body.
+    pub async fn get_chain(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+        subkey: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/assertion/{}/{}?chain=1", self.base, did, kind, subkey);
+        let req = with_session(self.http.get(&url), session);
+        let resp = self.send(req, "get chain").await?;
+        let resp = self.ensure_success(resp, "get chain").await?;
+        resp.json().await.context("parse chain")
+    }
+
+    /// `POST /{did}/assertion/{kind}/{subkey}/compact` — compact the chain behind
+    /// its latest acknowledged checkpoint (ADR 0005 / A4). Owner-only. Returns the
+    /// HTTP status: 200 compacted, 409 no checkpoint to compact behind, 401/403
+    /// not the owner.
+    ///
+    /// # Errors
+    ///
+    /// Fails only on a connection error; a non-2xx status is returned, not raised.
+    pub async fn compact_chain(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+        subkey: &str,
+    ) -> Result<u16> {
+        let url = format!("{}/{}/assertion/{}/{}/compact", self.base, did, kind, subkey);
+        let req = with_session(self.http.post(&url), session);
+        let resp = self.send(req, "compact chain").await?;
+        Ok(resp.status().as_u16())
+    }
+
     /// `PUT /{did}/assertion/policy/{cid}` with a self-signed `SignedAssertion` body
     /// (Model A — the record self-authorizes, so no session header is needed).
     /// Returns the stored `seq`.
