@@ -464,6 +464,67 @@ mod tests {
         assert_ne!(base, chain_counter_body_fold(&body(50, 150, "other")), "prev link is bound");
     }
 
+    fn ckpt(closing: u64, head: &str, prev: &str) -> CheckpointBody {
+        CheckpointBody { closing_total: closing, chain_head_hash: head.to_owned(), prev_checkpoint: prev.to_owned() }
+    }
+
+    #[test]
+    fn checkpoint_hash_and_fold_bind_every_field() {
+        let base_h = checkpoint_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &ckpt(150, "head", "prev"));
+        let vary = |h: String| assert_ne!(h, base_h, "a changed field must change the checkpoint hash");
+        vary(checkpoint_hash("did:y", CHAIN_COUNTER_KIND, Some("acct"), 2, &ckpt(150, "head", "prev")));
+        vary(checkpoint_hash("did:x", "other.kind", Some("acct"), 2, &ckpt(150, "head", "prev")));
+        vary(checkpoint_hash("did:x", CHAIN_COUNTER_KIND, Some("other"), 2, &ckpt(150, "head", "prev")));
+        vary(checkpoint_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 3, &ckpt(150, "head", "prev")));
+        vary(checkpoint_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &ckpt(151, "head", "prev")));
+        vary(checkpoint_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &ckpt(150, "other", "prev")));
+        vary(checkpoint_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &ckpt(150, "head", "other")));
+        assert_eq!(base_h.len(), 64);
+        // A checkpoint hash is disjoint from a step's at the same route/seq.
+        let step_h = entry_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &body(0, 150, "head"));
+        assert_ne!(base_h, step_h, "a checkpoint can never collide with a step");
+
+        let base_f = checkpoint_body_fold(&ckpt(150, "head", "prev"));
+        assert_ne!(base_f, checkpoint_body_fold(&ckpt(151, "head", "prev")), "closing_total bound");
+        assert_ne!(base_f, checkpoint_body_fold(&ckpt(150, "other", "prev")), "head bound");
+        assert_ne!(base_f, checkpoint_body_fold(&ckpt(150, "head", "other")), "prev_checkpoint bound");
+        assert_ne!(base_f, chain_counter_body_fold(&body(0, 150, "head")), "checkpoint fold != step fold");
+    }
+
+    #[test]
+    fn a_checkpoint_at_the_wrong_seq_is_refused() {
+        let e1 = step_entry(1, 100, 100, GENESIS_PREV_HASH);
+        let prev = PrevEntry { seq: 1, total: 100, entry_hash: e1.head_hash() };
+        let good = ckpt(100, &e1.head_hash(), GENESIS_PREV_HASH);
+        // Correct successor seq is 2; 3 is a gap.
+        assert_eq!(
+            verify_checkpoint(&prev, GENESIS_PREV_HASH, &good, 3),
+            Err(ChainBreak::Seq { expected: 2, got: 3 })
+        );
+    }
+
+    #[test]
+    fn recompute_links_a_second_checkpoint_to_the_first() {
+        // e1, C1(over e1), e2(links C1), C2(over e2, prev_checkpoint = C1).
+        let e1 = step_entry(1, 100, 100, GENESIS_PREV_HASH);
+        let c1 = checkpoint_entry(2, 100, &e1.head_hash(), GENESIS_PREV_HASH);
+        let hc1 = c1.head_hash();
+        let e2 = step_entry(3, 50, 150, &hc1);
+        let c2 = checkpoint_entry(4, 150, &e2.head_hash(), &hc1);
+        assert_eq!(recompute_total(&[e1, c1, e2, c2.clone()]), Ok(150), "two checkpoints chain correctly");
+
+        // If the second checkpoint names the wrong prior checkpoint, recompute
+        // rejects it.
+        let e1b = step_entry(1, 100, 100, GENESIS_PREV_HASH);
+        let c1b = checkpoint_entry(2, 100, &e1b.head_hash(), GENESIS_PREV_HASH);
+        let e2b = step_entry(3, 50, 150, &c1b.head_hash());
+        let c2_bad = checkpoint_entry(4, 150, &e2b.head_hash(), "not-c1");
+        assert!(matches!(
+            recompute_total(&[e1b, c1b, e2b, c2_bad]),
+            Err(ChainBreak::PrevCheckpoint { .. })
+        ));
+    }
+
     fn step_entry(seq: u64, delta: i64, total: u64, prev: &str) -> ChainEntry {
         ChainEntry {
             did: "did:x".to_owned(),
