@@ -144,6 +144,49 @@ decision *wrong*.
 `exp` (`src/server.rs:828`), which atproto imposes because JWTs carry absolute expiry. Nothing else
 in the server's correctness path reads a clock.
 
+#### What the design already says, and why retention still fits
+
+Searched before designing (2026-08-11). **There is no seconds-since-epoch mechanism anywhere in the
+corpus, and that is deliberate.** Every monotonic counter that exists counts *events*, not time:
+
+| mechanism | what it counts | where |
+|---|---|---|
+| per-client `lamport` | facts authored by that client | Drystone Part 2 §4.5.1 |
+| `seq` (manifest / assertion / kv) | writes to that slot | CISS `manifest.rs`, `assertion.rs` |
+| `kv.counter` | owner-signed increments | CISS `kv.rs` |
+
+Part 2 §4.5.1 is explicit: *"the logical clock is per client and **strictly logical, never a
+wall-clock** … a wall-clock is never consulted because it is an **uncorroborable assertion** that
+could not order what must converge."* Part 1 §2.0.1 states the principle — *time is not a fact*.
+
+**So a logical clock cannot serve retention**, because retention is a claim about **duration** and a
+Lamport counter only supplies **order**. No amount of event-counting yields "14 days."
+
+**T7 is what makes this tractable, and its wording is narrower than a blanket ban:**
+
+> **T7** — Not require a wall-clock **for any authority-bearing decision** (§10.3, grounding Part 1 §2.0.1)
+
+The rule is about *authority*, not about ever reading a clock. Retention splits cleanly along that
+line:
+
+| | what it is | corroborable? | T7 |
+|---|---|---|---|
+| **the policy** — `max_age_days = 14` | an owner-**signed** assertion, `seq`-monotonic | yes — it is a signed fact | bears the authority |
+| **the measurement** — "this object is now 15 days old" | CISS's own local elapsed count | no, and it never needs to be | bears **no** authority |
+
+**The signature carries the authority; the counter only executes a policy that was authorized
+without it.** Nothing converges, nothing is ordered, no fact is attributed, no quorum is counted,
+and the count is never compared against another node's.
+
+**The constraint this places on the implementation, and it is the load-bearing one:** the elapsed
+counter **must never become a fact.** Never signed, never written into the fold, never carried on the
+wire, never compared across nodes. The moment a retention timestamp is signed into a fact, it stops
+being a local operational measurement and becomes exactly the uncorroborable assertion §4.5.1
+excludes. Keep it in server-local state (the `meta` table, not a manifest or an assertion body).
+
+Recorded because a later reader seeing "CISS reads a clock for retention" would reasonably suspect a
+T7 violation, and the answer is not obvious without this split.
+
 #### Prefer a monotonic day counter over a wall-clock comparison
 
 Two formulations, and the second is safer:
