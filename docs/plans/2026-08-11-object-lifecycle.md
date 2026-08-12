@@ -152,8 +152,8 @@ corpus, and that is deliberate.** Every monotonic counter that exists counts *ev
 | mechanism | what it counts | where |
 |---|---|---|
 | per-client `lamport` | facts authored by that client | Drystone Part 2 §4.5.1 |
-| `seq` (manifest / assertion / kv) | writes to that slot | CISS `manifest.rs`, `assertion.rs` |
-| `kv.counter` | owner-signed increments | CISS `kv.rs` |
+| `seq` (manifest / assertion / kv / chain) | writes to that slot | CISS `manifest.rs`, `assertion.rs` |
+| `chain.counter` | owner-signed delta entries (the running total, tamper-evident) | CISS `chain_kind.rs` |
 
 Part 2 §4.5.1 is explicit: *"the logical clock is per client and **strictly logical, never a
 wall-clock** … a wall-clock is never consulted because it is an **uncorroborable assertion** that

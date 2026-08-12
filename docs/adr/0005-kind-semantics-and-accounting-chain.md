@@ -1,10 +1,16 @@
 # ADR 0005 — Kind semantics classes, and the accounting chain
 
-- Status: **Accepted** (owner, 2026-08-11 — "we need to go ahead and do the
-  sys server plan ... we should implement one, then the other so that it's
-  all in line"). Axes, checkpoint design, and classifications walked through
-  with the owner; borne out by the full-store cross-inspection (appendix).
-  Implementation plan: `docs/plans/2026-08-11-kind-semantics-implementation.md`.
+- Status: **Accepted + Implemented** (accepted by owner 2026-08-11 — "we need
+  to go ahead and do the sys server plan ... we should implement one, then the
+  other so that it's all in line"; built and merged 2026-08-12). Axes,
+  checkpoint design, and classifications walked through with the owner; borne
+  out by the full-store cross-inspection (appendix). **Implemented as** Milestone
+  A (release 0.8.0, PR #37, `2d1e685`) + Milestone B (the consumer pin bump,
+  `croft-stack` PR #7, `b882d8f`); both money-shaped phases are mutation-clean.
+  Execution plan + record:
+  `docs/plans/2026-08-11-kind-semantics-implementation.md`. The classification
+  and checkpoint design below are the reasoning record; where it reads in the
+  future tense ("removed when the chain lands"), that has now happened.
 - Context: the assertion substrate (D1) + the first external-consumer kinds
   (`kv.flag`/`kv.counter`, PR #35) + the deletion-semantics question the
   croft-relay-admit integration surfaced
