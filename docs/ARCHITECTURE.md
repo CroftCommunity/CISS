@@ -91,12 +91,16 @@ annotation.
 ### Receipt modes (Unilateral vs Bilateral)
 
 A receipt is two-mode: **Unilateral** (provider-signed, our-side measurement) or
-**Bilateral** (co-signed by both parties). The raw S3/atproto boundary has no
-in-band channel for the customer to counter-sign, so v0 issues **Unilateral**
-receipts. A policy that selects Bilateral at that boundary is a hard
-`BilateralUnsupported` error — **never a silent downgrade**. Bilateral is the
-co-attested form the deferred capital layer will require; keeping the mode in the
-receipt from the start makes that forward-compatible.
+**Bilateral** (co-signed by both parties). Unilateral is the default; the
+customer opts into Bilateral with the `dial.receipt-mode` assertion (D4), after
+which every metered transfer yields a provider-signed **partial** awaiting the
+customer's countersignature — `POST /{did}/receipt/{hash}/countersign` completes
+it into a doubly-signed fact verifiable offline under the two keys published in
+the well-known `did.json` (`#receipts` + the customer's own). The walkaway case
+is tolerated by design: an uncountersigned partial stays a valid our-side
+measurement. Bilateral is the co-attested form the deferred capital layer will
+require. (Historical: Bilateral was a hard `BilateralUnsupported` 501 until the
+D4 dial unstubbed it — a loud seam, never a silent downgrade.)
 
 ## 3. Content addressing and the CIDv1 bridge
 

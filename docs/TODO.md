@@ -83,8 +83,10 @@ meter endpoint would accept a `did:` service-auth JWT (like `du`/`listBlobs`/
 
 - **Actionable exit codes:** every `ciss-ctl` error exits `1`; the messages are
   actionable but there are no distinct per-class exit codes (deferred, plan §4).
-- **Bilateral (client co-signed) receipts** — server SEAM (`BilateralUnsupported`);
-  the client shows `receipt: unilateral`.
+- ~~**Bilateral (client co-signed) receipts**~~ — DONE (D4, v0.7.0): the
+  `dial.receipt-mode` assertion opts in; `ciss-ctl dial countersign <hash>`
+  completes the doubly-signed fact. Remaining follow-on: auto-countersign
+  batching in the sync client (deferred, dials plan close-out).
 - **Manifest/rent client surface** — not exposed (`PUT /{did}/manifest`); the
   meter shows transferred bytes, not rent.
 - **Full atproto OAuth** for the `did:` path — v1 uses an app password; OAuth
