@@ -51,12 +51,20 @@ CISS is two layers that compose but never conflate:
    HTTP boundary  ── Layer 2: metering / crypto provenance ────────────┐
    S3  ·  atproto    content-address (SHA-256) + re-verify on read;     │  the ledger
    ·  manifest       provider-signed receipt per transfer (postage);    │  (E0–E9),
-   ·  meter          rent from the customer's signed manifest;          │  per-DID
-        │            statements · audit · seal · grace                   │  SQLite
+   ·  policy/dials   signed policy, ceiling, period + account-mode      │  per-DID
+   ·  meter · du     dials; manifest frontier heads                     │  SQLite
         ▼                                                                ▼
    BlobStore trait ── Layer 1: dumb bytes-under-a-key backend ──────────┘
    (memory · FS · …)   never meters, never verifies, never trusted
 ```
+
+> **Reachable from the boundary vs. library-only.** The diagram above lists what the running
+> service exposes. The E0–E9 core also contains **`statements`, `audit`, `dial`, `seal`, `grace`
+> and `clock`**, which are implemented and tested as libraries but have **no caller** — nothing in
+> the HTTP surface or the CLI can reach them, so no billing period ever closes and no seal,
+> grace event, or spot-check can be requested. They are capabilities the codebase *has* and the
+> service does *not yet offer*. Enforced by `tests/wiring_reachability.rs`; inventory and reasoning
+> in [`docs/notes/2026-08-11-reachability-audit.md`](docs/notes/2026-08-11-reachability-audit.md).
 
 - **Layer 1 (`blobstore.rs`)** is a deliberately dumb, pluggable byte store keyed
   by `(DID, CID)`. It never meters, never content-checks, holds no provenance —
@@ -246,21 +254,22 @@ src/
   main.rs          the runnable binary (flags, layout, graceful shutdown)
   # Layer 1 — the dumb backend
   blobstore.rs     BlobStore trait + MemoryBlobStore + FsBlobStore ({did}/{cid})
-  # The E0–E9 ledger core (proven; ported from the item-storage-protocol)
+  # The E0–E9 ledger core (proven AS A LIBRARY; ported from the item-storage-protocol).
+  # Lines marked [unwired] have no caller — see docs/notes/2026-08-11-reachability-audit.md
   crypto.rs        SHA-256 fingerprints + Ed25519 sign/verify (zeroized keys)
   identity.rs      an actor is a keypair; its id is derived from its public key
   item.rs          content-addressed items + the in-memory content store
   manifest.rs      the customer's signed Merkle manifest (what to store; rent base)
   receipts.rs      signed transfer receipts (Bilateral | Unilateral postage)
   ledger.rs        append-only, hash-linked, signed per-actor ledgers
-  statements.rs    balance-forward statements + byte-day rent + rollup/purge
-  audit.rs         k-sample spot-check audit (detection math over a seeded RNG)
-  dial.rs          the assurance dial — priced, signed assurance setting
-  seal.rs          seal / tombstone tiers (pin-a-root, fail-closed ceremonies)
-  grace.rs         the grace ledger — co-signed mercy events that net to zero
+  statements.rs    balance-forward statements + byte-day rent + rollup/purge   [unwired]
+  audit.rs         k-sample spot-check audit (detection math over a seeded RNG) [unwired]
+  dial.rs          the assurance dial — priced, signed assurance setting        [unwired]
+  seal.rs          seal / tombstone tiers (pin-a-root, fail-closed ceremonies)  [unwired]
+  grace.rs         the grace ledger — co-signed mercy events that net to zero   [unwired]
   pricing.rs       the price list (integer cents; postage + rent)
   canonical.rs     the one canonical byte-string every signature/hash is taken over
-  clock.rs         a deterministic day clock (time advances only when told)
+  clock.rs         a deterministic day clock (time advances only when told)     [unwired]
   rng.rs           a seeded deterministic PRNG (mulberry32; bit-exact parity)
   persist.rs       per-DID SQLite (manifests, receipts, statements, meta kv)
   did_resolver.rs  production DID-resolver composition (reqwest fetcher + wiring)
