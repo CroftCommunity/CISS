@@ -357,6 +357,45 @@ impl Store {
         Ok(seq.map(|s| u64::try_from(s).unwrap_or(0)))
     }
 
+    /// Erase the assertion at `(did, kind, subkey)` — a hard delete leaving no
+    /// row and **no seq residue** (ADR 0005 / A2), so a re-write starts fresh at
+    /// seq 1. Returns whether a row was removed (so the caller can 404 an absent
+    /// target). Erasability is a kind-declaration check made upstream; this is the
+    /// raw removal.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn delete_assertion(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<bool, PersistError> {
+        let n = self.conn.execute(
+            "DELETE FROM assertion WHERE did = ?1 AND kind = ?2 AND subkey = ?3",
+            rusqlite::params![did, kind, subkey.unwrap_or("")],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The subkeys a DID holds for one kind, sorted (ADR 0005 / A2). A namespace
+    /// row (no subkey) is stored as `''` and returned as-is when present. Self-only
+    /// enumeration is enforced upstream (owner-authz); this is the raw query.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn list_assertion_subkeys(&self, did: &str, kind: &str) -> Result<Vec<String>, PersistError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT subkey FROM assertion WHERE did = ?1 AND kind = ?2 ORDER BY subkey")?;
+        let rows = stmt.query_map(rusqlite::params![did, kind], |row| row.get::<_, String>(0))?;
+        let mut subkeys = Vec::new();
+        for row in rows {
+            subkeys.push(row?);
+        }
+        Ok(subkeys)
+    }
+
     /// Load a stored assertion + its ack, if present — the durable signed
     /// artifacts, for read-back. Surfaces a parse failure as an error: an owner
     /// reading back its own record should see a loud failure, not a silent

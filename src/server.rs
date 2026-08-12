@@ -87,6 +87,14 @@ pub(crate) const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
 /// must bind to (ADR 0003).
 pub(crate) const DU_LXM: &str = "ing.croft.ciss.du";
 
+/// The lexicon method a `did:` caller's **assertion erasure** JWT binds to
+/// (ADR 0005 / A2). Owner-only, like the write it undoes.
+pub(crate) const DELETE_ASSERTION_LXM: &str = "ing.croft.ciss.deleteAssertion";
+
+/// The lexicon method a `did:` caller's **assertion listing** JWT binds to
+/// (ADR 0005 / A2). Owner-only and self-only (the `du` discipline).
+pub(crate) const LIST_ASSERTIONS_LXM: &str = "ing.croft.ciss.listAssertions";
+
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -382,12 +390,19 @@ impl App {
             )
             .route(
                 "/{did}/assertion/{kind}",
-                put(put_assertion_handler).get(get_assertion_handler),
+                put(put_assertion_handler)
+                    .get(get_assertion_handler)
+                    .delete(delete_assertion_handler),
             )
             .route(
                 "/{did}/assertion/{kind}/{subkey}",
-                put(put_assertion_subkey_handler).get(get_assertion_subkey_handler),
+                put(put_assertion_subkey_handler)
+                    .get(get_assertion_subkey_handler)
+                    .delete(delete_assertion_subkey_handler),
             )
+            // The owner-only subkey listing (A2) — plural `assertions`, distinct
+            // from the singular read-back route above.
+            .route("/{did}/assertions/{kind}", get(list_assertions_handler))
             .route(
                 "/{did}/receipt/{hash}/countersign",
                 axum::routing::post(countersign_receipt_handler),
@@ -604,6 +619,19 @@ pub(crate) enum Op {
         kind: String,
         subkey: Option<String>,
     },
+    /// Erase a stored assertion (ADR 0005 / A2). Owner-only; allowed only for a
+    /// kind declaring `Erasable`. A `Permanent` kind is refused with its reason.
+    DeleteAssertion {
+        did: String,
+        kind: String,
+        subkey: Option<String>,
+    },
+    /// List the subkeys a DID holds for one kind (ADR 0005 / A2). Owner-only and
+    /// self-only (no existence oracle); allowed only for a `Listable` kind.
+    ListAssertions {
+        did: String,
+        kind: String,
+    },
     /// The customer countersigns a bilateral receipt (self-authorizing: the
     /// signature must verify under the key deriving the DID).
     CountersignReceipt {
@@ -637,6 +665,8 @@ impl Op {
             | Op::ListBlobs { .. }
             | Op::PutAssertion { .. }
             | Op::GetAssertion { .. }
+            | Op::DeleteAssertion { .. }
+            | Op::ListAssertions { .. }
             | Op::CountersignReceipt { .. }
             | Op::Du { .. } => false,
         }
@@ -690,6 +720,13 @@ pub(crate) enum OpOutcome {
     /// Pre-serialized JSON.
     UsageBody {
         json: String,
+    },
+    /// An assertion was erased (ADR 0005 / A2). Renders `{erased: true}` at 200.
+    AssertionErased,
+    /// The subkeys a DID holds for a listable kind (ADR 0005 / A2). Renders
+    /// `{subkeys: [...]}` at 200 — the owner's own keys, never a cross-DID view.
+    AssertionSubkeys {
+        subkeys: Vec<String>,
     },
 }
 
@@ -909,7 +946,13 @@ fn require_owner(principal: &Principal, did: &str) -> Result<(), ServerError> {
 /// reads for the history-convergence tier); v0 is the flat PDS-compat default.
 fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
     match op {
-        Op::PutObject { did, .. } | Op::GetMeter { did } => require_owner(principal, did),
+        // Owner-only mutation/inspection: the billing meter, and the A2
+        // assertion lifecycle (erase, list). DELETE and LIST are gated here,
+        // before any existence check, so a non-owner LIST is never an oracle.
+        Op::PutObject { did, .. }
+        | Op::GetMeter { did }
+        | Op::DeleteAssertion { did, .. }
+        | Op::ListAssertions { did, .. } => require_owner(principal, did),
         Op::GetObject { .. }
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
@@ -1003,6 +1046,10 @@ pub(crate) fn dispatch(
         Op::GetAssertion { did, kind, subkey } => {
             op_get_assertion(state, principal, &did, &kind, subkey.as_deref())
         }
+        Op::DeleteAssertion { did, kind, subkey } => {
+            op_delete_assertion(state, &did, &kind, subkey.as_deref())
+        }
+        Op::ListAssertions { did, kind } => op_list_assertions(state, &did, &kind),
         Op::CountersignReceipt { did, content_hash, sig } => {
             op_countersign_receipt(state, &did, &content_hash, &sig)
         }
@@ -1694,6 +1741,46 @@ fn op_get_assertion(
     Err(ServerError::NotFound)
 }
 
+/// Erase a stored assertion (ADR 0005 / A2). Allowed only for a kind declaring
+/// `Erasable`; a `Permanent` kind is refused with its reason. Owner authority is
+/// checked upstream (`require_owner`). A hard delete leaves **no residue** — the
+/// row and its seq are gone, so a re-write starts fresh at seq 1 (the pinned
+/// post-erase semantics). The erasable kinds are the private-instance kv kinds,
+/// whose write boundary is loopback; post-erase replay of an old signed record is
+/// out of that threat model (a loopback attacker already holds the tenant key).
+fn op_delete_assertion(
+    state: &AppState,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    let spec =
+        crate::kind_spec::kind_spec(kind).ok_or(ServerError::BadAssertion("unknown assertion kind"))?;
+    if spec.erasure == crate::kind_spec::Erasure::Permanent {
+        return Err(ServerError::ErasureNotAllowed { kind: kind.to_owned() });
+    }
+    if lock_store(&state.store).delete_assertion(did, kind, subkey)? {
+        Ok(OpOutcome::AssertionErased)
+    } else {
+        Err(ServerError::NotFound)
+    }
+}
+
+/// List the subkeys a DID holds for one kind (ADR 0005 / A2). Allowed only for a
+/// kind declaring `Listable`; a `PointOnly` kind is refused. Owner-and-self-only
+/// is enforced upstream (`require_owner` runs before this op), so the result is
+/// always the caller's own keys and a non-owner's refusal is never an existence
+/// oracle — it is decided before any row is consulted.
+fn op_list_assertions(state: &AppState, did: &str, kind: &str) -> Result<OpOutcome, ServerError> {
+    let spec =
+        crate::kind_spec::kind_spec(kind).ok_or(ServerError::BadAssertion("unknown assertion kind"))?;
+    if spec.enumeration == crate::kind_spec::Enumeration::PointOnly {
+        return Err(ServerError::EnumerationNotAllowed { kind: kind.to_owned() });
+    }
+    let subkeys = lock_store(&state.store).list_assertion_subkeys(did, kind)?;
+    Ok(OpOutcome::AssertionSubkeys { subkeys })
+}
+
 /// The customer's countersignature on a bilateral receipt: verify the sig
 /// over the content hash under the key deriving the DID (self-authorizing —
 /// no session needed beyond the signature itself), then complete the stored
@@ -1948,6 +2035,58 @@ async fn get_assertion_subkey_handler(
     .await
 }
 
+/// `DELETE /{did}/assertion/{kind}` — erase a namespace-scoped assertion (no
+/// subkey). Owner-only; refused for a `Permanent` kind (A2).
+async fn delete_assertion_handler(
+    State(state): State<AppState>,
+    Path((did, kind)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, DELETE_ASSERTION_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::DeleteAssertion { did: did.into_string(), kind, subkey: None },
+    )
+    .await
+}
+
+/// `DELETE /{did}/assertion/{kind}/{subkey}` — erase a subkeyed assertion (e.g. a
+/// `kv.flag`). Owner-only; refused for a `Permanent` kind (A2).
+async fn delete_assertion_subkey_handler(
+    State(state): State<AppState>,
+    Path((did, kind, subkey)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, DELETE_ASSERTION_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::DeleteAssertion { did: did.into_string(), kind, subkey: Some(subkey) },
+    )
+    .await
+}
+
+/// `GET /{did}/assertions/{kind}` — the owner-only subkey listing for a
+/// `Listable` kind (A2). Self-only, no existence oracle; refused for a
+/// `PointOnly` kind.
+async fn list_assertions_handler(
+    State(state): State<AppState>,
+    Path((did, kind)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, LIST_ASSERTIONS_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::ListAssertions { did: did.into_string(), kind },
+    )
+    .await
+}
+
 async fn get_meter_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
@@ -2067,6 +2206,10 @@ impl IntoResponse for OpOutcome {
                     .unwrap_or(serde_json::Value::Null),
             }))
             .into_response(),
+            OpOutcome::AssertionErased => Json(serde_json::json!({ "erased": true })).into_response(),
+            OpOutcome::AssertionSubkeys { subkeys } => {
+                Json(serde_json::json!({ "subkeys": subkeys })).into_response()
+            }
         }
     }
 }
@@ -2177,6 +2320,20 @@ pub enum ServerError {
         /// The kind's declared body ceiling.
         ceiling: usize,
     },
+    /// DELETE was attempted on a kind that declares `Permanent` erasure (ADR
+    /// 0005): the record is superseded by a higher-seq write, never deleted.
+    #[error("{kind} is permanent (ADR 0005): superseded by a new record, never deleted")]
+    ErasureNotAllowed {
+        /// The permanent kind whose erasure was refused.
+        kind: String,
+    },
+    /// LIST was attempted on a kind that declares `PointOnly` enumeration (ADR
+    /// 0005): the key is the price of asking; the kind is not enumerable.
+    #[error("{kind} is point-only (ADR 0005): address it by key, it does not enumerate")]
+    EnumerationNotAllowed {
+        /// The point-only kind whose listing was refused.
+        kind: String,
+    },
     /// A billable write would take the period's postage past the customer's
     /// asserted spend ceiling — refused BEFORE serving, with the quote
     /// (E89: throttle/defer, never mint debt). Owner egress is exempt
@@ -2227,6 +2384,9 @@ impl IntoResponse for ServerError {
             | ServerError::AssertionUnauthorized => StatusCode::FORBIDDEN,
             ServerError::AssertionStale { .. } | ServerError::DrawdownActive => {
                 StatusCode::CONFLICT
+            }
+            ServerError::ErasureNotAllowed { .. } | ServerError::EnumerationNotAllowed { .. } => {
+                StatusCode::METHOD_NOT_ALLOWED
             }
             ServerError::SpendCeiling { .. } => StatusCode::PAYMENT_REQUIRED,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
