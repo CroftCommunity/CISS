@@ -198,6 +198,47 @@ layout:
 Blob *bytes* never enter SQLite — they stay in the Layer-1 backend, keyed
 `(DID, CID)`.
 
+## 5a. The storage model: six declared axes
+
+Everything CISS stores is one record family sitting at a declared point in a
+small semantic space. This framing (ADR 0005, owner-directed 2026-08-11)
+replaces the earlier build-by-use-case accretion: a new stored thing picks a
+point on six axes instead of hand-rolling behaviour, and the cross-inspection
+below shows every existing surface already fits.
+
+| Axis | Values | The question it answers |
+|---|---|---|
+| **Retention** | `setting` · `immutable` · `log` · `chain` | Does history exist, and how? `setting`: latest wins, old value replaced. `immutable`: write-once per key, never updated (content-addressed bytes). `log`: append-only rows, integrity via periodic roots rather than per-entry links. `chain`: append-only + each entry binds its predecessor's hash. |
+| **Authorship** | `derived` · `owner-signed` · `provider-signed` · `co-signed` | Whose statement is this? `derived` records are unsigned, rebuildable caches of signed data — never authoritative. |
+| **Erasure** | `erasable` · `permanent` | Is true removal offered? `chain` implies `permanent` (until a checkpoint); the seal **tombstone** tier is `permanent` enforced by *destroying the unseal capability* — the axis's extreme point, already shipped. |
+| **Enumeration** | `listable` · `point-only` | Can the owner list their keys, or is knowing the key the price of asking? `point-only` is a privacy stance, chosen on purpose. |
+| **Hashing** | `fold-bound` · `chain-linked` · `merkle-rooted` · `content-addressed`, × algorithm | What does the hash commit to — a canonical serialization, the predecessor, a set, or the identity itself? The **algorithm is declared**: SHA-256 throughout CISS; BLAKE3 where content interoperates with iroh file transfer. The split is deliberate ecosystem alignment. |
+| **Sizing** | body ceiling, growth: `bounded` · `rolling` · `unbounded` | Nothing is assumed infinite. `rolling` = compaction behind **acknowledged** checkpoints (the statements rollup/purge boundary, generalized). `unbounded` exists only as a visible choice. |
+
+The whole store, classified:
+
+| Surface | Retention | Authorship | Erasure | Enumeration | Hashing | Sizing |
+|---|---|---|---|---|---|---|
+| blobs (`blocks/{did}/{cid}`) | immutable | owner-submitted, boundary-verified | erasable | listable (manifest/`du`) | content-addressed / SHA-256 | store + per-DID ceilings |
+| `manifest` | setting | owner-signed | erasable | n/a (one per DID) | **merkle-rooted** / SHA-256 (root over `(cid,size)` leaves) | grows with item count — ceiling applies |
+| `receipt` | **log** | provider- or co-signed | permanent **until settled** | listable (self-only) | fold-bound / SHA-256 | **rolling** — `purge_receipts_settled_through` drops rows behind a settled statement |
+| `statement` | **chain** | co-signed | permanent | listable (self-only) | chain-linked + merkle-rooted / SHA-256 | rolling (it *is* the checkpoint layer) |
+| ledger entries (incl. grace) | chain | co-signed | permanent | listable per actor | chain-linked / SHA-256 | rolling via statements |
+| `did_total` | setting | **derived** (rebuildable from receipts) | erasable | n/a | none | bounded |
+| `meta` | setting | derived / provider-internal | erasable | n/a | none | bounded |
+| assertions (`policy`, `dial.*`, `kv.flag`) | setting | owner-signed or provider-attested, provider-acked | per kind (ADR 0005) | per kind | fold-bound / SHA-256 | small ceiling, bounded |
+| seal declarations | setting | owner-signed | tombstone tier: **capability destroyed** | point-only | fold-bound over a pinned root | bounded |
+| `chain.counter` (ADR 0005, pending) | chain | owner-signed, provider-acked | permanent | listable | chain-linked / SHA-256 | rolling (checkpoint + ack-before-shred) |
+
+What the cross-inspection taught (and fed back into ADR 0005): retention needed
+four values, not two (blobs are `immutable`, receipts are a `log`); authorship
+was a latent sixth axis the substrate's Model A/C already half-encoded; the
+manifest's Merkle root is a fourth hashing posture; and the checkpoint/
+compaction design for chains is a **port of shipped practice** (the statements
+rollup/purge boundary), not an invention. The queue work layering on CISS
+(meer, custodian chains) slots in as future `log`/`chain` rows — the axes are
+the vocabulary for that conversation too.
+
 ## 6. Trust boundaries / threat model
 
 | Actor / surface | Trusted for | NOT trusted for | Caught by |

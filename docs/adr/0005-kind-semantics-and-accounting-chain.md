@@ -182,6 +182,39 @@ handles both, reading this CHANGELOG entry.
 - Downstream pins (README "Downstream consumers") bump deliberately;
   croft-relay-admit's move is its own PR against this CHANGELOG entry.
 
+
+## Cross-inspection: the whole store, against the axes (2026-08-11)
+
+At the owner's direction, every storage surface in CISS — not only assertion
+kinds — was swept against the model to see whether the framing bears out.
+**It does, and the sweep refined it**; the full classification table now lives
+in `ARCHITECTURE.md` §5a as the repo's stated storage model, replacing the
+build-by-use-case framing. What the inspection changed:
+
+1. **Retention has four values, not two.** Content-addressed blobs are
+   `immutable` (write-once per key, deletable, never updated — neither a
+   setting nor a chain). Receipts are a **`log`**: append-only rows whose
+   integrity comes from periodic roots (statements) rather than per-entry
+   links. So: `setting | immutable | log | chain`.
+2. **Authorship is a sixth axis**, latent everywhere: `derived` (unsigned,
+   rebuildable caches — `did_total`, `meta`; never authoritative) |
+   `owner-signed` | `provider-signed` | `co-signed`. The substrate's Model
+   A/C is this axis's assertion-shaped corner.
+3. **Hashing gains a fourth posture: `merkle-rooted`** — the manifest's root
+   over `(cid, size)` leaves, and the roots statements bind. Commitment over
+   a *set*, distinct from fold, link, and identity.
+4. **The checkpoint design is a port of shipped practice, not an
+   invention:** `purge_receipts_settled_through` already drops receipts
+   behind a *settled* (co-signed) statement — compaction behind an
+   acknowledged checkpoint, live in the money path today. `chain.counter`
+   generalizes it to the substrate. The seal **tombstone** tier likewise
+   corroborates the erasure axis at its extreme: `permanent` enforced by
+   destroying the unseal capability.
+
+Nothing in the store resisted classification; the two `derived` tables were
+the only surfaces needing a value the assertion-shaped draft lacked, and the
+authorship axis absorbs them cleanly.
+
 ## Implementation order (when accepted)
 
 1. `KindSpec` + reclassification of existing kinds (no behaviour change yet;
