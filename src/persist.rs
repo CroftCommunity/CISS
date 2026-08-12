@@ -32,6 +32,11 @@ pub struct ReceiptTotals {
     pub upload_bytes: u64,
     /// Total bytes downloaded (provider -> customer).
     pub download_bytes: u64,
+    /// Bytes downloaded while the account was in drawdown — the separable
+    /// "drain" line (B6 legibility). Always ALSO counted in
+    /// `download_bytes`: drawdown egress is fully metered; this figure only
+    /// makes it separable for the statement-time human billing judgment.
+    pub drawdown_download_bytes: u64,
 }
 
 impl ReceiptTotals {
@@ -188,11 +193,12 @@ impl Store {
                  json TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS did_total (
-                 did            TEXT PRIMARY KEY,
-                 receipt_count  INTEGER NOT NULL DEFAULT 0,
-                 upload_bytes   INTEGER NOT NULL DEFAULT 0,
-                 download_bytes INTEGER NOT NULL DEFAULT 0,
-                 stored_bytes   INTEGER NOT NULL DEFAULT 0
+                 did                     TEXT PRIMARY KEY,
+                 receipt_count           INTEGER NOT NULL DEFAULT 0,
+                 upload_bytes            INTEGER NOT NULL DEFAULT 0,
+                 download_bytes          INTEGER NOT NULL DEFAULT 0,
+                 stored_bytes            INTEGER NOT NULL DEFAULT 0,
+                 drawdown_download_bytes INTEGER NOT NULL DEFAULT 0
              );
              DROP TABLE IF EXISTS namespace_policy;
              DROP TABLE IF EXISTS object_policy;
@@ -216,15 +222,17 @@ impl Store {
                         receipt_count
                  FROM did_total;",
         )?;
-        // Defensive migration for a did_total created before `stored_bytes`
+        // Defensive migrations for a did_total created before later columns
         // existed (a dev database); ignore the duplicate-column error.
-        if let Err(e) = conn.execute(
+        for ddl in [
             "ALTER TABLE did_total ADD COLUMN stored_bytes INTEGER NOT NULL DEFAULT 0",
-            [],
-        ) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(e.into());
+            "ALTER TABLE did_total ADD COLUMN drawdown_download_bytes INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
             }
         }
         Ok(Self { conn })
@@ -627,6 +635,15 @@ impl Store {
             Direction::Upload => (bytes, 0),
             Direction::Download => (0, bytes),
         };
+        // The drain line (B6 legibility): a download tagged Drawdown counts
+        // here IN ADDITION to download_bytes — separable, never exempted.
+        let drain = if receipt.core().direction == Direction::Download
+            && receipt.core().account_mode == crate::dials::AccountMode::Drawdown
+        {
+            bytes
+        } else {
+            0
+        };
         let tx = self.conn.unchecked_transaction()?;
         // Backfill the cache row from any pre-existing receipts the first time we
         // touch this DID, so the incremental counter is correct even for a ledger
@@ -640,9 +657,10 @@ impl Store {
             "UPDATE did_total
                  SET receipt_count = receipt_count + 1,
                      upload_bytes = upload_bytes + ?2,
-                     download_bytes = download_bytes + ?3
+                     download_bytes = download_bytes + ?3,
+                     drawdown_download_bytes = drawdown_download_bytes + ?4
              WHERE did = ?1",
-            rusqlite::params![did, up, down],
+            rusqlite::params![did, up, down, drain],
         )?;
         tx.commit()?;
         Ok(())
@@ -657,13 +675,15 @@ impl Store {
         let cached = self
             .conn
             .query_row(
-                "SELECT receipt_count, upload_bytes, download_bytes FROM did_total WHERE did = ?1",
+                "SELECT receipt_count, upload_bytes, download_bytes, drawdown_download_bytes
+                   FROM did_total WHERE did = ?1",
                 [did],
                 |row| {
                     Ok(ReceiptTotals {
                         receipt_count: row.get(0)?,
                         upload_bytes: row.get(1)?,
                         download_bytes: row.get(2)?,
+                        drawdown_download_bytes: row.get(3)?,
                     })
                 },
             )
@@ -730,13 +750,15 @@ impl Store {
         if !present {
             let totals = self.sum_receipts(did)?;
             self.conn.execute(
-                "INSERT INTO did_total (did, receipt_count, upload_bytes, download_bytes)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO did_total
+                     (did, receipt_count, upload_bytes, download_bytes, drawdown_download_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     did,
                     totals.receipt_count,
                     totals.upload_bytes,
-                    totals.download_bytes
+                    totals.download_bytes,
+                    totals.drawdown_download_bytes
                 ],
             )?;
         }
@@ -753,7 +775,12 @@ impl Store {
             totals.receipt_count += 1;
             match receipt.core().direction {
                 Direction::Upload => totals.upload_bytes += bytes,
-                Direction::Download => totals.download_bytes += bytes,
+                Direction::Download => {
+                    totals.download_bytes += bytes;
+                    if receipt.core().account_mode == crate::dials::AccountMode::Drawdown {
+                        totals.drawdown_download_bytes += bytes;
+                    }
+                }
             }
         }
         Ok(totals)
@@ -1035,7 +1062,7 @@ mod tests {
         let did = "id:tester";
         let mk = |dir, bytes, rt| {
             make_unilateral_receipt(
-                ReceiptCore::new(dir, "cid", (0, bytes), rt, 0, "id:r", "id:s"),
+                ReceiptCore::new(dir, "cid", (0, bytes), rt, 0, crate::dials::AccountMode::Active, "id:r", "id:s"),
                 "id:s",
                 &provider,
             )
@@ -1068,6 +1095,49 @@ mod tests {
     }
 
     #[test]
+    fn drawdown_drain_counts_in_both_cache_and_ledger_scan() {
+        use crate::dials::AccountMode;
+        use crate::receipts::{make_unilateral_receipt, Direction, ReceiptCore};
+
+        let provider = derive_keypair("m", "p");
+        let store = Store::open_in_memory().expect("open");
+        let did = "id:drainer";
+        let mk = |dir, bytes, rt, mode| {
+            make_unilateral_receipt(
+                ReceiptCore::new(dir, "cid", (0, bytes), rt, 0, mode, "id:r", "id:s"),
+                "id:s",
+                &provider,
+            )
+        };
+
+        // Only a Download in Drawdown is a drain: an active download is
+        // ordinary traffic, and an upload tagged Drawdown (impossible via the
+        // gated write path, but the accounting must not care) is not egress.
+        store
+            .append_receipt(did, &mk(Direction::Download, 5, 5, AccountMode::Active))
+            .expect("active down");
+        store
+            .append_receipt(did, &mk(Direction::Download, 7, 12, AccountMode::Drawdown))
+            .expect("drain down");
+        store
+            .append_receipt(did, &mk(Direction::Upload, 11, 23, AccountMode::Drawdown))
+            .expect("tagged up");
+
+        let cached = store.running_totals(did).expect("cached totals");
+        assert_eq!(cached.download_bytes, 12, "the drain still meters in full");
+        assert_eq!(cached.drawdown_download_bytes, 7, "only the drawdown download drains");
+
+        // B5: the O(1) cache must equal a full ledger scan — including the
+        // drain column. Drop the cache row and re-read through the scan path.
+        store
+            .conn
+            .execute("DELETE FROM did_total WHERE did = ?1", [did])
+            .expect("drop cache row");
+        let scanned = store.running_totals(did).expect("scanned totals");
+        assert_eq!(scanned, cached, "cache and ledger scan agree on the drain");
+    }
+
+    #[test]
     fn did_usage_view_reflects_stores_and_transfers() {
         use crate::receipts::{make_unilateral_receipt, Direction, ReceiptCore};
         let provider = derive_keypair("m", "p");
@@ -1077,7 +1147,7 @@ mod tests {
             .append_receipt(
                 did,
                 &make_unilateral_receipt(
-                    ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 0, "id:r", "id:s"),
+                    ReceiptCore::new(Direction::Upload, "cid", (0, 100), 100, 0, crate::dials::AccountMode::Active, "id:r", "id:s"),
                     "id:s",
                     &provider,
                 ),

@@ -56,6 +56,7 @@ fn transfer(
             (offset, end),
             running,
             1,
+            ciss::dials::AccountMode::Active,
             receiver_id,
             sender_id,
         );
@@ -218,6 +219,7 @@ fn e3_unilateral_is_a_single_party_measurement_not_co_attested() {
         (0, 2048),
         2048,
         1,
+        ciss::dials::AccountMode::Active,
         &provider_id,
         &customer_id,
     );

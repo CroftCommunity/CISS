@@ -668,6 +668,7 @@ pub(crate) enum OpOutcome {
         download_bytes: u64,
         running_total_bytes: u64,
         postage_cents: u64,
+        drawdown_download_bytes: u64,
     },
     /// The distinct content addresses (hex SHA-256) a DID has uploaded, in
     /// first-upload order. The atproto layer maps each to a CIDv1 `$link`.
@@ -1123,26 +1124,20 @@ fn op_put_object(
     let total = usize::try_from(totals.total_bytes()).expect("byte total fits usize") + boundary;
 
     // Upload: customer -> provider. receiver = provider, sender = customer.
+    // The receipt carries the account mode in effect at transfer time
+    // (drawdown legibility, B6) — signed into the core, so the drain
+    // classification is an attested fact, not an annotation.
     let core = ReceiptCore::new(
         Direction::Upload,
         &cid,
         (0, boundary),
         total,
         state.day,
+        store.account_mode(did)?,
         &state.provider.id,
         did,
     );
-    let default_mode = match store.receipt_mode_dial(did)? {
-        ReceiptModeChoice::Bilateral => ReceiptMode::Bilateral,
-        ReceiptModeChoice::Unilateral => ReceiptMode::Unilateral,
-    };
-    let mode = select_mode(
-        &TransferContext {
-            bytes: boundary,
-            trust_distance: None,
-        },
-        default_mode,
-    );
+    let mode = boundary_receipt_mode(&store, did, boundary)?;
     let receipt = build_boundary_receipt(state, core, mode);
     // A new store adds to the DID's distinct bytes at rest; a dedup store does not.
     if is_new_store {
@@ -1190,26 +1185,19 @@ fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, Se
     let total = usize::try_from(totals.total_bytes()).expect("byte total fits usize") + boundary;
 
     // Download: provider -> customer. receiver = customer, sender = provider.
+    // In drawdown this is the drain: served (B6), fully metered, and the
+    // mode tag makes it separable for the statement-time billing judgment.
     let core = ReceiptCore::new(
         Direction::Download,
         cid,
         (0, boundary),
         total,
         state.day,
+        store.account_mode(did)?,
         did,
         &state.provider.id,
     );
-    let default_mode = match store.receipt_mode_dial(did)? {
-        ReceiptModeChoice::Bilateral => ReceiptMode::Bilateral,
-        ReceiptModeChoice::Unilateral => ReceiptMode::Unilateral,
-    };
-    let mode = select_mode(
-        &TransferContext {
-            bytes: boundary,
-            trust_distance: None,
-        },
-        default_mode,
-    );
+    let mode = boundary_receipt_mode(&store, did, boundary)?;
     let receipt = build_boundary_receipt(state, core, mode);
     store.append_receipt(did, &receipt)?;
     tracing::info!(
@@ -1234,6 +1222,27 @@ fn op_get_object(state: &AppState, did: &str, cid: &str) -> Result<OpOutcome, Se
 /// the Phase-8 auth handshake / a later client-signing spike. Until then a
 /// policy that selects `Bilateral` is a loud error, never a silent downgrade to
 /// unilateral.
+/// Resolve the receipt mode for a boundary transfer: the customer's
+/// receipt-mode dial sets the default (D4), then the per-transfer policy
+/// seam (`select_mode`) has the last word.
+fn boundary_receipt_mode(
+    store: &crate::persist::Store,
+    did: &str,
+    boundary: usize,
+) -> Result<ReceiptMode, ServerError> {
+    let default_mode = match store.receipt_mode_dial(did)? {
+        ReceiptModeChoice::Bilateral => ReceiptMode::Bilateral,
+        ReceiptModeChoice::Unilateral => ReceiptMode::Unilateral,
+    };
+    Ok(select_mode(
+        &TransferContext {
+            bytes: boundary,
+            trust_distance: None,
+        },
+        default_mode,
+    ))
+}
+
 fn build_boundary_receipt(
     state: &AppState,
     core: ReceiptCore,
@@ -1332,6 +1341,7 @@ fn op_get_meter(state: &AppState, did: &str) -> Result<OpOutcome, ServerError> {
         download_bytes: totals.download_bytes,
         running_total_bytes: totals.total_bytes(),
         postage_cents: postage_cents(totals.total_bytes()),
+        drawdown_download_bytes: totals.drawdown_download_bytes,
     })
 }
 
@@ -2036,12 +2046,14 @@ impl IntoResponse for OpOutcome {
                 download_bytes,
                 running_total_bytes,
                 postage_cents,
+                drawdown_download_bytes,
             } => Json(serde_json::json!({
                 "receipt_count": receipt_count,
                 "upload_bytes": upload_bytes,
                 "download_bytes": download_bytes,
                 "running_total_bytes": running_total_bytes,
                 "postage_cents": postage_cents,
+                "drawdown_download_bytes": drawdown_download_bytes,
             }))
             .into_response(),
             OpOutcome::BlobList { cids } => {

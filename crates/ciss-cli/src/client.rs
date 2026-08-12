@@ -131,6 +131,10 @@ pub struct Meter {
     pub running_total_bytes: u64,
     /// Postage owed, in cents.
     pub postage_cents: u64,
+    /// Bytes downloaded while the account was in drawdown — the "drain"
+    /// line (B6 legibility): fully metered into `download_bytes` too, but
+    /// separable so statement-time billing judgment has a figure to act on.
+    pub drawdown_download_bytes: u64,
 }
 
 /// A client bound to one CISS server base URL.

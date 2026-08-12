@@ -108,6 +108,7 @@ fn e4_statements_chain_balance_forward_and_purge() {
         (0, c.size()),
         c.size(),
         0,
+        ciss::dials::AccountMode::Active,
         &provider_id,
         &customer_id,
     );
@@ -134,6 +135,7 @@ fn e4_statements_chain_balance_forward_and_purge() {
         (0, d.size()),
         d.size(),
         35,
+        ciss::dials::AccountMode::Active,
         &provider_id,
         &customer_id,
     );

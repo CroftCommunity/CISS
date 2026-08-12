@@ -301,12 +301,12 @@ mod tests {
         let sender = derive_keypair("m", "s");
         let mut receipts = vec![
             make_bilateral_receipt(
-                ReceiptCore::new(Direction::Upload, "c1", (0, 10), 10, 5, "r", "s"),
+                ReceiptCore::new(Direction::Upload, "c1", (0, 10), 10, 5, crate::dials::AccountMode::Active, "r", "s"),
                 Some(&receiver),
                 &sender,
             ),
             make_bilateral_receipt(
-                ReceiptCore::new(Direction::Upload, "c2", (0, 10), 10, 40, "r", "s"),
+                ReceiptCore::new(Direction::Upload, "c2", (0, 10), 10, 40, crate::dials::AccountMode::Active, "r", "s"),
                 Some(&receiver),
                 &sender,
             ),
