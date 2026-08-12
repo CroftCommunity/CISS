@@ -1615,14 +1615,6 @@ fn kind_fold(
                 .map_err(|_| ServerError::BadAssertion("body is not a valid kv flag"))?;
             Ok(crate::kv::flag_body_fold(&body))
         }
-        crate::kv::COUNTER_KIND => {
-            if !crate::kv::subkey_valid(subkey) {
-                return Err(ServerError::BadAssertion("kv kinds require a valid subkey"));
-            }
-            let body: crate::kv::CounterBody = serde_json::from_value(body.clone())
-                .map_err(|_| ServerError::BadAssertion("body is not a valid kv counter"))?;
-            Ok(crate::kv::counter_body_fold(&body))
-        }
         crate::chain_kind::CHAIN_COUNTER_KIND => {
             // A chain totals a per-subkey account, so a subkey is required (the
             // same discipline as the kv kinds). The body is either a step or a

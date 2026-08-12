@@ -171,7 +171,6 @@ pub const REGISTRY: &[&KindSpec] = &[
     &crate::dials::ACCOUNT_MODE_DIAL_SPEC,
     &crate::dials::RECEIPT_MODE_DIAL_SPEC,
     &crate::kv::FLAG_SPEC,
-    &crate::kv::COUNTER_SPEC,
     &crate::chain_kind::CHAIN_COUNTER_SPEC,
 ];
 
@@ -263,7 +262,6 @@ mod tests {
             crate::dials::ACCOUNT_MODE_DIAL_KIND,
             crate::dials::RECEIPT_MODE_DIAL_KIND,
             crate::kv::FLAG_KIND,
-            crate::kv::COUNTER_KIND,
             crate::chain_kind::CHAIN_COUNTER_KIND,
         ];
         for kind in foldable {

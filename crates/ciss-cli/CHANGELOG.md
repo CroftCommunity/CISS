@@ -5,6 +5,15 @@ it fronts: `ciss-sync`, `ciss-iroh`). The server has its own changelog at the
 repo root. Versions move in lockstep with the server; the Homebrew tap
 (`croftcommunity/tap/ciss-ctl`) tracks tagged releases.
 
+## [Unreleased]
+
+### Added — the kind-semantics client surface (ADR 0005)
+- `Client::delete_assertion` / `Client::list_assertions` — the generic
+  owner-only `DELETE` and subkey `LIST` (return the HTTP status so refusals are
+  observable).
+- `Client::get_chain` — the `?chain=1` read (entry history + recomputed total).
+- `Client::compact_chain` — the explicit `POST .../compact` billing-marker path.
+
 ## [0.7.0] — 2026-08-09
 
 Everything since the ladder release, in two waves.

@@ -12,16 +12,55 @@ GitHub release notes).
 
 ## [Unreleased]
 
+The **kind-semantics release** (ADR 0005): every stored kind now declares its
+point in a six-axis space (`src/kind_spec.rs`), and the accounting substrate
+learns a tamper-evident chain. This is the release the downstream consumer
+(`croft-stack/relay/source`, croft-relay-admit) bumps its pin to; the notes
+below are its migration reading. That pin does not see any of this until it
+deliberately bumps to a commit including it (README "Downstream consumers").
+
 ### Added
-- **Generic KV kinds on the self-assertion substrate** (`src/kv.rs`):
-  `kv.flag` (a per-subkey boolean) and `kv.counter` (a per-subkey total,
-  ordered by the substrate's strictly-monotonic `seq`). Both require a
-  bounded, charset-checked subkey; bodies are typed and folded like every
-  other kind, and unregistered kinds remain refused. No consumer vocabulary —
-  any tenant can use a flag or a counter. First consumer:
-  `croft-stack/relay/source` (croft-relay-admit's membership/accounting store
-  on a private instance; see README "Downstream consumers" — that pin does
-  not see this change until it deliberately bumps to a commit including it).
+- **`KindSpec` and the six-axis storage model** (`src/kind_spec.rs`, ADR 0005 /
+  ARCHITECTURE §5a): every kind declares retention, authorship, erasure,
+  enumeration, hashing (posture × algorithm), and sizing as data. A compile-time
+  invariant enforces `Chain ⇒ Permanent`.
+- **Body ceilings** — a kind-specific body-byte ceiling enforced at the write
+  boundary, refused with the limit quoted (independent of count guards like
+  policy's `MAX_READERS`).
+- **`kv.flag`** — a per-subkey boolean (a tenant's membership roster): erasable,
+  listable, `Setting` retention.
+- **Generic `DELETE` and `LIST`, gated by declaration**:
+  `DELETE /{did}/assertion/{kind}[/{subkey}]` (owner-only; allowed only for an
+  `Erasable` kind — a hard delete leaving no residue, so a re-write starts at
+  seq 1; a `Permanent` kind refused 405) and
+  `GET /{did}/assertions/{kind}` (owner-and-self-only subkey listing for a
+  `Listable` kind; a `PointOnly` kind refused 405; the owner-gate runs before
+  any row is read, so a refusal is never an existence oracle).
+- **`chain.counter`** — an append-only, hash-linked accounting chain
+  (`src/chain_kind.rs`). Each entry is a signed `{delta, total, prev_entry_hash}`
+  step, verified at write to *follow* the chain (total, seq contiguity, and the
+  predecessor link) and refused with the real values quoted otherwise.
+  `?chain=1` returns the entry history plus a server-recomputed, verified total
+  (recomputation catches tampering after the fact — the point of a chain over a
+  cell). Verification path is mutation-clean.
+- **Checkpoints + compaction** (ADR 0005 A4): a signed checkpoint entry
+  `{closing_total, chain_head_hash, prev_checkpoint}` closes the books forward;
+  entries behind an acknowledged checkpoint may be compacted so a chain stays
+  bounded while its aggregate survives. Compaction is a configured policy —
+  `on_ack` (default) or `deferred` to an explicit
+  `POST /{did}/assertion/{kind}/{subkey}/compact` (a billing marker); compaction
+  with no acknowledged checkpoint is refused (no shredding before agreement).
+
+### Removed
+- **`kv.counter`** — the per-subkey latest-wins total, added earlier in this
+  unreleased cycle and **removed before release**: a latest-wins slot lets a
+  compromised writer silently rewrite a running total, which accounting cannot
+  allow. Its role moves to the tamper-evident `chain.counter`. **Consumer
+  migration (B1):** usage accounting moves from `kv.counter` (read-modify-write a
+  total) to `chain.counter` (read-head-then-append a `{delta, total, prev_hash}`
+  entry); the once-retry survives. Membership stays `kv.flag` (a roster wants
+  erasure, not permanence). The consumer's `remove()`/`keys()` workarounds retire
+  onto the real `DELETE`/`LIST`.
 
 ## [0.7.0] — 2026-08-09
 
