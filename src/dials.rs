@@ -122,6 +122,18 @@ pub enum AccountMode {
     Drawdown,
 }
 
+impl AccountMode {
+    /// Whether this is the default `Active` mode. Used as `skip_serializing_if`
+    /// on [`crate::receipts::ReceiptCore::account_mode`]: the default is
+    /// omitted from the serialized (and therefore canonical/signed) form, so a
+    /// receipt signed before the tag existed re-canonicalizes to its original
+    /// bytes — verify-compat, not just parse-compat.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
 /// The account-mode dial's body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

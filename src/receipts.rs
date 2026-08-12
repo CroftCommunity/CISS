@@ -74,7 +74,10 @@ pub struct ReceiptCore {
     /// rides: future modes (service, bot, staff — see [`AccountMode`])
     /// classify traffic the same way, as a signed fact per receipt rather
     /// than a mutable server-side annotation.
-    #[serde(default)]
+    /// Serialization: the default (`Active`) is **omitted** so the canonical
+    /// bytes — and therefore the signed content hash — of a pre-tag receipt
+    /// are unchanged (see [`AccountMode::is_active`]).
+    #[serde(default, skip_serializing_if = "AccountMode::is_active")]
     pub account_mode: AccountMode,
     /// The party receiving the bytes.
     pub receiver_id: String,
@@ -499,6 +502,46 @@ mod tests {
         assert!(
             !bilateral.verify_unilateral(&ring),
             "bilateral is not unilaterally valid",
+        );
+    }
+
+    #[test]
+    fn a_receipt_persisted_before_the_account_mode_tag_still_verifies() {
+        let (rid, receiver, sid, sender) = parties();
+        let ring = ring(&[(&rid, &receiver), (&sid, &sender)]);
+
+        // A pre-tag ledger row, byte-for-byte: the canonical bytes this
+        // receipt was signed over never contained `account_mode`. Verify-compat
+        // (not just parse-compat) is the guarantee — an already-signed receipt
+        // must never become "tampered" because the schema grew a field.
+        let legacy_core = serde_json::json!({
+            "direction": "upload",
+            "cid": "cid",
+            "byte_start": 0,
+            "byte_end": 100,
+            "bytes": 100,
+            "running_total": 100,
+            "day": 1,
+            "receiver_id": rid,
+            "sender_id": sid,
+        });
+        let content_hash = crate::crypto::sha256_hex(&crate::canonical::to_canonical_bytes(
+            &legacy_core,
+        ));
+        let mut sigs = BTreeMap::new();
+        sigs.insert(sid.clone(), sender.sign_message(&content_hash));
+        let row = serde_json::json!({
+            "core": legacy_core,
+            "content_hash": content_hash,
+            "mode": "unilateral",
+            "sigs": sigs,
+        });
+
+        let receipt: Receipt = serde_json::from_value(row).expect("legacy row deserializes");
+        assert_eq!(receipt.core().account_mode, AccountMode::Active);
+        assert!(
+            receipt.verify_unilateral(&ring),
+            "a receipt signed before the account-mode tag existed must stay verifiable"
         );
     }
 }
