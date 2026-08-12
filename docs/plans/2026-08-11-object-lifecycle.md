@@ -1,15 +1,22 @@
 # Object lifecycle — reclamation (A) and declared retention (B)
 
 date: 2026-08-11
-status: **planned, not started.** Scoped from the meer Phase-0 spike (discovery `E95`).
+status: **planned, not started. RE-ALIGNED 2026-08-12 against CISS v0.8.0 (kind semantics A1–A5).**
+Scoped from the meer Phase-0 spike (discovery `E95`). The upstream kind-semantics work changed this
+plan materially — Problem A shrank, Design B gained a home, and one framing here was wrong.
 origin: `discovery/alpha/experiments/meer-queue/TEST-LOG.md` (S5), `discovery/alpha/ROADMAP_TODO.md` E95
 
 ---
 
 ## Problem statement
 
-**CISS cannot delete anything.** The object plane is `PUT` and `GET`; there is no `DELETE`, no
-expiry, and no reclamation of any kind. Nothing that is stored ever stops being stored.
+> **CORRECTED 2026-08-12 (v0.8.0).** This plan opened *"CISS cannot delete anything."* That is now
+> half wrong: **assertions gained a generic owner-authorized `DELETE`** (A2), gated by declaration
+> (`Erasure::Erasable`). **Objects did not** — `/{did}/objects/{addr}` is still `put().get()`. The
+> statement below is narrowed to the object plane, which is where it still holds.
+
+**CISS cannot delete an object.** The object plane is `PUT` and `GET`; there is no `DELETE`, no
+expiry, and no reclamation. Nothing stored as a blob ever stops being stored.
 
 This was measured, not inferred — the meer spike swept an expired queue entry, confirmed the queue
 served nothing afterwards, and confirmed the object was **still on disk**
@@ -48,11 +55,45 @@ other.
 a `DELETE` route would be a new destructive path requiring its own authorization story and its own
 anti-rollback proof. Both halves instead ride authority CISS already has.
 
-### A — reclamation driven by the signed manifest
+### A — register objects as a kind, and point the existing DELETE at them
 
-> **CORRECTED 2026-08-11, before any code was written.** The first draft of this section said
-> *"reclamation collects objects no manifest references."* **That would have deleted nearly
-> everything.** See "The manifest is not an index" below.
+> **RESHAPED 2026-08-12.** Two corrections, in order of when they were found.
+>
+> **(i) 2026-08-11, before any code:** the first draft said *"reclamation collects objects no
+> manifest references."* That would have deleted nearly everything — see "The manifest is not an
+> index" below, which still stands and is still the reason a manifest-driven design is delicate.
+>
+> **(ii) 2026-08-12, after v0.8.0: the manifest-transition design is probably the wrong shape now.**
+> It was invented to route around a missing `DELETE`. That `DELETE` now exists.
+
+**ADR 0005 already decided this, and the implementation stopped one step short of its own
+conclusion.** The ADR's reasoning is explicit:
+
+> *"**Retention has four values, not two.** Content-addressed blobs are `immutable` (write-once per
+> key, **deletable**, never updated…)"*
+
+So blobs are classified, and classified as **deletable**. But there is **no registered `KindSpec` for
+objects** — the registry holds `policy`, four dials, `kv.flag`, `chain.counter`, `grace-event` — and
+A2's `DELETE` landed on the assertion surface only.
+
+**Classified in this repo's own terms** (`CLAUDE.md`: bug vs. design failure): **neither.** Nothing
+violates a stated invariant, so it is not a bug; and the ADR reasoned about blobs explicitly, so it is
+not out of scope. It is an **unfinished edge of an accepted design**.
+
+**Which makes A much smaller than this plan first assumed.** The framework, the DELETE machinery, the
+declaration gating and the `erasure` axis all exist. What is missing is registering objects as a kind
+and pointing the existing DELETE at them — plus deciding the two things blobs do not share with
+assertions:
+
+- **Sharing.** One object can be referenced by several queue entries or manifests. Assertion subkeys
+  have no such fan-in. A delete needs to say what happens to other references.
+- **Namespace scope.** Objects live at `blocks/{did}/{cid}` and **dedup does not cross a namespace**
+  (meer spike S2). Deleting `{did}/{cid}` cannot affect another DID's copy — which is a simplification,
+  not a complication, and should be stated so nobody re-derives it nervously.
+
+**The manifest-transition design below is retained** as the fallback if an explicit object DELETE is
+rejected, and because its central finding — that the manifest is not an index of what exists — is
+load-bearing for anything that reasons about "unreferenced".
 
 The manifest is the owner's signed statement of what they **claim to be keeping**. It binds every
 leaf (invariant **B1**) and carries a monotonic `seq` refused on rollback (**B3**,
@@ -82,12 +123,32 @@ it is not free, and pretending the manifest was already an index would have been
 
 Billing needs no change — byte-days already stop when a leaf leaves the manifest.
 
-### B — a retention dial on the assertion surface
+### B — a seventh `KindSpec` axis: declared expiry
 
-**The mechanism already exists.** CISS has a typed, owner-signed, `seq`-monotonic assertion surface
+> **RESHAPED 2026-08-12.** This was scoped as a bespoke `dial.retention` assertion kind. **v0.8.0
+> gave it a better home:** `KindSpec` (ADR 0005) is a typed, six-axis declaration on every kind, and
+> expiry is a seventh axis rather than a dial of its own.
+
+**Why a new axis and not a value of `Retention`.** `Retention` answers *"does history exist, and
+how?"* — `Setting | Immutable | Log | Chain`. Expiry answers *"how long does the current value
+live?"* The two are **orthogonal**: a `kv.flag` is a `Setting` that could expire; a queue entry is
+`Immutable` and should. Folding expiry into `Retention` would force a false choice between history
+shape and lifetime.
+
+**And it is the first axis whose enforcement needs a clock** — every other axis is decided from the
+record itself. That is what makes it worth an ADR amendment rather than a field: the axis has to
+carry the T7 argument below with it, or a later reader will read a clock into the substrate and
+reasonably object.
+
+**The precedent to follow, rather than invent: A4's "ack-before-shred".** Compaction is already a
+**policy-gated destructive operation** in this codebase — an owner-configured behaviour
+(`on_ack` | `deferred`), destruction requires an **acked** checkpoint, and compaction with none is
+refused `409`: *"no shredding before agreement."* Declared expiry is the same pattern with a
+different trigger (elapsed time rather than an ack), and should reuse its shape and its refusals.
+
+**The surface it rides.** CISS has a typed, owner-signed, `seq`-monotonic assertion surface
 (`PUT /{did}/assertion/{kind}[/{subkey}]`) whose `kind_fold` **refuses unknown kinds** — *"kinds are
-code, not data"* (`src/server.rs:1440`). `POLICY_KIND`, `CEILING_DIAL_KIND` and `PERIOD_DIAL_KIND`
-already ride it.
+code, not data"*. `POLICY_KIND`, the four dials, `kv.flag` and `chain.counter` already ride it.
 
 A **retention dial** is one more kind on that surface, following `CeilingDialBody` exactly:
 
@@ -327,15 +388,19 @@ assertions, commit the green state before mutating.
 
 **Done when:** the manifest/object coupling is understood well enough that A cannot delete live data.
 
-### Phase 1 — The retention dial (B, declaration half)
+### Phase 1 — The expiry axis (B, declaration half)
 
-**Goal:** an owner can declare a retention window; it round-trips and is refused when malformed.
-**Changes:** `src/dials.rs` (`RetentionDialBody` + fold), `src/server.rs` (`RETENTION_DIAL_KIND` in
-`kind_fold`), `tests/` a new assertion wiring test.
-**Wiring test:** `PUT /{did}/assertion/retention` with a valid body round-trips via `GET`; a
-malformed body is refused; a stale `seq` is refused; **an unknown kind is still refused** (the
-fail-closed property must not regress).
-**Done when:** the dial is declarable and readable end to end over HTTP. Nothing expires yet.
+**Goal:** `KindSpec` gains a seventh axis; a kind can declare a lifetime; the declaration
+round-trips and is refused when malformed. **Nothing expires yet.**
+**Changes:** `src/kind_spec.rs` (the axis + its consistency rule), the registered specs that opt in,
+**and the ADR 0005 amendment in the same commit** (per the owner's document-as-we-implement rule).
+**Consistency rule to decide here:** which retention shapes may carry an expiry. `Chain` + expiry is
+the suspicious pair — a chain whose entries vanish is not a chain — and mirrors the ADR's existing
+cross-axis invariant (`Chain` implies `Permanent` erasure).
+**Wiring test:** a kind declaring a lifetime round-trips; a malformed declaration is refused; an
+inconsistent axis pair is refused; **unknown kinds are still refused** (the fail-closed property must
+not regress).
+**Done when:** a lifetime is declarable and readable end to end, and the ADR says why the axis exists.
 
 ### Phase 2 — Enforcement (B, expiry half)
 
@@ -347,15 +412,23 @@ dial declared, nothing ever expires (the default must be inert).
 **Risk:** the default. A bug here deletes customer data on upgrade. `None` must mean indefinite, and
 the test asserting that is the most important one in this plan.
 
-### Phase 3 — Manifest-driven reclamation (A)
+### Phase 3 — Objects become a registered kind, with DELETE (A)
 
-**Goal:** an object no manifest references becomes reclaimable.
-**Changes:** reclamation pass keyed on the current manifest per namespace, honouring whatever grace
-rule D1 forces.
-**Wiring test:** manifest `N` lists an object; manifest `N+1` omits it; after reclamation the object
-is gone and `du` reflects it. **And the negative:** an object still listed is never touched, and an
-object never manifested is not destroyed inside the put-then-manifest window.
-**Done when:** signing a manifest without a leaf actually reclaims the bytes.
+**Goal:** close the gap between ADR 0005's classification of blobs (`immutable`, **deletable**) and
+the registry, which has no object kind — so the DELETE that already exists can serve them.
+**Changes:** a `KindSpec` for objects; `DELETE /{did}/objects/{cid}` routed through the existing
+declaration-gated delete path; the ADR note recording the registration.
+**The two things blobs do not share with assertions, to be decided here:**
+- **fan-in** — one object may back several queue entries or manifests, where an assertion subkey has
+  exactly one writer. Decide whether a delete is refused while references exist, or is an
+  owner override that orphans them loudly.
+- **namespace scope** — objects live at `blocks/{did}/{cid}` and dedup does **not** cross a namespace
+  (meer spike S2), so deleting one DID's copy cannot affect another's. State it; do not re-derive it.
+**Wiring test:** an owner deletes their object and a subsequent `GET` 404s; `du` reflects it; **and
+the negatives** — another DID's identical bytes are untouched, and a non-owner cannot delete.
+**Fallback:** if an explicit object DELETE is rejected, fall back to the manifest-transition design
+(retained above), and re-read "the manifest is not an index" first.
+**Done when:** an owner can remove their own object, and the registry and the ADR agree.
 
 ### Phase 4 — Close the atproto half and document
 
@@ -366,6 +439,15 @@ the new reclamation path and its authority argument; note the retention dial in 
 
 ## Documentation impact
 
+- **`docs/adr/0005-kind-semantics-and-accounting-chain.md` — amend it.** The expiry axis is a
+  **seventh axis on an accepted ADR**, and the ADR is where the six-axis reasoning lives. Amending it
+  is not paperwork: it is where the T7 argument (signed policy bears authority; the elapsed count is
+  local, mechanical, and never a fact) has to be written down, or a later reader sees a clock in the
+  substrate and reasonably objects. **Owner's instruction (2026-08-12): document as we implement,
+  not after.** Each phase below carries its own ADR/doc edit rather than deferring to a docs phase.
+- **`docs/adr/0005-…` — record that objects become a registered kind.** The ADR already classifies
+  blobs as `immutable` and deletable; registering them closes the gap between that reasoning and the
+  registry, and should say so explicitly rather than appearing as a silent addition.
 - **`README.md` — the architecture diagram overstates what the service does.** It lists
   *"statements · audit · seal · grace"* as part of the running system and calls the E0–E9 core
   *"proven"*. All four are **library-only with zero callers**
