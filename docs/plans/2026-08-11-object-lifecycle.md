@@ -127,6 +127,54 @@ is deletion, failing safe means **retain indefinitely**:
 set-time validation (`src/server.rs:1584`) checks the ceiling against a provider bound; a retention
 dial's set-time check should reject an implausibly short window rather than accept it.
 
+### Time: one stamping authority, and a counter rather than a clock
+
+**Owner's posture (2026-08-11), and it decides this design:** we do not rely on wall clocks. A clock
+assertion is trustworthy locally and never *between* nodes. The usable version is **seconds since
+epoch stamped by a single authority** — then time is monotonic *within the system*, and what remains
+is **drift over an interval**, not clock synchronisation between machines.
+
+For retention that collapses the problem, because **the storer and the deleter are the same party.**
+CISS stamps an object on arrival and CISS decides it has expired. Both readings come from one clock,
+so nothing is ever compared across a trust boundary and no stamp has to be believed from elsewhere.
+Drift against real-world time only decides whether "14 days" is 13.9 or 14.1 — it cannot make the
+decision *wrong*.
+
+**Starting position is good:** the server's only wall-clock read today is `now_unix_s()` for JWT
+`exp` (`src/server.rs:828`), which atproto imposes because JWTs carry absolute expiry. Nothing else
+in the server's correctness path reads a clock.
+
+#### Prefer a monotonic day counter over a wall-clock comparison
+
+Two formulations, and the second is safer:
+
+1. **Store absolute seconds, compare to `SystemTime::now()`.** Simple, but `SystemTime` can jump. A
+   *backward* jump is harmless here (age computes negative, clamp to zero, retain). A **forward jump
+   deletes early** — the dangerous direction, and the one no clamp catches.
+2. **Store a day index; advance it deliberately.** Correctness depends only on the counter being
+   monotonic. Wall clock decides *when* to advance it, which sets granularity, not correctness.
+
+**Take (2), because its failure mode is the safe one.** If the advancer stalls, the counter stops,
+ages stop growing, and **nothing is deleted**. A stalled component causes retention, not data loss —
+which is the same direction the unparseable-dial rule takes, and for the same reason.
+
+**`SimClock` is already this shape.** `src/clock.rs` is a day counter that only moves when told
+(`advance_days`), written for reproducible byte-day rent — *"no wall-clock reads"*. It has **zero
+callers**. It was built as a test type and it is the right production shape; retention would be its
+first consumer.
+
+#### Two clocks, one authority per question
+
+The meer already stamps queue entries with its own `deposited_day`. That does **not** need to agree
+with CISS's counter, because they answer different questions: the meer's clock drives the
+**watermark** ("you missed 3 things between day 0 and day 2"), CISS's drives **deletion**. Neither
+stamp is ever read by the other party, so there is no cross-node time trust — which is the whole
+point. Worth stating explicitly so a later reader does not try to reconcile them.
+
+**Open, and it is a coupling not a contradiction:** if CISS deletes on its own counter, the meer
+learns what was swept only by asking. Whether the watermark is derived from CISS's sweep or kept
+independently by the meer is a Phase-3 question.
+
 ### Why B is not blocked on the meer lane
 
 The original E95 sketch assumed retention would live in the typed-chain substrate's *slot
@@ -207,11 +255,27 @@ assertions, commit the green state before mutating.
       consult the manifest at all, or only the blobstore? Determines where a reclamation check lives.
 - [ ] **D3: Confirm the assertion surface accepts a new kind cleanly.** Add a throwaway kind, PUT and
       GET it, confirm `kind_fold` refuses a malformed body and an unknown kind.
-- [ ] **D4: Where does per-object age come from?** **Partly answered: not from the blobstore.** The
-      `BlobStore` trait is `put`/`get`/`has` (`src/blobstore.rs:80–92`) with no metadata, and the
-      `receipt` table is `(id, did, json)` with no age column. Byte-day accounting must derive age
-      from somewhere — find it, and decide whether B reads it or needs its own column. **B's
-      enforcement cannot be built until this is settled.**
+- [x] **D4: Where does per-object age come from?** **ANSWERED 2026-08-11: nowhere. It does not
+      exist, and neither does the machinery I assumed would supply it.**
+      - `BlobStore` is `put`/`get`/`has` with no metadata (`src/blobstore.rs:80–92`); the `receipt`
+        table is `(id, did, json)` with no age column.
+      - **Byte-day accounting is not running.** `Timeline` / `set_bytes_at_rest` / `byte_days` have
+        **no callers outside `src/statements.rs`**. `persist.rs` can `append_statement` and
+        `load_statements`, but **nothing in the server ever constructs a `Statement`** — no period
+        ever closes.
+      - Even fully wired it would not help: the `Timeline` is a **namespace-level** step function of
+        total bytes at rest per day. It never knew when an individual object arrived.
+      - **There is no day clock running.** `src/clock.rs` has zero callers.
+      - Same state for the lifecycle machinery generally: **`seal.rs` and `grace.rs` have zero
+        callers** and are unreachable from the HTTP boundary and the CLI.
+
+      **Consequence:** B must introduce its own arrival stamp and its own counter. The dial half
+      stays cheap; the enforcement half is new construction, not a read. See "Time" above.
+
+      *Recorded plainly because the corpus reads otherwise:* "the E0–E9 ledger core is complete" is
+      true **of the library**, and its tests are real. What is not true is the implicit next step —
+      that the boundary exposes it. Phase 7 wired the metered byte-path; the periodic and lifecycle
+      halves stayed behind the library wall.
 
 **Done when:** the manifest/object coupling is understood well enough that A cannot delete live data.
 
