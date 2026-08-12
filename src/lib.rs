@@ -27,6 +27,7 @@ pub mod assertion;
 pub mod audit;
 pub mod blobstore;
 pub mod canonical;
+pub mod chain_kind;
 pub mod cidv1;
 pub mod clock;
 pub mod crypto;

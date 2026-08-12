@@ -205,6 +205,19 @@ impl Store {
                  ack    TEXT NOT NULL,
                  PRIMARY KEY (did, kind, subkey)
              );
+             CREATE TABLE IF NOT EXISTS chain_entry (
+                 did             TEXT NOT NULL,
+                 kind            TEXT NOT NULL,
+                 subkey          TEXT NOT NULL DEFAULT '',
+                 seq             INTEGER NOT NULL,
+                 delta           INTEGER NOT NULL,
+                 total           INTEGER NOT NULL,
+                 prev_entry_hash TEXT NOT NULL,
+                 entry_hash      TEXT NOT NULL,
+                 json            TEXT NOT NULL,
+                 ack             TEXT NOT NULL,
+                 PRIMARY KEY (did, kind, subkey, seq)
+             );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);
              CREATE VIEW IF NOT EXISTS did_usage AS
@@ -394,6 +407,126 @@ impl Store {
             subkeys.push(row?);
         }
         Ok(subkeys)
+    }
+
+    /// The head of a chain (ADR 0005 / A3) — the highest-seq entry's seq, total,
+    /// and hash, which a proposed successor must follow and link to. `None` for an
+    /// empty chain (the next entry is genesis).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn latest_chain_entry(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<crate::chain_kind::PrevEntry>, PersistError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT seq, total, entry_hash FROM chain_entry
+                 WHERE did = ?1 AND kind = ?2 AND subkey = ?3
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![did, kind, subkey.unwrap_or("")],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(seq, total, entry_hash)| crate::chain_kind::PrevEntry {
+            seq: u64::try_from(seq).unwrap_or(0),
+            total: u64::try_from(total).unwrap_or(0),
+            entry_hash,
+        }))
+    }
+
+    /// Append a verified chain entry (ADR 0005 / A3) in one transaction: the entry
+    /// is inserted into the append-only `chain_entry` history, and the `assertion`
+    /// row is upserted to the same signed record so a point read returns the latest
+    /// total. The seq's uniqueness in the chain PRIMARY KEY is the last-line fork
+    /// guard. Verification (`verify_step`) is the caller's; this is the durable
+    /// write.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite/serialization failure (including a
+    /// duplicate seq — a fork — surfaced as a constraint violation).
+    pub fn append_chain_entry(
+        &self,
+        record: &SignedAssertion,
+        ack: &Ack,
+        body: &crate::chain_kind::ChainCounterBody,
+        entry_hash: &str,
+    ) -> Result<(), PersistError> {
+        let json = serde_json::to_string(record)?;
+        let ack_json = serde_json::to_string(ack)?;
+        let seq = i64::try_from(record.seq).unwrap_or(i64::MAX);
+        let total = i64::try_from(body.total).unwrap_or(i64::MAX);
+        let subkey = record.subkey.as_deref().unwrap_or("");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO chain_entry
+                 (did, kind, subkey, seq, delta, total, prev_entry_hash, entry_hash, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                record.did, record.kind, subkey, seq, body.delta, total,
+                body.prev_entry_hash, entry_hash, json, ack_json
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO assertion (did, kind, subkey, seq, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(did, kind, subkey) DO UPDATE
+                 SET seq = excluded.seq, json = excluded.json, ack = excluded.ack
+             WHERE excluded.seq > assertion.seq",
+            rusqlite::params![record.did, record.kind, subkey, seq, json, ack_json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every entry of a chain, seq-ordered, each with its signed JSON (ADR 0005 /
+    /// A3) — the input to recomputation and the `?chain=1` read. (Checkpoint-bounded
+    /// windows arrive with A4; A3 returns the whole chain.)
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn chain_entries(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Vec<(crate::chain_kind::ChainEntry, String)>, PersistError> {
+        let sk = subkey.unwrap_or("");
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, delta, total, prev_entry_hash, json FROM chain_entry
+             WHERE did = ?1 AND kind = ?2 AND subkey = ?3 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![did, kind, sk], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, delta, total, prev_entry_hash, json) = row?;
+            out.push((
+                crate::chain_kind::ChainEntry {
+                    did: did.to_owned(),
+                    kind: kind.to_owned(),
+                    subkey: subkey.map(str::to_owned),
+                    seq: u64::try_from(seq).unwrap_or(0),
+                    body: crate::chain_kind::ChainCounterBody {
+                        delta,
+                        total: u64::try_from(total).unwrap_or(0),
+                        prev_entry_hash,
+                    },
+                },
+                json,
+            ));
+        }
+        Ok(out)
     }
 
     /// Load a stored assertion + its ack, if present — the durable signed

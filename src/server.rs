@@ -28,7 +28,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -632,6 +632,13 @@ pub(crate) enum Op {
         did: String,
         kind: String,
     },
+    /// Read a chain's full entry history plus its recomputed, verified total
+    /// (ADR 0005 / A3 — the `?chain=1` read). Owner-only.
+    GetChain {
+        did: String,
+        kind: String,
+        subkey: Option<String>,
+    },
     /// The customer countersigns a bilateral receipt (self-authorizing: the
     /// signature must verify under the key deriving the DID).
     CountersignReceipt {
@@ -667,6 +674,7 @@ impl Op {
             | Op::GetAssertion { .. }
             | Op::DeleteAssertion { .. }
             | Op::ListAssertions { .. }
+            | Op::GetChain { .. }
             | Op::CountersignReceipt { .. }
             | Op::Du { .. } => false,
         }
@@ -719,6 +727,11 @@ pub(crate) enum OpOutcome {
     /// A usage report body: `{objects:[{cid,bytes},…], total_bytes}` (ADR 0003).
     /// Pre-serialized JSON.
     UsageBody {
+        json: String,
+    },
+    /// A chain read (ADR 0005 / A3): `{entries: [...], total}` — the full signed
+    /// history and the recomputed, verified total. Pre-serialized JSON.
+    ChainBody {
         json: String,
     },
     /// An assertion was erased (ADR 0005 / A2). Renders `{erased: true}` at 200.
@@ -952,7 +965,8 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         Op::PutObject { did, .. }
         | Op::GetMeter { did }
         | Op::DeleteAssertion { did, .. }
-        | Op::ListAssertions { did, .. } => require_owner(principal, did),
+        | Op::ListAssertions { did, .. }
+        | Op::GetChain { did, .. } => require_owner(principal, did),
         Op::GetObject { .. }
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
@@ -1050,6 +1064,7 @@ pub(crate) fn dispatch(
             op_delete_assertion(state, &did, &kind, subkey.as_deref())
         }
         Op::ListAssertions { did, kind } => op_list_assertions(state, &did, &kind),
+        Op::GetChain { did, kind, subkey } => op_get_chain(state, &did, &kind, subkey.as_deref()),
         Op::CountersignReceipt { did, content_hash, sig } => {
             op_countersign_receipt(state, &did, &content_hash, &sig)
         }
@@ -1555,6 +1570,16 @@ fn kind_fold(
                 .map_err(|_| ServerError::BadAssertion("body is not a valid kv counter"))?;
             Ok(crate::kv::counter_body_fold(&body))
         }
+        crate::chain_kind::CHAIN_COUNTER_KIND => {
+            // A chain totals a per-subkey account, so a subkey is required (the
+            // same discipline as the kv kinds).
+            if !crate::kv::subkey_valid(subkey) {
+                return Err(ServerError::BadAssertion("chain.counter requires a valid subkey"));
+            }
+            let body: crate::chain_kind::ChainCounterBody = serde_json::from_value(body.clone())
+                .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
+            Ok(crate::chain_kind::chain_counter_body_fold(&body))
+        }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
 }
@@ -1680,6 +1705,16 @@ fn op_put_assertion(
     // The provider acknowledgment: the countersignature that lets the
     // customer prove — not merely hope — that the assertion took effect.
     let ack = make_ack(&record, &state.provider.attest_keypair)?;
+
+    // Chain kinds (ADR 0005 / A3) append verified history rather than upsert a
+    // latest value. The signature and seq anti-rollback above already hold; the
+    // entry must also *follow* the chain, checked in the helper.
+    if crate::kind_spec::kind_spec(kind)
+        .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
+    {
+        return append_verified_chain_entry(&store, did, kind, subkey, &record, &ack);
+    }
+
     store.save_assertion(&record, &ack)?;
 
     // Accepting a period dial snapshots the meter's cumulative total as the
@@ -1697,6 +1732,34 @@ fn op_put_assertion(
         seq: record.seq,
         ack_json: serde_json::to_string(&ack)?,
     })
+}
+
+/// Append a verified `chain.counter` entry (ADR 0005 / A3). The entry must
+/// continue the stored chain — its total follows `prev.total + delta`, its seq is
+/// contiguous, and it links the current head's hash — or it is refused with the
+/// real values quoted. Extracted from [`op_put_assertion`], which has already
+/// verified the signature and the seq anti-rollback before calling here.
+fn append_verified_chain_entry(
+    store: &Store,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+    record: &SignedAssertion,
+    ack: &crate::assertion::Ack,
+) -> Result<OpOutcome, ServerError> {
+    let chain_body: crate::chain_kind::ChainCounterBody =
+        serde_json::from_value(record.body.clone())
+            .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
+    let prev = store.latest_chain_entry(did, kind, subkey)?;
+    crate::chain_kind::verify_step(prev.as_ref(), &chain_body, record.seq)
+        .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+    let this_hash = crate::chain_kind::entry_hash(did, kind, subkey, record.seq, &chain_body);
+    store.append_chain_entry(record, ack, &chain_body, &this_hash)?;
+    tracing::debug!(
+        resource = %did, kind, subkey = ?subkey, seq = record.seq, total = chain_body.total,
+        "chain entry appended"
+    );
+    Ok(OpOutcome::AssertionSaved { seq: record.seq, ack_json: serde_json::to_string(ack)? })
 }
 
 /// Read back a stored assertion + ack, with kind-specific visibility. The
@@ -1779,6 +1842,34 @@ fn op_list_assertions(state: &AppState, did: &str, kind: &str) -> Result<OpOutco
     }
     let subkeys = lock_store(&state.store).list_assertion_subkeys(did, kind)?;
     Ok(OpOutcome::AssertionSubkeys { subkeys })
+}
+
+/// Read a chain's entries and its recomputed, verified total (ADR 0005 / A3 —
+/// the `?chain=1` read). Owner-only (checked upstream). Recomputation walks the
+/// stored history and re-derives every hash link, so a chain tampered with in the
+/// store — not just at write time — is caught here and surfaced, not served as if
+/// sound. (A4 will bound the walk to the nearest checkpoint; A3 returns all.)
+fn op_get_chain(
+    state: &AppState,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    if !crate::kind_spec::kind_spec(kind)
+        .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
+    {
+        return Err(ServerError::BadAssertion("kind does not support a chain read"));
+    }
+    let entries = lock_store(&state.store).chain_entries(did, kind, subkey)?;
+    let chain: Vec<crate::chain_kind::ChainEntry> = entries.iter().map(|(e, _)| e.clone()).collect();
+    let total = crate::chain_kind::recompute_total(&chain)
+        .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+    let records: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(_, json)| serde_json::from_str(json).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let json = serde_json::json!({ "entries": records, "total": total }).to_string();
+    Ok(OpOutcome::ChainBody { json })
 }
 
 /// The customer's countersignature on a bilateral receipt: verify the sig
@@ -2015,24 +2106,30 @@ async fn get_assertion_handler(
     .await
 }
 
-/// `GET /{did}/assertion/{kind}/{subkey}` — the subkeyed read-back.
+/// The `?chain=1` switch on the subkeyed read: present → the full chain read
+/// (entries + recomputed total), absent → the ordinary latest-record read-back.
+#[derive(serde::Deserialize)]
+struct AssertionReadQuery {
+    chain: Option<String>,
+}
+
+/// `GET /{did}/assertion/{kind}/{subkey}` — the subkeyed read-back. With
+/// `?chain=1` on a chain kind it returns the entry history and the recomputed,
+/// verified total (A3) instead of just the latest record.
 async fn get_assertion_subkey_handler(
     State(state): State<AppState>,
     Path((did, kind, subkey)): Path<(String, String, String)>,
+    Query(query): Query<AssertionReadQuery>,
     headers: HeaderMap,
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     let principal = authenticate_atproto(&state, &headers, GET_POLICY_LXM).await;
-    dispatch_blocking(
-        &state,
-        principal,
-        Op::GetAssertion {
-            did: did.into_string(),
-            kind,
-            subkey: Some(subkey),
-        },
-    )
-    .await
+    let op = if query.chain.is_some() {
+        Op::GetChain { did: did.into_string(), kind, subkey: Some(subkey) }
+    } else {
+        Op::GetAssertion { did: did.into_string(), kind, subkey: Some(subkey) }
+    };
+    dispatch_blocking(&state, principal, op).await
 }
 
 /// `DELETE /{did}/assertion/{kind}` — erase a namespace-scoped assertion (no
@@ -2180,7 +2277,8 @@ impl IntoResponse for OpOutcome {
             .into_response(),
             OpOutcome::ManifestBody { json }
             | OpOutcome::PolicyBody { json }
-            | OpOutcome::UsageBody { json } => {
+            | OpOutcome::UsageBody { json }
+            | OpOutcome::ChainBody { json } => {
                 ([("content-type", "application/json")], json).into_response()
             }
             OpOutcome::Meter {
@@ -2334,6 +2432,11 @@ pub enum ServerError {
         /// The point-only kind whose listing was refused.
         kind: String,
     },
+    /// A `chain.counter` entry does not continue the stored chain (ADR 0005 / A3):
+    /// its total does not follow, its seq is not the successor's, or it links to
+    /// the wrong head. The reason quotes the real values.
+    #[error("chain.counter refused: {0}")]
+    ChainBroken(String),
     /// A billable write would take the period's postage past the customer's
     /// asserted spend ceiling — refused BEFORE serving, with the quote
     /// (E89: throttle/defer, never mint debt). Owner egress is exempt
@@ -2382,9 +2485,9 @@ impl IntoResponse for ServerError {
             ServerError::DidKeyMismatch
             | ServerError::Forbidden
             | ServerError::AssertionUnauthorized => StatusCode::FORBIDDEN,
-            ServerError::AssertionStale { .. } | ServerError::DrawdownActive => {
-                StatusCode::CONFLICT
-            }
+            ServerError::AssertionStale { .. }
+            | ServerError::DrawdownActive
+            | ServerError::ChainBroken(_) => StatusCode::CONFLICT,
             ServerError::ErasureNotAllowed { .. } | ServerError::EnumerationNotAllowed { .. } => {
                 StatusCode::METHOD_NOT_ALLOWED
             }

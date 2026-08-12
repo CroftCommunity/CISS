@@ -172,6 +172,7 @@ pub const REGISTRY: &[&KindSpec] = &[
     &crate::dials::RECEIPT_MODE_DIAL_SPEC,
     &crate::kv::FLAG_SPEC,
     &crate::kv::COUNTER_SPEC,
+    &crate::chain_kind::CHAIN_COUNTER_SPEC,
 ];
 
 /// The spec for a kind tag, or `None` for an unregistered kind (kinds are code,
@@ -263,6 +264,7 @@ mod tests {
             crate::dials::RECEIPT_MODE_DIAL_KIND,
             crate::kv::FLAG_KIND,
             crate::kv::COUNTER_KIND,
+            crate::chain_kind::CHAIN_COUNTER_KIND,
         ];
         for kind in foldable {
             assert!(kind_spec(kind).is_some(), "foldable kind {kind} has no spec");

@@ -513,6 +513,27 @@ impl Client {
         Ok((status, subkeys))
     }
 
+    /// `GET /{did}/assertion/{kind}/{subkey}?chain=1` — the chain read (ADR 0005 /
+    /// A3): the full entry history plus the server-recomputed, verified `total`.
+    /// Owner-only. Returns the parsed `{entries, total}` body.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures, a non-2xx status, or an unparseable body.
+    pub async fn get_chain(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+        subkey: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/assertion/{}/{}?chain=1", self.base, did, kind, subkey);
+        let req = with_session(self.http.get(&url), session);
+        let resp = self.send(req, "get chain").await?;
+        let resp = self.ensure_success(resp, "get chain").await?;
+        resp.json().await.context("parse chain")
+    }
+
     /// `PUT /{did}/assertion/policy/{cid}` with a self-signed `SignedAssertion` body
     /// (Model A — the record self-authorizes, so no session header is needed).
     /// Returns the stored `seq`.
