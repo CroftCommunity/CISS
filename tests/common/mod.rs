@@ -144,6 +144,16 @@ impl World {
         Self::from_app(app, None).await
     }
 
+    /// A world with a specific chain compaction policy (ADR 0005 / A4) — e.g.
+    /// `Deferred` to prove a checkpoint write leaves history until an explicit
+    /// compaction call.
+    pub async fn spawn_with_compaction(policy: ciss::server::CompactionPolicy) -> Self {
+        let app = App::new("test-provider", Blobs::Memory, Db::Memory)
+            .expect("build app")
+            .with_compaction_policy(policy);
+        Self::from_app(app, None).await
+    }
+
     /// A world on the filesystem blob backend (in-memory ledger), rooted at a
     /// fresh temp dir exposed via [`World::data_dir`].
     pub async fn spawn_fs() -> Self {

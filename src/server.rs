@@ -95,6 +95,10 @@ pub(crate) const DELETE_ASSERTION_LXM: &str = "ing.croft.ciss.deleteAssertion";
 /// (ADR 0005 / A2). Owner-only and self-only (the `du` discipline).
 pub(crate) const LIST_ASSERTIONS_LXM: &str = "ing.croft.ciss.listAssertions";
 
+/// The lexicon method a `did:` caller's **chain compaction** JWT binds to
+/// (ADR 0005 / A4 — the billing-marker shred). Owner-only.
+pub(crate) const COMPACT_CHAIN_LXM: &str = "ing.croft.ciss.compactChain";
+
 /// How long a single data-plane request may run before it is dropped (V4).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -217,6 +221,19 @@ impl Limits {
 /// guard. `SEAM:` a real deployment shards a `Store` per DID (one SQLite file
 /// each) behind a small pool; here every DID co-locates in one connection,
 /// keyed by the `did` column.
+/// When chain compaction fires (ADR 0005 / A4) — a configured policy, because
+/// compaction is the one irreversible, history-destroying act. Automatic on
+/// checkpoint ack for dev/tests and the starting case; deferred to a deliberate
+/// compaction call (a billing marker) in production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionPolicy {
+    /// Compact behind a checkpoint the moment it is written and acked (default).
+    #[default]
+    OnAck,
+    /// Never compact on write; only an explicit compaction call shreds history.
+    Deferred,
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     provider: Arc<Provider>,
@@ -245,6 +262,8 @@ pub(crate) struct AppState {
     /// `admin_dids` may run `du` — still only for its own namespace. Off by
     /// default: any authenticated caller may `du` its own namespace.
     admin_only_du: bool,
+    /// When chain compaction fires (ADR 0005 / A4). `OnAck` by default.
+    compaction: CompactionPolicy,
 }
 
 /// The cooperative metered-storage server.
@@ -330,8 +349,21 @@ impl App {
                 // default; an operator locks `du` to admins via `with_admin_only_du`.
                 admin_dids: Arc::new(std::collections::HashSet::new()),
                 admin_only_du: false,
+                // Compaction defaults to on-ack (the starting case / tests);
+                // production sets Deferred to shred only at a billing marker.
+                compaction: CompactionPolicy::default(),
             },
         }
+    }
+
+    /// Set the chain compaction policy (ADR 0005 / A4). Default [`CompactionPolicy::OnAck`]
+    /// compacts a chain the moment a checkpoint is acked; [`CompactionPolicy::Deferred`]
+    /// leaves compaction to an explicit call (a billing marker) so a checkpoint
+    /// write never destroys history on its own.
+    #[must_use]
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.state.compaction = policy;
+        self
     }
 
     /// Lock `du` to admins (`CISS_ADMIN_ONLY_DU`, ADR 0003 / invariant Z9). `du` is
@@ -403,6 +435,11 @@ impl App {
             // The owner-only subkey listing (A2) — plural `assertions`, distinct
             // from the singular read-back route above.
             .route("/{did}/assertions/{kind}", get(list_assertions_handler))
+            // Explicit chain compaction (A4, the billing-marker path).
+            .route(
+                "/{did}/assertion/{kind}/{subkey}/compact",
+                axum::routing::post(compact_chain_handler),
+            )
             .route(
                 "/{did}/receipt/{hash}/countersign",
                 axum::routing::post(countersign_receipt_handler),
@@ -639,6 +676,14 @@ pub(crate) enum Op {
         kind: String,
         subkey: Option<String>,
     },
+    /// Compact a chain behind its latest acknowledged checkpoint (ADR 0005 / A4 —
+    /// the explicit billing-marker path). Owner-only; refused if no checkpoint
+    /// exists to compact behind (no shredding before agreement).
+    CompactChain {
+        did: String,
+        kind: String,
+        subkey: Option<String>,
+    },
     /// The customer countersigns a bilateral receipt (self-authorizing: the
     /// signature must verify under the key deriving the DID).
     CountersignReceipt {
@@ -675,6 +720,7 @@ impl Op {
             | Op::DeleteAssertion { .. }
             | Op::ListAssertions { .. }
             | Op::GetChain { .. }
+            | Op::CompactChain { .. }
             | Op::CountersignReceipt { .. }
             | Op::Du { .. } => false,
         }
@@ -733,6 +779,11 @@ pub(crate) enum OpOutcome {
     /// history and the recomputed, verified total. Pre-serialized JSON.
     ChainBody {
         json: String,
+    },
+    /// A chain was compacted behind its checkpoint at `behind` (ADR 0005 / A4).
+    /// Renders `{compacted_behind: seq}` at 200.
+    ChainCompacted {
+        behind: u64,
     },
     /// An assertion was erased (ADR 0005 / A2). Renders `{erased: true}` at 200.
     AssertionErased,
@@ -966,7 +1017,8 @@ fn authorize(principal: &Principal, op: &Op) -> Result<(), ServerError> {
         | Op::GetMeter { did }
         | Op::DeleteAssertion { did, .. }
         | Op::ListAssertions { did, .. }
-        | Op::GetChain { did, .. } => require_owner(principal, did),
+        | Op::GetChain { did, .. }
+        | Op::CompactChain { did, .. } => require_owner(principal, did),
         Op::GetObject { .. }
         | Op::PutManifest { .. }
         | Op::GetManifest { .. }
@@ -1065,6 +1117,7 @@ pub(crate) fn dispatch(
         }
         Op::ListAssertions { did, kind } => op_list_assertions(state, &did, &kind),
         Op::GetChain { did, kind, subkey } => op_get_chain(state, &did, &kind, subkey.as_deref()),
+        Op::CompactChain { did, kind, subkey } => op_compact_chain(state, &did, &kind, subkey.as_deref()),
         Op::CountersignReceipt { did, content_hash, sig } => {
             op_countersign_receipt(state, &did, &content_hash, &sig)
         }
@@ -1572,13 +1625,15 @@ fn kind_fold(
         }
         crate::chain_kind::CHAIN_COUNTER_KIND => {
             // A chain totals a per-subkey account, so a subkey is required (the
-            // same discipline as the kv kinds).
+            // same discipline as the kv kinds). The body is either a step or a
+            // checkpoint (ADR 0005 / A4); the fold differs so the two can never be
+            // confused.
             if !crate::kv::subkey_valid(subkey) {
                 return Err(ServerError::BadAssertion("chain.counter requires a valid subkey"));
             }
-            let body: crate::chain_kind::ChainCounterBody = serde_json::from_value(body.clone())
+            let step: crate::chain_kind::ChainStep = serde_json::from_value(body.clone())
                 .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
-            Ok(crate::chain_kind::chain_counter_body_fold(&body))
+            Ok(step.fold())
         }
         _ => Err(ServerError::BadAssertion("unknown assertion kind")),
     }
@@ -1712,7 +1767,7 @@ fn op_put_assertion(
     if crate::kind_spec::kind_spec(kind)
         .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
     {
-        return append_verified_chain_entry(&store, did, kind, subkey, &record, &ack);
+        return append_verified_chain_entry(&store, state.compaction, did, kind, subkey, &record, &ack);
     }
 
     store.save_assertion(&record, &ack)?;
@@ -1741,24 +1796,52 @@ fn op_put_assertion(
 /// verified the signature and the seq anti-rollback before calling here.
 fn append_verified_chain_entry(
     store: &Store,
+    compaction: CompactionPolicy,
     did: &str,
     kind: &str,
     subkey: Option<&str>,
     record: &SignedAssertion,
     ack: &crate::assertion::Ack,
 ) -> Result<OpOutcome, ServerError> {
-    let chain_body: crate::chain_kind::ChainCounterBody =
-        serde_json::from_value(record.body.clone())
-            .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
-    let prev = store.latest_chain_entry(did, kind, subkey)?;
-    crate::chain_kind::verify_step(prev.as_ref(), &chain_body, record.seq)
-        .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
-    let this_hash = crate::chain_kind::entry_hash(did, kind, subkey, record.seq, &chain_body);
-    store.append_chain_entry(record, ack, &chain_body, &this_hash)?;
-    tracing::debug!(
-        resource = %did, kind, subkey = ?subkey, seq = record.seq, total = chain_body.total,
-        "chain entry appended"
-    );
+    use crate::chain_kind::{
+        checkpoint_hash, entry_hash, verify_checkpoint, verify_step, ChainStep, GENESIS_PREV_HASH,
+    };
+    let step: ChainStep = serde_json::from_value(record.body.clone())
+        .map_err(|_| ServerError::BadAssertion("body is not a valid chain.counter entry"))?;
+    match step {
+        ChainStep::Step(body) => {
+            let prev = store.latest_chain_entry(did, kind, subkey)?;
+            verify_step(prev.as_ref(), &body, record.seq)
+                .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+            let hash = entry_hash(did, kind, subkey, record.seq, &body);
+            store.append_chain_entry(record, ack, &body, &hash)?;
+        }
+        ChainStep::Checkpoint(body) => {
+            // A checkpoint closes over a real predecessor; an empty chain has
+            // nothing to close.
+            let prev = store.latest_chain_entry(did, kind, subkey)?.ok_or_else(|| {
+                ServerError::ChainBroken("a checkpoint needs a chain to close (none exists)".to_owned())
+            })?;
+            let expected_prev = store
+                .latest_checkpoint_hash(did, kind, subkey)?
+                .unwrap_or_else(|| GENESIS_PREV_HASH.to_owned());
+            verify_checkpoint(&prev, &expected_prev, &body, record.seq)
+                .map_err(|brk| ServerError::ChainBroken(brk.reason()))?;
+            let hash = checkpoint_hash(did, kind, subkey, record.seq, &body);
+            store.append_checkpoint_entry(record, ack, &body, &hash)?;
+            // On-ack compaction (the default / starting case): the checkpoint's
+            // provider ack is the agreement, so entries behind it may be shredded
+            // now. Deferred policy leaves this to an explicit billing-marker call.
+            if compaction == CompactionPolicy::OnAck {
+                let compacted = store.compact_behind_latest_checkpoint(did, kind, subkey)?;
+                tracing::debug!(
+                    resource = %did, kind, subkey = ?subkey, behind = ?compacted,
+                    "chain compacted on checkpoint ack"
+                );
+            }
+        }
+    }
+    tracing::debug!(resource = %did, kind, subkey = ?subkey, seq = record.seq, "chain entry appended");
     Ok(OpOutcome::AssertionSaved { seq: record.seq, ack_json: serde_json::to_string(ack)? })
 }
 
@@ -1870,6 +1953,30 @@ fn op_get_chain(
         .collect();
     let json = serde_json::json!({ "entries": records, "total": total }).to_string();
     Ok(OpOutcome::ChainBody { json })
+}
+
+/// Compact a chain behind its latest acknowledged checkpoint (ADR 0005 / A4 — the
+/// explicit billing-marker path). Owner-only (checked upstream). Refused if the
+/// chain has no checkpoint to compact behind — the no-shredding-before-agreement
+/// rule, surfaced as a 409. Used directly under the `Deferred` policy, and always
+/// available to trigger a compaction at a business boundary.
+fn op_compact_chain(
+    state: &AppState,
+    did: &str,
+    kind: &str,
+    subkey: Option<&str>,
+) -> Result<OpOutcome, ServerError> {
+    if !crate::kind_spec::kind_spec(kind)
+        .is_some_and(|s| s.retention == crate::kind_spec::Retention::Chain)
+    {
+        return Err(ServerError::BadAssertion("kind does not support compaction"));
+    }
+    match lock_store(&state.store).compact_behind_latest_checkpoint(did, kind, subkey)? {
+        Some(behind) => Ok(OpOutcome::ChainCompacted { behind }),
+        None => Err(ServerError::ChainBroken(
+            "no acknowledged checkpoint to compact behind".to_owned(),
+        )),
+    }
 }
 
 /// The customer's countersignature on a bilateral receipt: verify the sig
@@ -2184,6 +2291,24 @@ async fn list_assertions_handler(
     .await
 }
 
+/// `POST /{did}/assertion/{kind}/{subkey}/compact` — compact the chain behind its
+/// latest acknowledged checkpoint (A4, the explicit billing-marker path).
+/// Owner-only; refused if there is no checkpoint to compact behind.
+async fn compact_chain_handler(
+    State(state): State<AppState>,
+    Path((did, kind, subkey)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<OpOutcome, ServerError> {
+    let did = Did::parse(&did)?;
+    let principal = authenticate_atproto(&state, &headers, COMPACT_CHAIN_LXM).await;
+    dispatch_blocking(
+        &state,
+        principal,
+        Op::CompactChain { did: did.into_string(), kind, subkey: Some(subkey) },
+    )
+    .await
+}
+
 async fn get_meter_handler(
     State(state): State<AppState>,
     Path(did): Path<String>,
@@ -2304,6 +2429,9 @@ impl IntoResponse for OpOutcome {
                     .unwrap_or(serde_json::Value::Null),
             }))
             .into_response(),
+            OpOutcome::ChainCompacted { behind } => {
+                Json(serde_json::json!({ "compacted_behind": behind })).into_response()
+            }
             OpOutcome::AssertionErased => Json(serde_json::json!({ "erased": true })).into_response(),
             OpOutcome::AssertionSubkeys { subkeys } => {
                 Json(serde_json::json!({ "subkeys": subkeys })).into_response()

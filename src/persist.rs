@@ -214,6 +214,8 @@ impl Store {
                  total           INTEGER NOT NULL,
                  prev_entry_hash TEXT NOT NULL,
                  entry_hash      TEXT NOT NULL,
+                 is_checkpoint   INTEGER NOT NULL DEFAULT 0,
+                 prev_checkpoint TEXT NOT NULL DEFAULT '',
                  json            TEXT NOT NULL,
                  ack             TEXT NOT NULL,
                  PRIMARY KEY (did, kind, subkey, seq)
@@ -483,8 +485,9 @@ impl Store {
     }
 
     /// Every entry of a chain, seq-ordered, each with its signed JSON (ADR 0005 /
-    /// A3) — the input to recomputation and the `?chain=1` read. (Checkpoint-bounded
-    /// windows arrive with A4; A3 returns the whole chain.)
+    /// A3–A4) — the input to recomputation and the `?chain=1` read. Steps and
+    /// checkpoints both appear; after compaction the leading row is the checkpoint
+    /// anchor.
     ///
     /// # Errors
     /// Returns [`PersistError`] on a SQLite failure.
@@ -496,8 +499,8 @@ impl Store {
     ) -> Result<Vec<(crate::chain_kind::ChainEntry, String)>, PersistError> {
         let sk = subkey.unwrap_or("");
         let mut stmt = self.conn.prepare(
-            "SELECT seq, delta, total, prev_entry_hash, json FROM chain_entry
-             WHERE did = ?1 AND kind = ?2 AND subkey = ?3 ORDER BY seq",
+            "SELECT seq, delta, total, prev_entry_hash, is_checkpoint, prev_checkpoint, json
+             FROM chain_entry WHERE did = ?1 AND kind = ?2 AND subkey = ?3 ORDER BY seq",
         )?;
         let rows = stmt.query_map(rusqlite::params![did, kind, sk], |r| {
             Ok((
@@ -505,28 +508,149 @@ impl Store {
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (seq, delta, total, prev_entry_hash, json) = row?;
+            let (seq, delta, total, prev_entry_hash, is_checkpoint, prev_checkpoint, json) = row?;
+            let total = u64::try_from(total).unwrap_or(0);
+            // A checkpoint row stores closing_total in `total` and the head hash
+            // it closes over in `prev_entry_hash` (see append_checkpoint_entry).
+            let step = if is_checkpoint != 0 {
+                crate::chain_kind::ChainStep::Checkpoint(crate::chain_kind::CheckpointBody {
+                    closing_total: total,
+                    chain_head_hash: prev_entry_hash,
+                    prev_checkpoint,
+                })
+            } else {
+                crate::chain_kind::ChainStep::Step(crate::chain_kind::ChainCounterBody {
+                    delta,
+                    total,
+                    prev_entry_hash,
+                })
+            };
             out.push((
                 crate::chain_kind::ChainEntry {
                     did: did.to_owned(),
                     kind: kind.to_owned(),
                     subkey: subkey.map(str::to_owned),
                     seq: u64::try_from(seq).unwrap_or(0),
-                    body: crate::chain_kind::ChainCounterBody {
-                        delta,
-                        total: u64::try_from(total).unwrap_or(0),
-                        prev_entry_hash,
-                    },
+                    step,
                 },
                 json,
             ));
         }
         Ok(out)
+    }
+
+    /// The hash of the chain's latest checkpoint, if any (ADR 0005 / A4) — the
+    /// value the next checkpoint must name as `prev_checkpoint`. `None` when the
+    /// chain has no checkpoint yet (the next one links [`GENESIS`]).
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn latest_checkpoint_hash(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<String>, PersistError> {
+        let hash: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM chain_entry
+                 WHERE did = ?1 AND kind = ?2 AND subkey = ?3 AND is_checkpoint = 1
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![did, kind, subkey.unwrap_or("")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hash)
+    }
+
+    /// Append a verified checkpoint entry (ADR 0005 / A4) in one transaction: the
+    /// checkpoint row goes into `chain_entry` (its `total` column is the
+    /// `closing_total`, its `prev_entry_hash` column the `chain_head_hash`), and
+    /// the `assertion` row is upserted so a point read reflects it. Compaction is a
+    /// **separate** step ([`compact_behind_latest_checkpoint`]) — writing a
+    /// checkpoint never deletes on its own.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite/serialization failure.
+    pub fn append_checkpoint_entry(
+        &self,
+        record: &SignedAssertion,
+        ack: &Ack,
+        body: &crate::chain_kind::CheckpointBody,
+        checkpoint_hash: &str,
+    ) -> Result<(), PersistError> {
+        let json = serde_json::to_string(record)?;
+        let ack_json = serde_json::to_string(ack)?;
+        let seq = i64::try_from(record.seq).unwrap_or(i64::MAX);
+        let closing = i64::try_from(body.closing_total).unwrap_or(i64::MAX);
+        let subkey = record.subkey.as_deref().unwrap_or("");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO chain_entry
+                 (did, kind, subkey, seq, delta, total, prev_entry_hash, entry_hash,
+                  is_checkpoint, prev_checkpoint, json, ack)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 1, ?8, ?9, ?10)",
+            rusqlite::params![
+                record.did, record.kind, subkey, seq, closing, body.chain_head_hash,
+                checkpoint_hash, body.prev_checkpoint, json, ack_json
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO assertion (did, kind, subkey, seq, json, ack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(did, kind, subkey) DO UPDATE
+                 SET seq = excluded.seq, json = excluded.json, ack = excluded.ack
+             WHERE excluded.seq > assertion.seq",
+            rusqlite::params![record.did, record.kind, subkey, seq, json, ack_json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Compact a chain behind its latest acknowledged checkpoint (ADR 0005 / A4):
+    /// delete every entry before that checkpoint, leaving it as the new anchor.
+    /// Returns the checkpoint's seq if it compacted, or `None` when the chain has
+    /// **no** checkpoint to compact behind — the caller turns that into the
+    /// no-shredding-before-agreement refusal. Every stored checkpoint is already
+    /// provider-acked (only acked writes are persisted), so a present checkpoint
+    /// *is* the agreement.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] on a SQLite failure.
+    pub fn compact_behind_latest_checkpoint(
+        &self,
+        did: &str,
+        kind: &str,
+        subkey: Option<&str>,
+    ) -> Result<Option<u64>, PersistError> {
+        let sk = subkey.unwrap_or("");
+        let checkpoint_seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM chain_entry
+                 WHERE did = ?1 AND kind = ?2 AND subkey = ?3 AND is_checkpoint = 1
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![did, kind, sk],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(seq) = checkpoint_seq else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "DELETE FROM chain_entry
+             WHERE did = ?1 AND kind = ?2 AND subkey = ?3 AND seq < ?4",
+            rusqlite::params![did, kind, sk, seq],
+        )?;
+        Ok(Some(u64::try_from(seq).unwrap_or(0)))
     }
 
     /// Load a stored assertion + its ack, if present — the durable signed

@@ -136,6 +136,14 @@ e1 → e2 → … → e100 → [CHECKPOINT C1] → e101 → …
   cost.
 - The roll trigger (every N entries / S bytes) is the `rolling`
   declaration's parameter.
+- **When compaction fires is a configured policy** (owner decision,
+  2026-08-11, implemented A4): `on_ack` compacts the moment a checkpoint is
+  written and acked — the default, and what dev/tests use; `deferred` leaves
+  compaction to an explicit call so a checkpoint write never destroys history
+  on its own — the production intent, where the shred is tied to a **billing
+  marker**. Both share one mechanism (compact behind the latest acked
+  checkpoint); the explicit call is also the control the "no shredding before
+  agreement" guard tests against.
 
 **First consumer:** croft-relay-admit's usage accounting moves from
 `kv.counter` to `chain.counter` on a pin bump — its relay-usage totals become

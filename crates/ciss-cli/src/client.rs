@@ -534,6 +534,27 @@ impl Client {
         resp.json().await.context("parse chain")
     }
 
+    /// `POST /{did}/assertion/{kind}/{subkey}/compact` — compact the chain behind
+    /// its latest acknowledged checkpoint (ADR 0005 / A4). Owner-only. Returns the
+    /// HTTP status: 200 compacted, 409 no checkpoint to compact behind, 401/403
+    /// not the owner.
+    ///
+    /// # Errors
+    ///
+    /// Fails only on a connection error; a non-2xx status is returned, not raised.
+    pub async fn compact_chain(
+        &self,
+        session: Option<&Session>,
+        did: &str,
+        kind: &str,
+        subkey: &str,
+    ) -> Result<u16> {
+        let url = format!("{}/{}/assertion/{}/{}/compact", self.base, did, kind, subkey);
+        let req = with_session(self.http.post(&url), session);
+        let resp = self.send(req, "compact chain").await?;
+        Ok(resp.status().as_u16())
+    }
+
     /// `PUT /{did}/assertion/policy/{cid}` with a self-signed `SignedAssertion` body
     /// (Model A — the record self-authorizes, so no session header is needed).
     /// Returns the stored `seq`.

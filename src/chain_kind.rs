@@ -82,6 +82,78 @@ pub fn entry_hash(did: &str, kind: &str, subkey: Option<&str>, seq: u64, body: &
     sha256_hex(preimage.as_bytes())
 }
 
+/// A **checkpoint** body (ADR 0005 / A4): a signed balance-forward marker. It
+/// closes over the chain up to its predecessor — `closing_total` is the running
+/// total at that point, `chain_head_hash` is the predecessor's hash (committing
+/// transitively to every entry behind it), and `prev_checkpoint` links the prior
+/// checkpoint (or [`GENESIS_PREV_HASH`]). Once acknowledged it lets the entries
+/// behind it be compacted; verification then walks back only to here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointBody {
+    /// The running total this checkpoint closes at (must equal the head entry's).
+    pub closing_total: u64,
+    /// The [`entry_hash`] of the entry this checkpoint closes over — commits
+    /// transitively to the whole compacted prefix.
+    pub chain_head_hash: String,
+    /// The [`checkpoint_hash`] of the prior checkpoint, or [`GENESIS_PREV_HASH`].
+    pub prev_checkpoint: String,
+}
+
+/// The canonical fold of a checkpoint body — distinct from a step fold, so a
+/// checkpoint can never be reinterpreted as a step (or vice versa).
+#[must_use]
+pub fn checkpoint_body_fold(body: &CheckpointBody) -> String {
+    format!(
+        "checkpoint;closing_total={};head={};prev_checkpoint={}",
+        body.closing_total, body.chain_head_hash, body.prev_checkpoint
+    )
+}
+
+/// The hash of a checkpoint entry — what its successor records as
+/// `prev_entry_hash` and what a later checkpoint records as `prev_checkpoint`.
+/// The `checkpoint;` prefix keeps it disjoint from any [`entry_hash`].
+#[must_use]
+pub fn checkpoint_hash(did: &str, kind: &str, subkey: Option<&str>, seq: u64, body: &CheckpointBody) -> String {
+    let preimage = format!(
+        "{did}|{kind}|{}|{seq}|checkpoint;closing_total={};head={};prev_checkpoint={}",
+        subkey.unwrap_or(""),
+        body.closing_total,
+        body.chain_head_hash,
+        body.prev_checkpoint
+    );
+    sha256_hex(preimage.as_bytes())
+}
+
+/// A chain write is one of two shapes — a step or a checkpoint — disambiguated by
+/// its fields (both `deny_unknown_fields`, so exactly one matches). This is what
+/// `chain.counter`'s registry arm parses and what the write path dispatches on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ChainStep {
+    /// A balance-forward checkpoint.
+    Checkpoint(CheckpointBody),
+    /// An ordinary `{delta, total, prev_entry_hash}` step.
+    Step(ChainCounterBody),
+}
+
+impl ChainStep {
+    /// The canonical fold for whichever shape this is.
+    #[must_use]
+    pub fn fold(&self) -> String {
+        match self {
+            ChainStep::Step(b) => chain_counter_body_fold(b),
+            ChainStep::Checkpoint(b) => checkpoint_body_fold(b),
+        }
+    }
+
+    /// Whether this write is a checkpoint.
+    #[must_use]
+    pub fn is_checkpoint(&self) -> bool {
+        matches!(self, ChainStep::Checkpoint(_))
+    }
+}
+
 /// Why a proposed entry does not continue the stored chain — the precise,
 /// value-quoting reason returned to the customer (never a bare "invalid").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +184,20 @@ pub enum ChainBreak {
         /// The predecessor hash the entry actually named.
         got: String,
     },
+    /// A checkpoint's `closing_total` does not equal the running total it closes.
+    ClosingTotal {
+        /// The chain's running total at the checkpoint's predecessor.
+        running_total: u64,
+        /// The `closing_total` the checkpoint asserted.
+        closing_total: u64,
+    },
+    /// A checkpoint names the wrong prior checkpoint.
+    PrevCheckpoint {
+        /// The prior checkpoint's hash a valid checkpoint must name.
+        expected: String,
+        /// The prior-checkpoint hash the checkpoint actually named.
+        got: String,
+    },
 }
 
 impl ChainBreak {
@@ -127,6 +213,12 @@ impl ChainBreak {
             ),
             ChainBreak::PrevHash { expected, got } => {
                 format!("prev_entry_hash {got} does not match the chain head {expected}")
+            }
+            ChainBreak::ClosingTotal { running_total, closing_total } => format!(
+                "checkpoint closing_total {closing_total} does not equal the running total {running_total}"
+            ),
+            ChainBreak::PrevCheckpoint { expected, got } => {
+                format!("prev_checkpoint {got} does not match the prior checkpoint {expected}")
             }
         }
     }
@@ -173,8 +265,48 @@ pub fn verify_step(prev: Option<&PrevEntry>, body: &ChainCounterBody, seq: u64) 
     Ok(())
 }
 
-/// A full chain entry as recomputation sees it (route identity + body), so the
-/// recompute can re-derive each hash link independently of what was stored.
+/// Verify a checkpoint over the chain whose head is `prev`, given the expected
+/// prior-checkpoint hash. The four invariants, each refused with its real values:
+/// contiguous seq, a `chain_head_hash` linking the head it closes, a
+/// `closing_total` equal to the running total, and a correct prior-checkpoint
+/// link. A checkpoint always closes over a real predecessor — an empty chain has
+/// nothing to check.
+///
+/// # Errors
+/// Returns the specific [`ChainBreak`] the checkpoint violates.
+pub fn verify_checkpoint(
+    prev: &PrevEntry,
+    expected_prev_checkpoint: &str,
+    body: &CheckpointBody,
+    seq: u64,
+) -> Result<(), ChainBreak> {
+    if seq != prev.seq + 1 {
+        return Err(ChainBreak::Seq { expected: prev.seq + 1, got: seq });
+    }
+    if body.chain_head_hash != prev.entry_hash {
+        return Err(ChainBreak::PrevHash {
+            expected: prev.entry_hash.clone(),
+            got: body.chain_head_hash.clone(),
+        });
+    }
+    if body.closing_total != prev.total {
+        return Err(ChainBreak::ClosingTotal {
+            running_total: prev.total,
+            closing_total: body.closing_total,
+        });
+    }
+    if body.prev_checkpoint != expected_prev_checkpoint {
+        return Err(ChainBreak::PrevCheckpoint {
+            expected: expected_prev_checkpoint.to_owned(),
+            got: body.prev_checkpoint.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// A full chain entry as recomputation sees it (route identity + the step or
+/// checkpoint body), so the recompute can re-derive each hash link independently
+/// of what was stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainEntry {
     /// The owning DID.
@@ -185,8 +317,22 @@ pub struct ChainEntry {
     pub subkey: Option<String>,
     /// The entry sequence.
     pub seq: u64,
-    /// The entry body.
-    pub body: ChainCounterBody,
+    /// The step or checkpoint body.
+    pub step: ChainStep,
+}
+
+impl ChainEntry {
+    /// This entry's hash — what its successor links (`entry_hash` for a step,
+    /// `checkpoint_hash` for a checkpoint).
+    #[must_use]
+    pub fn head_hash(&self) -> String {
+        match &self.step {
+            ChainStep::Step(b) => entry_hash(&self.did, &self.kind, self.subkey.as_deref(), self.seq, b),
+            ChainStep::Checkpoint(b) => {
+                checkpoint_hash(&self.did, &self.kind, self.subkey.as_deref(), self.seq, b)
+            }
+        }
+    }
 }
 
 /// Recompute a chain from its entries (seq-ordered), returning the verified final
@@ -199,13 +345,30 @@ pub struct ChainEntry {
 /// Returns the first [`ChainBreak`] the recomputation finds, or `Seq` for an
 /// empty chain queried as if non-empty is not an error — an empty chain has total 0.
 pub fn recompute_total(entries: &[ChainEntry]) -> Result<u64, ChainBreak> {
-    let mut prev: Option<PrevEntry> = None;
+    let mut head: Option<PrevEntry> = None;
+    let mut last_checkpoint = GENESIS_PREV_HASH.to_owned();
     for entry in entries {
-        verify_step(prev.as_ref(), &entry.body, entry.seq)?;
-        let hash = entry_hash(&entry.did, &entry.kind, entry.subkey.as_deref(), entry.seq, &entry.body);
-        prev = Some(PrevEntry { seq: entry.seq, total: entry.body.total, entry_hash: hash });
+        match &entry.step {
+            ChainStep::Step(body) => verify_step(head.as_ref(), body, entry.seq)?,
+            ChainStep::Checkpoint(body) => match head.as_ref() {
+                // A leading checkpoint is a compacted anchor: the entries it
+                // closed are gone, so there is no predecessor to check it
+                // against — it is the trusted balance-forward root (verified when
+                // written). Every non-leading checkpoint is fully re-verified.
+                None => {}
+                Some(prev) => verify_checkpoint(prev, &last_checkpoint, body, entry.seq)?,
+            },
+        }
+        let (total, hash) = match &entry.step {
+            ChainStep::Step(body) => (body.total, entry.head_hash()),
+            ChainStep::Checkpoint(body) => (body.closing_total, entry.head_hash()),
+        };
+        if entry.step.is_checkpoint() {
+            last_checkpoint.clone_from(&hash);
+        }
+        head = Some(PrevEntry { seq: entry.seq, total, entry_hash: hash });
     }
-    Ok(prev.map_or(0, |p| p.total))
+    Ok(head.map_or(0, |h| h.total))
 }
 
 #[cfg(test)]
@@ -301,20 +464,37 @@ mod tests {
         assert_ne!(base, chain_counter_body_fold(&body(50, 150, "other")), "prev link is bound");
     }
 
-    #[test]
-    fn recompute_walks_the_whole_chain_and_catches_tampering() {
-        let mk = |seq, delta, total, prev: &str| ChainEntry {
+    fn step_entry(seq: u64, delta: i64, total: u64, prev: &str) -> ChainEntry {
+        ChainEntry {
             did: "did:x".to_owned(),
             kind: CHAIN_COUNTER_KIND.to_owned(),
             subkey: Some("acct".to_owned()),
             seq,
-            body: body(delta, total, prev),
-        };
-        let e1 = mk(1, 100, 100, GENESIS_PREV_HASH);
-        let h1 = entry_hash(&e1.did, &e1.kind, e1.subkey.as_deref(), 1, &e1.body);
-        let e2 = mk(2, 50, 150, &h1);
-        let h2 = entry_hash(&e2.did, &e2.kind, e2.subkey.as_deref(), 2, &e2.body);
-        let e3 = mk(3, -30, 120, &h2);
+            step: ChainStep::Step(body(delta, total, prev)),
+        }
+    }
+
+    fn checkpoint_entry(seq: u64, closing: u64, head: &str, prev_ckpt: &str) -> ChainEntry {
+        ChainEntry {
+            did: "did:x".to_owned(),
+            kind: CHAIN_COUNTER_KIND.to_owned(),
+            subkey: Some("acct".to_owned()),
+            seq,
+            step: ChainStep::Checkpoint(CheckpointBody {
+                closing_total: closing,
+                chain_head_hash: head.to_owned(),
+                prev_checkpoint: prev_ckpt.to_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn recompute_walks_the_whole_chain_and_catches_tampering() {
+        let e1 = step_entry(1, 100, 100, GENESIS_PREV_HASH);
+        let h1 = e1.head_hash();
+        let e2 = step_entry(2, 50, 150, &h1);
+        let h2 = e2.head_hash();
+        let e3 = step_entry(3, -30, 120, &h2);
 
         assert_eq!(recompute_total(&[e1.clone(), e2.clone(), e3.clone()]), Ok(120));
         assert_eq!(recompute_total(&[]), Ok(0), "an empty chain totals zero");
@@ -322,10 +502,66 @@ mod tests {
         // Tamper with e2's total after the fact: recomputation catches it, even
         // though e2 was valid when written (its stored total drove e3's link).
         let mut tampered = e2.clone();
-        tampered.body.total = 9_999;
+        tampered.step = ChainStep::Step(body(50, 9_999, &h1));
         assert!(matches!(
             recompute_total(&[e1, tampered, e3]),
             Err(ChainBreak::Total { .. })
+        ));
+    }
+
+    #[test]
+    fn recompute_crosses_a_checkpoint_and_a_compacted_anchor() {
+        // e1(+100)=100, e2(+50)=150, C1 closes 150 over e2, e3(+25)=175 links C1.
+        let e1 = step_entry(1, 100, 100, GENESIS_PREV_HASH);
+        let h1 = e1.head_hash();
+        let e2 = step_entry(2, 50, 150, &h1);
+        let h2 = e2.head_hash();
+        let c1 = checkpoint_entry(3, 150, &h2, GENESIS_PREV_HASH);
+        let hc1 = c1.head_hash();
+        let e3 = step_entry(4, 25, 175, &hc1);
+
+        // The full chain recomputes to 175 across the checkpoint.
+        assert_eq!(recompute_total(&[e1, e2, c1.clone(), e3.clone()]), Ok(175));
+
+        // After compaction the steps behind C1 are gone; C1 leads as the anchor,
+        // carrying closing_total forward. Same final total, bounded storage.
+        assert_eq!(recompute_total(&[c1, e3]), Ok(175), "a compacted chain totals from its anchor");
+    }
+
+    #[test]
+    fn a_checkpoint_must_close_the_real_running_total_and_head() {
+        let e1 = step_entry(1, 100, 100, GENESIS_PREV_HASH);
+        let prev = PrevEntry { seq: 1, total: 100, entry_hash: e1.head_hash() };
+        let good = CheckpointBody {
+            closing_total: 100,
+            chain_head_hash: e1.head_hash(),
+            prev_checkpoint: GENESIS_PREV_HASH.to_owned(),
+        };
+        assert!(verify_checkpoint(&prev, GENESIS_PREV_HASH, &good, 2).is_ok());
+        // Wrong closing total.
+        assert_eq!(
+            verify_checkpoint(
+                &prev,
+                GENESIS_PREV_HASH,
+                &CheckpointBody { closing_total: 99, ..good.clone() },
+                2,
+            ),
+            Err(ChainBreak::ClosingTotal { running_total: 100, closing_total: 99 })
+        );
+        // A head hash not matching the entry it claims to close (tamper detected).
+        assert!(matches!(
+            verify_checkpoint(
+                &prev,
+                GENESIS_PREV_HASH,
+                &CheckpointBody { chain_head_hash: "beef".to_owned(), ..good.clone() },
+                2,
+            ),
+            Err(ChainBreak::PrevHash { .. })
+        ));
+        // Wrong prior-checkpoint link.
+        assert!(matches!(
+            verify_checkpoint(&prev, "realprev", &good, 2),
+            Err(ChainBreak::PrevCheckpoint { .. })
         ));
     }
 }
