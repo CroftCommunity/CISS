@@ -50,13 +50,35 @@ anti-rollback proof. Both halves instead ride authority CISS already has.
 
 ### A — reclamation driven by the signed manifest
 
-The manifest is *already* the owner's signed statement of what should exist. It binds every leaf
-(invariant **B1**) and carries a monotonic `seq` refused on rollback (**B3**, enforced at
-`src/server.rs:1299`).
+> **CORRECTED 2026-08-11, before any code was written.** The first draft of this section said
+> *"reclamation collects objects no manifest references."* **That would have deleted nearly
+> everything.** See "The manifest is not an index" below.
 
-So: **an owner signing manifest `N+1` without a leaf has said "I no longer claim this."** That is
-authenticated, replay-proof, and already expressible. Reclamation collects objects no manifest
-references.
+The manifest is the owner's signed statement of what they **claim to be keeping**. It binds every
+leaf (invariant **B1**) and carries a monotonic `seq` refused on rollback (**B3**,
+`src/server.rs:1299`). So an owner signing manifest `N+1` **without** a leaf that manifest `N`
+**did** carry is an authenticated, replay-proof *"I no longer claim this."*
+
+**That is the only safe signal, and it is narrower than "absent from the manifest."**
+
+#### The manifest is not an index of what exists
+
+Verified in source, and it invalidates the obvious design:
+
+- **`op_put_object` never touches the manifest** (`src/server.rs:1030`). It gates on quota and the
+  spend ceiling, writes to the blobstore, and records a receipt. Nothing more.
+- **`op_du` reads receipts, not the manifest** (`src/server.rs:1399`, `:1414`).
+- The Phase-0 meer probe corroborates it empirically: `d2_ciss_put.rs` PUTs four objects, never
+  writes a manifest, and all four store, serve, and appear in `du`.
+
+The manifest and the receipts are **two different ledgers** — the customer's claim, and the
+provider's record of what actually moved. An object that was never manifested is not *unwanted*; it
+is *never claimed*, which is the ordinary case.
+
+**Consequence for A:** reclamation must be keyed on a **transition** — an object that *was* carried
+by some manifest and is *no longer* carried by the current one — never on mere absence. This
+requires tracking "was this cid ever manifested for this did," which is new state. It is small, but
+it is not free, and pretending the manifest was already an index would have been a data-loss bug.
 
 Billing needs no change — byte-days already stop when a leaf leaves the manifest.
 
@@ -83,6 +105,27 @@ which is the whole point, because the meer exists precisely for when the owner i
 Security properties come for free from the surface it rides: the declaration is owner-signed,
 `seq`-monotonic (so it cannot be rolled back), and a custodian never sets it, so the party it
 constrains cannot weaken it.
+
+#### The one place B must NOT copy the ceiling dial: the failure direction
+
+`at_rest_dial` fails **closed to a cap of 0** when a stored dial will not parse
+(`src/persist.rs:424–443`) — documented as *"new stores refuse loudly rather than silently dropping
+the customer's protection."* For a **ceiling**, that is right: the dial is a *protection*, so
+failing closed means refusing writes, which is the safe direction.
+
+**A retention dial is destructive, so the safe direction inverts.** An unparseable retention dial
+that "failed closed" to 0 days would **delete the namespace immediately**. For anything whose effect
+is deletion, failing safe means **retain indefinitely**:
+
+| dial | effect | unparseable ⇒ |
+|---|---|---|
+| ceiling (`at_rest_bytes`) | protective — refuses writes | cap `0` — refuse loudly ✅ |
+| **retention (`max_age_days`)** | **destructive — deletes** | **`None` — retain forever, and warn loudly** |
+
+"Follow `CeilingDialBody` exactly" is correct for the shape, the fold, the signing and the
+`seq` handling — and **wrong on precisely this point.** Same for the enforcement hook:
+set-time validation (`src/server.rs:1584`) checks the ceiling against a provider bound; a retention
+dial's set-time check should reject an implausibly short window rather than accept it.
 
 ### Why B is not blocked on the meer lane
 
@@ -134,11 +177,13 @@ Confirmed by reading source on 2026-08-11, not from memory:
 
 ## Open questions
 
-- **[BLOCKING — Phase 0 resolves]** *Can an object be `PUT` and never appear in a manifest?* If yes,
-  A cannot treat "absent from the manifest" as "unwanted" without destroying the normal
-  put-then-manifest window. Likely needs a grace period, or reclamation restricted to objects that
-  were manifested at least once. **This decides whether A is safe at all**, so it is Phase 0's first
-  probe.
+- **[RESOLVED 2026-08-11 — and the answer is worse than a grace period]** *Can an object be `PUT`
+  and never appear in a manifest?* **Yes, and that is the ordinary case.** `op_put_object` never
+  touches the manifest; `op_du` reads receipts; the meer probe PUTs four objects with no manifest at
+  all and every one stores, serves and meters. So "absent from the manifest" is not a weak signal
+  needing a grace window — **it is the normal state of almost every object.** A must key on the
+  *transition* (was manifested, now is not), which needs new state: a record of which cids have ever
+  been manifested per did. Folded into Phase 3.
 - **[PHASE-GATED — Phase 3]** *Is retention per namespace, or per object?* The dial above is
   namespace-wide. A queue wants namespace-wide; a general customer might want per-object. The
   assertion surface supports a `subkey`, so per-object is expressible — but it is more state and more
@@ -154,15 +199,19 @@ assertions, commit the green state before mutating.
 
 ### Phase 0 — Discovery (blocking)
 
-- [ ] **D1: Can an object be PUT and never manifested?** Probe: PUT an object, never manifest it,
-      read `du` and the blob directory. **Decides whether A is safe as specified.**
+- [x] **D1: Can an object be PUT and never manifested?** **ANSWERED 2026-08-11: yes, and it is the
+      ordinary case.** `op_put_object` (`src/server.rs:1030`) never touches the manifest; `op_du`
+      (`:1399`) reads receipts. Corroborated by `meer-queue/src/bin/d2_ciss_put.rs`. **A is not safe
+      as originally specified** — corrected above.
 - [ ] **D2: What is the manifest→object relationship at read time?** Does `GET /{did}/objects/{cid}`
       consult the manifest at all, or only the blobstore? Determines where a reclamation check lives.
 - [ ] **D3: Confirm the assertion surface accepts a new kind cleanly.** Add a throwaway kind, PUT and
       GET it, confirm `kind_fold` refuses a malformed body and an unknown kind.
-- [ ] **D4: Does anything already read `deposited_at` / object age?** The meter tracks byte-days, so
-      a per-object timestamp may already exist. If it does, B's enforcement is a read, not a new
-      column.
+- [ ] **D4: Where does per-object age come from?** **Partly answered: not from the blobstore.** The
+      `BlobStore` trait is `put`/`get`/`has` (`src/blobstore.rs:80–92`) with no metadata, and the
+      `receipt` table is `(id, did, json)` with no age column. Byte-day accounting must derive age
+      from somewhere — find it, and decide whether B reads it or needs its own column. **B's
+      enforcement cannot be built until this is settled.**
 
 **Done when:** the manifest/object coupling is understood well enough that A cannot delete live data.
 
