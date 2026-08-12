@@ -7,21 +7,23 @@ server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
 
 ---
 
-## 0. ADR 0005 ACCEPTED — implementation plan ready: `docs/plans/2026-08-11-kind-semantics-implementation.md`
+## 0. ADR 0005 IMPLEMENTED — kind semantics + the accounting chain ✅ (2026-08-12)
 
-Scoped + owner-reviewed 2026-08-11
-(`docs/adr/0005-kind-semantics-and-accounting-chain.md`): **five** declared
-axes per kind — retention, erasure, enumeration, **hashing (posture +
-algorithm; the BLAKE3/SHA-256 ecosystem split stated per kind)**, and
-**sizing (body ceilings + growth posture; nothing assumed infinite)**.
-`chain.counter` brings the ledger's tamper-evidence to the substrate with
-**checkpoint/compaction under the ack-before-shred rule** (balance-forward,
-per the statements pattern). Agreed calls: `kv.flag` erasable+listable;
-`kv.counter` REMOVED when the chain lands (no deprecated 2am traps).
-Six phases, two milestones, strictly sequential (A1 KindSpec+ceilings → A2
-DELETE/LIST endpoints → A3 chain.counter → A4 checkpoints+compaction → A5
-remove kv.counter + release → B1 consumer pin bump retiring all three
-recorded workarounds). Closes at B1.
+Built and merged. ADR 0005
+(`docs/adr/0005-kind-semantics-and-accounting-chain.md`) is now code: **six**
+declared axes per kind (retention, authorship, erasure, enumeration, hashing
+posture×algorithm, sizing) in `src/kind_spec.rs`, with `Chain ⇒ Permanent`
+enforced at compile time. Milestone A landed on `main` (**release 0.8.0, PR
+#37, `2d1e685`**): A1 KindSpec + body ceilings → A2 generic declaration-gated
+DELETE/LIST → A3 `chain.counter` (append-only hash-linked, **mutation-clean
+16/16**) → A4 checkpoints + compaction (configurable `on_ack`/`deferred` policy,
+no shredding before an acked checkpoint, **mutation-clean 35/35**) → A5
+`kv.counter` removed before release. Milestone B (the consumer pin bump)
+landed on `croft-stack` (**PR #7, `b882d8f`**), retiring all three recorded
+`CissStore` workarounds: usage `kv.counter` → `chain.counter`, `remove()` →
+the real DELETE (no roster residue), `keys()` → the real LIST. `kv.flag`
+stays erasable + listable (a roster wants erasure; usage wants permanence).
+Execution record: `docs/plans/2026-08-11-kind-semantics-implementation.md`.
 
 
 ## 1. Redeploy the VPS to v0.5.6 — blocks `du` and any post-v0.4.0 server change  ⟵ biggest

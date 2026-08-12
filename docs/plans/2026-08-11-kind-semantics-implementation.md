@@ -1,13 +1,21 @@
 # Kind semantics + the accounting chain: implementation plan
 
-- **Status:** Ready. ADR 0005 **Accepted** 2026-08-11; the design conversation
-  (owner walk-through of every axis, the checkpoint model, and both
-  classification calls) and the full-store cross-inspection served as this
-  plan's design and verification passes — the ADR is the reasoning record,
-  `ARCHITECTURE.md` §5a the stated model. Six phases in **two milestones
-  across two surfaces, strictly sequential** (owner: "implement one, then the
-  other so that it's all in line — that's the advantage of it all being
-  ours").
+- **Status: IMPLEMENTED ✅ (2026-08-12).** All six phases landed, each RED-first,
+  green + clippy-clean; the two money-shaped phases are mutation-clean (A3 16/16,
+  A4 35/35). **Milestone A** merged to `main` as **release 0.8.0 (PR #37,
+  `2d1e685`)**: A1 `KindSpec` + body ceilings · A2 generic DELETE/LIST · A3
+  `chain.counter` · A4 checkpoints + compaction (configurable `on_ack`/`deferred`)
+  · A5 `kv.counter` removed. **Milestone B / B1** merged to `croft-stack` (**PR
+  #7, `b882d8f`**): pin bump to `2d1e685`, usage → `chain.counter`, `remove()` →
+  DELETE, `keys()` → LIST. Execution notes per phase are in the commit history
+  and the tiered-admission plan's execution log (discovery repo). ADR 0005 is the
+  reasoning record; `ARCHITECTURE.md` §5a the stated model.
+- **Original framing (retained):** ADR 0005 **Accepted** 2026-08-11; the design
+  conversation (owner walk-through of every axis, the checkpoint model, and both
+  classification calls) and the full-store cross-inspection served as this plan's
+  design and verification passes. Six phases in **two milestones across two
+  surfaces, strictly sequential** (owner: "implement one, then the other so that
+  it's all in line — that's the advantage of it all being ours").
 - **Surfaces:** Milestone A is this repo; Milestone B is
   `croft-stack/relay/source` (the pinned consumer). Milestone B starts only
   after A's release commit exists — the pin bump *is* the interface.
