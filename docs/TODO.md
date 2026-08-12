@@ -7,6 +7,17 @@ server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
 
 ---
 
+## 0. ADR 0005 (Proposed): kind semantics classes + the accounting chain — owner review
+
+Scoped 2026-08-11 (`docs/adr/0005-kind-semantics-and-accounting-chain.md`): each
+assertion kind declares retention (`setting`/`chain`), erasure
+(`erasable`/`permanent`), and enumeration (`listable`/`point-only`); a new
+`chain.counter` kind gives accounting the ledger's tamper-evidence on the
+substrate. Solves the deletion-semantics and enumeration gaps the
+croft-relay-admit integration surfaced (its usage moves off `kv.counter` on a
+pin bump once this lands). **Needs the owner's acceptance before implementation.**
+
+
 ## 1. Redeploy the VPS to v0.5.6 — blocks `du` and any post-v0.4.0 server change  ⟵ biggest
 
 The deployed `https://ciss.croft.ing` runs a **pre-v0.5.5** server: it enforces
