@@ -49,16 +49,19 @@ concrete gaps in the first external integration:
 ## Proposal: each kind declares its semantics
 
 Kinds stay **code, not data** (the registry stays closed). What changes: the
-registry entry for a kind declares its semantics on **five axes**, and the
+registry entry for a kind declares its semantics on **six axes** (five as
+first drafted; the cross-inspection appendix added authorship and widened
+retention — the table below is the refined form), and the
 generic machinery enforces them — a new use case picks a point in a small,
 named space instead of hand-rolling behaviour.
 
 | Axis | Values | Meaning |
 |---|---|---|
-| **Retention** | `setting` \| `chain` | `setting`: latest-wins; the old value is replaced and gone. `chain`: append-only; each entry binds the previous entry's hash; history is the value. |
+| **Retention** | `setting` \| `immutable` \| `log` \| `chain` | `setting`: latest-wins; the old value is replaced and gone. `immutable`: write-once per key, never updated (content-addressed bytes). `log`: append-only rows, integrity via periodic roots. `chain`: append-only; each entry binds the previous entry's hash; history is the value. |
+| **Authorship** | `derived` \| `owner-signed` \| `provider-signed` \| `co-signed` | Whose statement is this? `derived` records are unsigned, rebuildable caches of signed data — never authoritative. The substrate's Model A/C is this axis's assertion-shaped corner. |
 | **Erasure** | `erasable` \| `permanent` | `erasable`: an owner-authorized `DELETE /{did}/assertion/{kind}/{subkey}` removes the subkey entirely. `permanent`: delete is refused with the declared reason. **`chain` implies `permanent`** — an erasable chain is a contradiction. |
 | **Enumeration** | `listable` \| `point-only` | `listable`: owner-only `GET /{did}/assertions/{kind}` returns the subkeys (the `du` discipline). `point-only`: lookups require knowing the key — the no-readable-roster stance, chosen on purpose. |
-| **Hashing** | `fold-bound` \| `chain-linked` \| `content-addressed`, **× algorithm** | `fold-bound`: the signature covers a canonical fold; no standalone content hash. `chain-linked`: additionally binds the previous entry's hash (implies fold-bound). `content-addressed`: the hash is the identity. The **algorithm is part of the declaration** — SHA-256 for CISS chains/content addresses, BLAKE3 where a kind's content interoperates with iroh file transfer. The split is deliberate ecosystem alignment; declaring it per kind is what stops a refactor from "harmonizing" across the boundary. |
+| **Hashing** | `fold-bound` \| `chain-linked` \| `merkle-rooted` \| `content-addressed`, **× algorithm** | `fold-bound`: the signature covers a canonical fold; no standalone content hash. `chain-linked`: additionally binds the previous entry's hash (implies fold-bound). `content-addressed`: the hash is the identity. The **algorithm is part of the declaration** — SHA-256 for CISS chains/content addresses, BLAKE3 where a kind's content interoperates with iroh file transfer. The split is deliberate ecosystem alignment; declaring it per kind is what stops a refactor from "harmonizing" across the boundary. |
 | **Sizing** | body ceiling (bytes), **growth**: `bounded` \| `rolling` \| `unbounded` | Every kind declares a max body size. `bounded`: at most one row per subkey (settings). `rolling`: entries compact behind acknowledged checkpoints (chains — see below), parameterized by a roll trigger (every N entries or S bytes). `unbounded`: eternal fine-grained history as a **visible, conscious choice** — never a default. |
 
 Classification of what exists (owner-agreed):
