@@ -7,15 +7,19 @@ server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
 
 ---
 
-## 0. ADR 0005 (Proposed): kind semantics classes + the accounting chain — owner review
+## 0. ADR 0005: kind semantics classes + the accounting chain — walked through with the owner, ready to implement on final acceptance
 
-Scoped 2026-08-11 (`docs/adr/0005-kind-semantics-and-accounting-chain.md`): each
-assertion kind declares retention (`setting`/`chain`), erasure
-(`erasable`/`permanent`), and enumeration (`listable`/`point-only`); a new
-`chain.counter` kind gives accounting the ledger's tamper-evidence on the
-substrate. Solves the deletion-semantics and enumeration gaps the
-croft-relay-admit integration surfaced (its usage moves off `kv.counter` on a
-pin bump once this lands). **Needs the owner's acceptance before implementation.**
+Scoped + owner-reviewed 2026-08-11
+(`docs/adr/0005-kind-semantics-and-accounting-chain.md`): **five** declared
+axes per kind — retention, erasure, enumeration, **hashing (posture +
+algorithm; the BLAKE3/SHA-256 ecosystem split stated per kind)**, and
+**sizing (body ceilings + growth posture; nothing assumed infinite)**.
+`chain.counter` brings the ledger's tamper-evidence to the substrate with
+**checkpoint/compaction under the ack-before-shred rule** (balance-forward,
+per the statements pattern). Agreed calls: `kv.flag` erasable+listable;
+`kv.counter` REMOVED when the chain lands (no deprecated 2am traps).
+Implementation order is in the ADR; croft-relay-admit's usage moves over on
+a pin bump as step 5.
 
 
 ## 1. Redeploy the VPS to v0.5.6 — blocks `du` and any post-v0.4.0 server change  ⟵ biggest
