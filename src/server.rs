@@ -1578,6 +1578,20 @@ fn op_put_assertion(
 
     let fold = kind_fold(kind, subkey, &record.body)?;
 
+    // Body ceiling (ADR 0005, the sizing axis): every kind declares a
+    // body-byte ceiling; a body above it is refused at the boundary with the
+    // limit quoted. An independent bound from the kind's count guards (e.g.
+    // policy's MAX_READERS) — a reader set can be valid by count and oversized
+    // by bytes. kind_fold above already refused unknown kinds, so the spec
+    // lookup succeeds for every kind that reaches here.
+    if let Some(spec) = crate::kind_spec::kind_spec(kind) {
+        let bytes = serde_json::to_vec(&record.body).map_or(usize::MAX, |v| v.len());
+        let ceiling = spec.sizing.body_ceiling;
+        if bytes > ceiling {
+            return Err(ServerError::BodyAboveCeiling { kind: kind.to_owned(), bytes, ceiling });
+        }
+    }
+
     // Kind-specific set-time enforcement: the ceiling dial cannot assert
     // above the provider's effective bound (user ruling: provider limits
     // supersede). The refusal quotes the real bound so the customer can act.
@@ -2151,6 +2165,18 @@ pub enum ServerError {
         /// The effective provider bound (`min(store_ceiling, did_cap)`).
         bound: u64,
     },
+    /// An assertion body exceeded the kind's declared body ceiling (ADR 0005,
+    /// the sizing axis). Refused at the write boundary with the limit quoted —
+    /// the ceiling-dial refusal pattern, generalized to every kind.
+    #[error("assertion refused: {kind} body is {bytes} bytes, over the {ceiling}-byte ceiling")]
+    BodyAboveCeiling {
+        /// The kind whose ceiling was exceeded.
+        kind: String,
+        /// The serialized body size that was refused.
+        bytes: usize,
+        /// The kind's declared body ceiling.
+        ceiling: usize,
+    },
     /// A billable write would take the period's postage past the customer's
     /// asserted spend ceiling — refused BEFORE serving, with the quote
     /// (E89: throttle/defer, never mint debt). Owner egress is exempt
@@ -2194,6 +2220,7 @@ impl IntoResponse for ServerError {
             | ServerError::BadCid(_)
             | ServerError::BadAssertion(_)
             | ServerError::AssertionAboveBound { .. }
+            | ServerError::BodyAboveCeiling { .. }
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
             ServerError::DidKeyMismatch
             | ServerError::Forbidden

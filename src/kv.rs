@@ -21,10 +21,39 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kind_spec::{
+    Authorship, Enumeration, Erasure, Growth, HashAlgorithm, HashPosture, Hashing, KindSpec,
+    Retention, Sizing, SMALL_BODY_CEILING_BYTES,
+};
+
 /// The flag kind: a per-subkey boolean.
 pub const FLAG_KIND: &str = "kv.flag";
 /// The counter kind: a per-subkey monotone-by-`seq` total.
 pub const COUNTER_KIND: &str = "kv.counter";
+
+/// The shared six-axis point for the generic kv kinds (ADR 0005, §5a): a tenant
+/// service's latest-wins per-subkey state (`Setting`), truly removable
+/// (`Erasable` — member removal leaves no row, A2/B1), owner-listable
+/// (`Listable` — the consumer's `keys()`, A2/B1), fold-bound over SHA-256, small
+/// fixed-shape body.
+const fn kv_spec(kind: &'static str) -> KindSpec {
+    KindSpec {
+        kind,
+        retention: Retention::Setting,
+        authorship: Authorship::OwnerSigned,
+        erasure: Erasure::Erasable,
+        enumeration: Enumeration::Listable,
+        hashing: Hashing { posture: HashPosture::FoldBound, algorithm: HashAlgorithm::Sha256 },
+        sizing: Sizing { body_ceiling: SMALL_BODY_CEILING_BYTES, growth: Growth::Bounded },
+    }
+}
+
+/// The `kv.flag` kind's six-axis declaration.
+pub const FLAG_SPEC: KindSpec = kv_spec(FLAG_KIND);
+
+/// The `kv.counter` kind's six-axis declaration. (Removed in A5, superseded by
+/// `chain.counter`; classified here for completeness while it exists.)
+pub const COUNTER_SPEC: KindSpec = kv_spec(COUNTER_KIND);
 
 /// Longest accepted subkey. Consumers use digests (64 hex) or short labels;
 /// 256 is a generous ceiling that still refuses the absurd.

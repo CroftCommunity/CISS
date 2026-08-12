@@ -37,6 +37,7 @@ pub mod grace;
 pub mod identifiers;
 pub mod identity;
 pub mod item;
+pub mod kind_spec;
 pub mod kv;
 pub mod ledger;
 pub mod manifest;
