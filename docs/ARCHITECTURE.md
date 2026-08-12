@@ -73,19 +73,34 @@ Policy is set on a dedicated surface (`PUT/GET /{did}/policy` and
 (`id:` owner self-signs; `did:` owner authorizes via a service-auth JWT that CISS
 provider-attests). `listBlobs` filters the same way — hidden cids are omitted.
 
-`GET /{did}/meter` sums the ledger (upload/download bytes, running total,
-postage cents). The running total is recomputed from the ledger, not cached — the
-ledger is the source of truth.
+`GET /{did}/meter` reports the ledger totals (upload/download bytes, running
+total, postage cents, and `drawdown_download_bytes` — the separable "drain"
+line: bytes downloaded while the account was in drawdown, fully counted in
+`download_bytes` too, surfaced so statement-time billing judgment has a
+figure to act on). Totals are served from an O(1) per-DID cache maintained
+atomically with each receipt (invariant B5); the receipt ledger stays the
+source of truth — the cache backfills from it and must always equal a full
+scan.
+
+Every receipt core also carries the **account mode in effect at transfer
+time** (`account_mode`, signed into the content hash), so a transfer's
+accounting class — today `active`/`drawdown`, the seam for future classes
+like service/bot/staff — is an attested fact, not a mutable server-side
+annotation.
 
 ### Receipt modes (Unilateral vs Bilateral)
 
 A receipt is two-mode: **Unilateral** (provider-signed, our-side measurement) or
-**Bilateral** (co-signed by both parties). The raw S3/atproto boundary has no
-in-band channel for the customer to counter-sign, so v0 issues **Unilateral**
-receipts. A policy that selects Bilateral at that boundary is a hard
-`BilateralUnsupported` error — **never a silent downgrade**. Bilateral is the
-co-attested form the deferred capital layer will require; keeping the mode in the
-receipt from the start makes that forward-compatible.
+**Bilateral** (co-signed by both parties). Unilateral is the default; the
+customer opts into Bilateral with the `dial.receipt-mode` assertion (D4), after
+which every metered transfer yields a provider-signed **partial** awaiting the
+customer's countersignature — `POST /{did}/receipt/{hash}/countersign` completes
+it into a doubly-signed fact verifiable offline under the two keys published in
+the well-known `did.json` (`#receipts` + the customer's own). The walkaway case
+is tolerated by design: an uncountersigned partial stays a valid our-side
+measurement. Bilateral is the co-attested form the deferred capital layer will
+require. (Historical: Bilateral was a hard `BilateralUnsupported` 501 until the
+D4 dial unstubbed it — a loud seam, never a silent downgrade.)
 
 ## 3. Content addressing and the CIDv1 bridge
 

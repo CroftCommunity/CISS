@@ -144,6 +144,49 @@ decision *wrong*.
 `exp` (`src/server.rs:828`), which atproto imposes because JWTs carry absolute expiry. Nothing else
 in the server's correctness path reads a clock.
 
+#### What the design already says, and why retention still fits
+
+Searched before designing (2026-08-11). **There is no seconds-since-epoch mechanism anywhere in the
+corpus, and that is deliberate.** Every monotonic counter that exists counts *events*, not time:
+
+| mechanism | what it counts | where |
+|---|---|---|
+| per-client `lamport` | facts authored by that client | Drystone Part 2 §4.5.1 |
+| `seq` (manifest / assertion / kv) | writes to that slot | CISS `manifest.rs`, `assertion.rs` |
+| `kv.counter` | owner-signed increments | CISS `kv.rs` |
+
+Part 2 §4.5.1 is explicit: *"the logical clock is per client and **strictly logical, never a
+wall-clock** … a wall-clock is never consulted because it is an **uncorroborable assertion** that
+could not order what must converge."* Part 1 §2.0.1 states the principle — *time is not a fact*.
+
+**So a logical clock cannot serve retention**, because retention is a claim about **duration** and a
+Lamport counter only supplies **order**. No amount of event-counting yields "14 days."
+
+**T7 is what makes this tractable, and its wording is narrower than a blanket ban:**
+
+> **T7** — Not require a wall-clock **for any authority-bearing decision** (§10.3, grounding Part 1 §2.0.1)
+
+The rule is about *authority*, not about ever reading a clock. Retention splits cleanly along that
+line:
+
+| | what it is | corroborable? | T7 |
+|---|---|---|---|
+| **the policy** — `max_age_days = 14` | an owner-**signed** assertion, `seq`-monotonic | yes — it is a signed fact | bears the authority |
+| **the measurement** — "this object is now 15 days old" | CISS's own local elapsed count | no, and it never needs to be | bears **no** authority |
+
+**The signature carries the authority; the counter only executes a policy that was authorized
+without it.** Nothing converges, nothing is ordered, no fact is attributed, no quorum is counted,
+and the count is never compared against another node's.
+
+**The constraint this places on the implementation, and it is the load-bearing one:** the elapsed
+counter **must never become a fact.** Never signed, never written into the fold, never carried on the
+wire, never compared across nodes. The moment a retention timestamp is signed into a fact, it stops
+being a local operational measurement and becomes exactly the uncorroborable assertion §4.5.1
+excludes. Keep it in server-local state (the `meta` table, not a manifest or an assertion body).
+
+Recorded because a later reader seeing "CISS reads a clock for retention" would reasonably suspect a
+T7 violation, and the answer is not obvious without this split.
+
 #### Prefer a monotonic day counter over a wall-clock comparison
 
 Two formulations, and the second is safer:
@@ -247,6 +290,11 @@ assertions, commit the green state before mutating.
 
 ### Phase 0 — Discovery (blocking)
 
+- [ ] **D0: Correct the README so it stops asserting more than the boundary does.** Not discovery —
+      it is here because it is independent of everything else, costs an hour, and is the specific
+      inaccuracy that led us to plan against machinery that was not running. Mark the library-only
+      layer as such in the architecture diagram.
+
 - [x] **D1: Can an object be PUT and never manifested?** **ANSWERED 2026-08-11: yes, and it is the
       ordinary case.** `op_put_object` (`src/server.rs:1030`) never touches the manifest; `op_du`
       (`:1399`) reads receipts. Corroborated by `meer-queue/src/bin/d2_ciss_put.rs`. **A is not safe
@@ -318,6 +366,13 @@ the new reclamation path and its authority argument; note the retention dial in 
 
 ## Documentation impact
 
+- **`README.md` — the architecture diagram overstates what the service does.** It lists
+  *"statements · audit · seal · grace"* as part of the running system and calls the E0–E9 core
+  *"proven"*. All four are **library-only with zero callers**
+  (`docs/notes/2026-08-11-reachability-audit.md`). "Proven" is true of the library; the diagram
+  invites the false next clause. **This is the smallest and most urgent item in this plan** — it
+  costs an hour, it is the thing that misled us, and it does not depend on any other phase.
+  **Do it first, in Phase 0.**
 - `docs/SECURITY-POSTURE.md` — reclamation is a new state transition; its authority (B1/B3 via the
   manifest, `seq`-monotonic assertion for the dial) belongs beside the existing invariants. Phase 4.
 - `docs/` API surface — the new assertion kind. Phase 1.

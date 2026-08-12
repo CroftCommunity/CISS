@@ -466,3 +466,20 @@ Deferred, recorded: Model-C (did:) dial submission via the CLI; the
 manifest-on-substrate migration (did:-plane sync); rent inside the server
 ceiling (statement-scheduler SEAM); the monotonic period-gate for drawdown
 re-open (in reserve); auto-countersign batching in the sync client.
+
+Deferred additions from the 2026-08-11 pricing review (legibility
+conveniences, not protections): tariff snapshot at `dial.period` accept so
+the in-period rate is a fixed, visible number (cents ceiling then exact in
+both denominations within a period); a dual-denomination usage view
+(`du` vs `du -h`) translating ceiling/spent/remaining between cents and
+bytes at the period rate. Ruled out in the same review: forward price
+commitments of any kind (e.g. put-time egress price locks) — a promise the
+provider cannot underwrite. The exit right is the only guarantee CISS
+attempts: no future price is promised; instead the customer can always
+invoke drawdown and take their data out, predicated on the big decision of
+closing the books. Ruled in the same review: drawdown egress stays METERED
+at the going rate; whether it bills in full, prorated, or at a special rate
+is a human utility judgment at statement time (automatic free exit invites
+freeze-a-large-account-as-fileshare abuse). Scaffolding built for that
+judgment: receipts carry the account-mode in effect at transfer time, so
+drawdown-drain egress is separable on the record.

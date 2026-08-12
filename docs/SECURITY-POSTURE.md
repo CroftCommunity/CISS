@@ -253,6 +253,22 @@ The client cost twin honors the same rule from its side — its ceiling defers
 *uploads* whole and is structurally absent from the restore/hydrate paths,
 guarded by a regression test that restores under an exhausted ceiling.
 
+*Design principle behind B6 (ruled 2026-08-11): CISS makes no forward price
+commitments — a put-time promise about future egress or rent rates is a
+liability the provider cannot underwrite, so it is ruled out entirely. The
+only guarantee attempted is the exit right: prices float freely and visibly,
+and the customer's protection is that they can always close the books
+(drawdown) and take their data out. Drawdown egress is always METERED at the
+going rate; whether it is billed in full, prorated, or at a special rate is
+a human utility judgment made at statement time — never an automatic
+exemption, because automatic free exit invites the abuse of freezing a
+large account to use it as an unmetered fileshare. The system's job is
+scaffolding for that judgment: egress that occurs while the account is in
+drawdown is tagged as such on its receipts, so a statement can separate
+"drawdown drain" from ordinary traffic and a human can adjust it. (The ADR
+0004 reserve shape — unmetered drawdown behind a one-way commitment —
+remains in reserve if judgment-at-statement-time proves insufficient.)*
+
 ## 8. Cryptographic posture
 
 - **Primitives:** Ed25519 signatures, SHA-256 fingerprints. Deterministic key
@@ -362,7 +378,7 @@ inside the hardened sandbox (§11).
 | B2 | unambiguous Merkle + no dup cids | `merkle_root` / `has_duplicate_cids` |
 | B3 | no manifest rollback | `op_put_manifest` (seq) |
 | B4/B5 | receipts tamper-evident; cache = ledger | `receipts` / `persist::running_totals` |
-| B6 | billing state never gates self-egress (exit-exempt) | server: spend/drawdown gates in `op_put_object`/`op_put_manifest` only — no read op consults billing state; client twin: `ciss-sync::backup::push_tree` (ceiling on push only) |
+| B6 | billing state never gates self-egress (exit-exempt) | server: spend/drawdown gates in `op_put_object`/`op_put_manifest` only — no read op consults billing state; client twin: `ciss-sync::backup::push_tree` (ceiling on push only); legibility scaffolding: `ReceiptCore.account_mode` (signed) + the `drawdown_download_bytes` drain line on `GET /meter` (B5-cached, scan-agreed) |
 | D1–D4 | assertions bound whole; monotonic seq (typed 409); Model A/C only; every accept acknowledged | `assertion.rs` / `op_put_assertion` / `save_assertion` |
 | D5/D6 | dials fail closed toward the customer; provider bounds supersede (`min()`) | `persist::{at_rest_dial,spend_dial,account_mode,receipt_mode_dial}` / `provider_at_rest_bound` |
 | K1–K4 | strict verify, domain sep, full DID, zeroize | `crypto` / `identity` / `manifest` |

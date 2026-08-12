@@ -95,10 +95,28 @@ pub const ACCOUNT_MODE_DIAL_KIND: &str = "dial.account-mode";
 pub const ACCOUNT_MODE_DIAL_SPEC: KindSpec = dial_spec(ACCOUNT_MODE_DIAL_KIND);
 
 /// The two account modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// This enum is the seam for future **accounting classes** beyond the
+/// customer lifecycle — e.g. `Service`, `Bot`, or `Staff` lanes with their
+/// own gate decisions, rates, and meter lines. Each transfer receipt
+/// carries the mode in effect (signed into the core), and the totals cache
+/// keeps per-mode counters separable, so adding a class is: a variant
+/// here, a fold token, a gate decision, and a meter line — the same
+/// three-layer pattern drawdown uses (signed tag → separable counter →
+/// statement-time billing judgment).
+///
+/// Authorization boundary for new variants: a **customer-asserted** mode
+/// (Model A, like `Drawdown`) may only ever RESTRICT the asserter. Any
+/// mode that confers favorable billing (a staff rate, a comped service
+/// lane) must be **provider-attested** (Model C) — nobody signs themselves
+/// into a privileged class; the grant itself is a seq'd, acked record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountMode {
-    /// Normal operation.
+    /// Normal operation. The `Default` — receipts written before the
+    /// account-mode tag existed deserialize as `Active` (they all predate
+    /// drawdown).
+    #[default]
     Active,
     /// Books closed to new writes; egress served and metered.
     Drawdown,
