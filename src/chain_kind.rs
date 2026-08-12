@@ -276,6 +276,32 @@ mod tests {
     }
 
     #[test]
+    fn entry_hash_binds_every_identity_field() {
+        // The baseline entry's hash, and a hash with exactly one field changed.
+        let base = entry_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &body(50, 150, "prevhash"));
+        let vary = |h: String| assert_ne!(h, base, "a changed field must change the hash");
+        vary(entry_hash("did:y", CHAIN_COUNTER_KIND, Some("acct"), 2, &body(50, 150, "prevhash")));
+        vary(entry_hash("did:x", "other.kind", Some("acct"), 2, &body(50, 150, "prevhash")));
+        vary(entry_hash("did:x", CHAIN_COUNTER_KIND, Some("other"), 2, &body(50, 150, "prevhash")));
+        vary(entry_hash("did:x", CHAIN_COUNTER_KIND, None, 2, &body(50, 150, "prevhash")));
+        vary(entry_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 3, &body(50, 150, "prevhash")));
+        vary(entry_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &body(51, 150, "prevhash")));
+        vary(entry_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &body(50, 151, "prevhash")));
+        vary(entry_hash("did:x", CHAIN_COUNTER_KIND, Some("acct"), 2, &body(50, 150, "other")));
+        // It is a 64-char hex SHA-256 digest.
+        assert_eq!(base.len(), 64);
+        assert!(base.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn the_fold_binds_every_body_field() {
+        let base = chain_counter_body_fold(&body(50, 150, "prev"));
+        assert_ne!(base, chain_counter_body_fold(&body(51, 150, "prev")), "delta is bound");
+        assert_ne!(base, chain_counter_body_fold(&body(50, 151, "prev")), "total is bound");
+        assert_ne!(base, chain_counter_body_fold(&body(50, 150, "other")), "prev link is bound");
+    }
+
+    #[test]
     fn recompute_walks_the_whole_chain_and_catches_tampering() {
         let mk = |seq, delta, total, prev: &str| ChainEntry {
             did: "did:x".to_owned(),
