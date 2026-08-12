@@ -5,6 +5,13 @@ it fronts: `ciss-sync`, `ciss-iroh`). The server has its own changelog at the
 repo root. Versions move in lockstep with the server; the Homebrew tap
 (`croftcommunity/tap/ciss-ctl`) tracks tagged releases.
 
+## [Unreleased]
+
+### Added
+- `Meter` (from `GET /{did}/meter`) now carries `drawdown_download_bytes` —
+  the separable drawdown "drain" line (fully counted in `download_bytes`
+  too; see the server changelog's drawdown-legibility entry).
+
 ## [0.7.0] — 2026-08-09
 
 Everything since the ladder release, in two waves.

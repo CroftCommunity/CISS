@@ -378,7 +378,7 @@ inside the hardened sandbox (§11).
 | B2 | unambiguous Merkle + no dup cids | `merkle_root` / `has_duplicate_cids` |
 | B3 | no manifest rollback | `op_put_manifest` (seq) |
 | B4/B5 | receipts tamper-evident; cache = ledger | `receipts` / `persist::running_totals` |
-| B6 | billing state never gates self-egress (exit-exempt) | server: spend/drawdown gates in `op_put_object`/`op_put_manifest` only — no read op consults billing state; client twin: `ciss-sync::backup::push_tree` (ceiling on push only) |
+| B6 | billing state never gates self-egress (exit-exempt) | server: spend/drawdown gates in `op_put_object`/`op_put_manifest` only — no read op consults billing state; client twin: `ciss-sync::backup::push_tree` (ceiling on push only); legibility scaffolding: `ReceiptCore.account_mode` (signed) + the `drawdown_download_bytes` drain line on `GET /meter` (B5-cached, scan-agreed) |
 | D1–D4 | assertions bound whole; monotonic seq (typed 409); Model A/C only; every accept acknowledged | `assertion.rs` / `op_put_assertion` / `save_assertion` |
 | D5/D6 | dials fail closed toward the customer; provider bounds supersede (`min()`) | `persist::{at_rest_dial,spend_dial,account_mode,receipt_mode_dial}` / `provider_at_rest_bound` |
 | K1–K4 | strict verify, domain sep, full DID, zeroize | `crypto` / `identity` / `manifest` |

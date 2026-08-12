@@ -73,9 +73,20 @@ Policy is set on a dedicated surface (`PUT/GET /{did}/policy` and
 (`id:` owner self-signs; `did:` owner authorizes via a service-auth JWT that CISS
 provider-attests). `listBlobs` filters the same way — hidden cids are omitted.
 
-`GET /{did}/meter` sums the ledger (upload/download bytes, running total,
-postage cents). The running total is recomputed from the ledger, not cached — the
-ledger is the source of truth.
+`GET /{did}/meter` reports the ledger totals (upload/download bytes, running
+total, postage cents, and `drawdown_download_bytes` — the separable "drain"
+line: bytes downloaded while the account was in drawdown, fully counted in
+`download_bytes` too, surfaced so statement-time billing judgment has a
+figure to act on). Totals are served from an O(1) per-DID cache maintained
+atomically with each receipt (invariant B5); the receipt ledger stays the
+source of truth — the cache backfills from it and must always equal a full
+scan.
+
+Every receipt core also carries the **account mode in effect at transfer
+time** (`account_mode`, signed into the content hash), so a transfer's
+accounting class — today `active`/`drawdown`, the seam for future classes
+like service/bot/staff — is an attested fact, not a mutable server-side
+annotation.
 
 ### Receipt modes (Unilateral vs Bilateral)
 

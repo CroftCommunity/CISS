@@ -143,7 +143,7 @@ curl "http://127.0.0.1:8080/xrpc/com.atproto.sync.listBlobs?did=did:plc:me"     
 | `GET` | `/{did}/objects/{cid}` | **Public by default; gateable** (a denied read 404s; authenticates an `id:` session). Return the exact bytes (re-verified against the CID); metered (**download** receipt). |
 | `PUT` | `/{did}/manifest` | Store the customer's signed manifest (header `x-croft-pubkey`; the DID must be the key's fingerprint). The rent base. |
 | `GET` | `/{did}/manifest` | The stored signed manifest. |
-| `GET` | `/{did}/meter` | Metering summary: `{receipt_count, upload_bytes, download_bytes, running_total_bytes, postage_cents}`. |
+| `GET` | `/{did}/meter` | Metering summary: `{receipt_count, upload_bytes, download_bytes, running_total_bytes, postage_cents, drawdown_download_bytes}` (the last is the separable drawdown "drain" line — also counted in `download_bytes`). |
 
 DELETE / LIST / HEAD / multipart are a `SEAM:` behind the fallback (`501`), not in v0.
 

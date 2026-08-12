@@ -13,6 +13,20 @@ GitHub release notes).
 ## [Unreleased]
 
 ### Added
+- **Drawdown legibility — the signed account-mode tag + the drain meter
+  line** (PR #36, per the 2026-08-11 exit-pricing ruling). CISS makes no
+  forward price commitments; the exit right is the only guarantee, and
+  drawdown egress stays fully **metered** — whether it bills in full,
+  prorated, or at a special rate is a human utility judgment at statement
+  time (automatic free exit invites freezing a large account as an
+  unmetered fileshare). The scaffolding that judgment needs:
+  `ReceiptCore.account_mode` (the mode in effect at transfer time, signed
+  into the content hash — an attested fact, and the seam for future
+  accounting classes like service/bot/staff), `drawdown_download_bytes`
+  through the B5 totals cache (append + backfill, cache-vs-scan guarded),
+  and the drain line surfaced on `GET /{did}/meter`. `grace.rs` is the
+  existing co-signed machinery a human credits against it. POSTURE B6
+  records the principle. Workflow guard: `tests/flow_drawdown_meter.rs`.
 - **Generic KV kinds on the self-assertion substrate** (`src/kv.rs`):
   `kv.flag` (a per-subkey boolean) and `kv.counter` (a per-subkey total,
   ordered by the substrate's strictly-monotonic `seq`). Both require a
