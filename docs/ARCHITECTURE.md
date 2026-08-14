@@ -213,6 +213,51 @@ layout:
 Blob *bytes* never enter SQLite — they stay in the Layer-1 backend, keyed
 `(DID, CID)`.
 
+### 5.1 Comparison: the reference-PDS storage split
+
+The official atproto reference PDS (TypeScript `@atproto/pds`) in SQLite mode
+makes the same database/blob split CISS makes, and the correspondence is worth
+stating precisely because the dividing line is **records vs blobs, not
+structured vs content-addressed**: the reference PDS stores repo *record blocks*
+(MST nodes, commits, records — CBOR bytes, themselves CID-addressed) as rows
+*inside* the per-actor SQLite, while blob (media) bytes never enter any
+database. Content addressing alone does not decide where bytes live.
+
+| | Reference PDS (SQLite mode) | rsky-pds | CISS |
+|---|---|---|---|
+| Structured / canonical state | per-actor `actors/{sha256(did)[0..2]}/{did}/store.sqlite` + service DBs (`account.sqlite`, `sequencer.sqlite`, `did_cache.sqlite`) | per-actor SQLite | `meter.sqlite` (per-DID rows, one file — v0 single-writer, §5) |
+| Repo record blocks (CID-addressed CBOR) | rows **in** the actor SQLite (`repo_block`, `record`, `repo_root` tables) | in SQLite | n/a — CISS has no repos/records |
+| Blob bytes | `DiskBlobStore` `{location}/{did}/{cid}` with tmp staging (random-keyed) + a quarantine tree; or `S3BlobStore` (`@atproto/aws`) | filesystem `blocks/{did}/{cid}` | `FsBlobStore` `{root}/blocks/{did}/{cid}` + `{root}/tmp/{did}/{cid}` (mirrors rsky-pds) |
+| Blob metadata | `blob` table (cid, mimeType, size, tempKey, createdAt, takedownRef) + `record_blob` for record↔blob refs | in SQLite | derived from upload **receipts** in the ledger (`listBlobs`, §3) |
+| Blob-store abstraction | `BlobStore` interface (disk / S3) | — | `BlobStore` trait (`Fs` / `Memory`), dumb Layer 1, re-verified by Layer 2 |
+
+Reference-PDS specifics verified against `bluesky-social/atproto` `main`
+(2026-08-11): `packages/pds/src/actor-store/actor-store.ts` (`getLocation`:
+actor dir sharded by the first two hex chars of `sha256(did)`, db file
+`store.sqlite`), `packages/pds/src/config/config.ts` (service-DB filenames
+under `dataDirectory`), `packages/pds/src/disk-blobstore.ts` (blob/tmp/
+quarantine path construction), `packages/pds/src/actor-store/db/schema/`
+(the seven actor tables incl. `repo_block`, `blob`, `record_blob`), and
+`packages/aws/src/s3.ts` (`S3BlobStore`).
+
+Two deliberate divergences, both simplifications CISS's scope permits:
+
+- **No records means a cleaner line.** With no repo layer, CISS's split
+  degenerates to "everything structured in `meter.sqlite`, all content bytes
+  under `blocks/`" — the reference PDS's subtlety (CID-addressed bytes on both
+  sides of the line) does not arise here.
+- **Blob metadata is not a table.** Where the reference PDS maintains a `blob`
+  table as its blob index, CISS derives the blob index from the signed upload
+  receipts already in the ledger (§3, `listBlobs`). The metering ledger *is*
+  the blob metadata — one authoritative surface instead of a table that could
+  drift from it.
+
+What is mirrored on purpose: the per-actor SQLite orientation (Phase-0
+discovery, above), the `blocks/{did}/{cid}` on-disk layout (byte-compatible
+with rsky-pds's), and the swappable blob-store seam (the reference PDS's
+disk/S3 choice is the same seam as `Blobs::Fs`/`Memory`; an S3-shaped backend
+would attach at the `BlobStore` trait, §7 E84).
+
 ## 5a. The storage model: six declared axes
 
 Everything CISS stores is one record family sitting at a declared point in a
