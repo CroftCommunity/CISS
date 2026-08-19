@@ -88,7 +88,7 @@ not a fix.
 | Surface | CISS | Note |
 |---|---|---|
 | OAuth **authorization server** (`/oauth/*`, `.well-known/oauth-authorization-server`, consent UI) | **n/a** | bsky is the AS — the settled stance |
-| OAuth **resource-server metadata** (`/.well-known/oauth-protected-resource`) + DPoP token verification | ✘ | **the real "no OAuth" gap** — every reference PDS serves this even behind an entryway (`auth-routes.ts:31`). Tracked: ROADMAP_TODO **E101** |
+| OAuth **resource-server metadata** (`/.well-known/oauth-protected-resource`) + DPoP token verification | ◐ | **the real "no OAuth" gap.** The discovery document is **served as of 2026-08-19** (owner-directed; RFC 9728 `resource` + `authorization_servers: ["https://bsky.social"]`, guarded by `flow_atproto_identity::ciss_serves_oauth_protected_resource_metadata`); accepting DPoP-bound tokens remains parked — ROADMAP_TODO **E101** |
 | Service proxying / pipethrough (`atproto-proxy` header → appview, service-auth minted per request) | **n/a** | CISS is a terminal resource server |
 | `/.well-known/did.json` (did:web) | ✔ | CISS serves its own service identity — the reference PDS does this differently (did:plc for accounts; `atproto-did` for handle verification) |
 | Health probe | ✔ | `/healthz`, deliberately outside the data plane's timeout/concurrency gates; reference PDS: `/xrpc/_health` |

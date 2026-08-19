@@ -35,7 +35,7 @@ subsystems — added below the original rows.
 | PDS capability | What it is | CISS today | Needed under "piggyback bsky"? |
 |---|---|---|---|
 | **OAuth authorization server** | `/oauth/{authorize,token,par,jwks}`, `.well-known/oauth-authorization-server`, sign-in / consent / select / accept / reject UI | none | **No** — bsky is the AS |
-| **OAuth resource-server surface** | `/.well-known/oauth-protected-resource` (RFC 9728: `authorization_servers` pointer) + verifying DPoP-bound OAuth access tokens on XRPC. **Every reference PDS serves this, even behind an entryway** (`packages/pds/src/auth-routes.ts`) — being "not the AS" does not remove the RS obligations | none — CISS accepts service-auth JWTs and `id:` sessions only; no RS metadata, no OAuth-token verification | **Not yet** — but this is the real cost of "no OAuth": atproto-OAuth clients cannot address CISS directly. Needed the day a third-party atproto app (not the broker) should talk to CISS with a user's OAuth grant |
+| **OAuth resource-server surface** | `/.well-known/oauth-protected-resource` (RFC 9728: `authorization_servers` pointer) + verifying DPoP-bound OAuth access tokens on XRPC. **Every reference PDS serves this, even behind an entryway** (`packages/pds/src/auth-routes.ts`) — being "not the AS" does not remove the RS obligations | **pointer half shipped 2026-08-19** (`GET /.well-known/oauth-protected-resource` → `resource` + `authorization_servers: ["https://bsky.social"]`); token acceptance still absent — credentials stay service-auth JWTs + `id:` sessions | **Split.** Discovery: done. DPoP token verification: parked (E101) until a non-broker client pathway is wanted |
 | **Account lifecycle** | createAccount, createSession (app-pw), refresh/deleteSession, app-password CRUD, email confirm / reset | none | **No** — bsky owns accounts |
 | **Identity issuance** | did:plc genesis, signPlcOperation / submitPlcOperation, rotation keys, updateHandle, resolveHandle | consumes DID resolution only (`ciss-resolve`, TTL cache) — and **serves** its own `did:web` document | **No** — bsky issues identity |
 | **Repo (MST / records)** | applyWrites, {create,put,delete,get,list}Record, describeRepo, importRepo, getRepo (CAR), commit signing | none (object store, not a record repo) | **No** — bsky holds the repo |
@@ -94,8 +94,10 @@ the chosen model*, not just under "be a PDS":
 - **OAuth resource-server surface.** "No OAuth" was scoped against the AS role;
   the RS half (`/.well-known/oauth-protected-resource` + DPoP-bound token
   verification) is what would let third-party atproto apps hold a user's grant
-  to CISS without going through the broker. Not needed while the broker is the
-  only client pathway; it is the first thing to build if that assumption changes.
+  to CISS without going through the broker. *Update 2026-08-19 (owner-directed):
+  the discovery document is now served; DPoP token verification remains the
+  parked half (E101), so the pointer advertises an AS whose tokens CISS does
+  not yet accept — deliberate staging, documented on the handler.*
 - **Per-route/per-DID rate limiting.** The byte-path is metered but the request
   path is only globally capped (timeout + in-flight limit); compute per DID is
   neither observed (seam E83) nor limited. This is a hardening gap independent

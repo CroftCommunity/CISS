@@ -167,6 +167,28 @@ async fn ciss_serves_its_own_did_web_document() {
     world.shutdown().await;
 }
 
+#[tokio::test]
+async fn ciss_serves_oauth_protected_resource_metadata() {
+    // RFC 9728: the resource-server discovery document every reference PDS
+    // serves, even behind an entryway. This is the *pointer* half of the
+    // OAuth-RS surface (ROADMAP_TODO E101) — it names the resource and who
+    // issues tokens for it; accepting those tokens (DPoP verification) is
+    // E101's still-parked other half.
+    let world = World::spawn().await;
+    let resp = reqwest::get(world.url("/.well-known/oauth-protected-resource"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "RS metadata must be public");
+    let body = resp.bytes().await.expect("body");
+    let doc: serde_json::Value = serde_json::from_slice(&body).expect("json doc");
+    assert_eq!(doc["resource"], "https://ciss.croft.ing");
+    let servers = doc["authorization_servers"]
+        .as_array()
+        .expect("authorization_servers is an array");
+    assert_eq!(servers, &[serde_json::json!("https://bsky.social")]);
+    world.shutdown().await;
+}
+
 /// The current unix time in seconds (flows that mint custom-`exp` tokens).
 fn common_now() -> u64 {
     std::time::SystemTime::now()

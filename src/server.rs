@@ -463,6 +463,12 @@ impl App {
             // resolve `did:web:ciss.croft.ing` and address it as a service-auth
             // `aud`. Cheap + side-effect-free, so it sits beside `/healthz`.
             .route("/.well-known/did.json", get(well_known_did_handler))
+            // OAuth resource-server discovery (RFC 9728) — the pointer half
+            // of the RS surface (E101): public, cheap, side-effect-free.
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(oauth_protected_resource_handler),
+            )
             .merge(data)
             .fallback(unimplemented_s3)
             .with_state(self.state.clone())
@@ -974,6 +980,37 @@ async fn well_known_did_handler(State(state): State<AppState>) -> Response {
             "type": "CissItemStorage",
             "serviceEndpoint": service_endpoint,
         }],
+    });
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        doc.to_string(),
+    )
+        .into_response()
+}
+
+/// The authorization server whose grants this resource server points clients
+/// at (RFC 9728 `authorization_servers`). Under the piggyback-bsky model
+/// (ADR 0001) bsky is the AS for the accounts CISS serves; CISS issues
+/// nothing. A self-hosted-PDS caller has a different AS — widening this to a
+/// configured list is part of E101's token-verification half, not the pointer.
+const OAUTH_AUTHORIZATION_SERVER: &str = "https://bsky.social";
+
+/// `GET /.well-known/oauth-protected-resource` — RFC 9728 resource-server
+/// discovery: names this resource and who issues tokens for it. The **pointer
+/// half** of the OAuth-RS surface (`ROADMAP_TODO` E101): it makes CISS
+/// discoverable to atproto-OAuth clients; *accepting* their DPoP-bound tokens
+/// is E101's other half and remains parked — until it lands, the only
+/// accepted credentials stay `id:` sessions and service-auth JWTs.
+async fn oauth_protected_resource_handler(State(state): State<AppState>) -> Response {
+    let resource = state
+        .service_did
+        .strip_prefix("did:web:")
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_default();
+    let doc = serde_json::json!({
+        "resource": resource,
+        "authorization_servers": [OAUTH_AUTHORIZATION_SERVER],
     });
     (
         StatusCode::OK,
