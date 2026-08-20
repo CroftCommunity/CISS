@@ -186,7 +186,11 @@ client (`ciss-ctl`), and **`ciss-sync`** is the file-sync engine (content-define
 chunking, dual sha-256/blake3 chunk refs, the canonical DAG-CBOR fs-manifest) —
 pure core, no network; the sync transport rides `ciss-cli`'s `Client`
 (plan: `docs/plans/2026-08-07-file-sync-m1-chunk-and-backup.md`). CISS serves its own did:web document at
-`GET /.well-known/did.json`. Full trust model + invariants: `SECURITY-POSTURE.md`
+`GET /.well-known/did.json`, and OAuth resource-server discovery (RFC 9728) at
+`GET /.well-known/oauth-protected-resource` — the pointer half only: it names
+bsky as the AS, but CISS does not yet accept OAuth tokens (the verification
+half is parked; `docs/notes/pds-capability-gap.md`, ROADMAP_TODO E101). Full
+trust model + invariants: `SECURITY-POSTURE.md`
 §4 (A1–A7); design: `docs/notes/atproto-integration-model.md`; decision: ADR 0001.
 
 ## 5. Persistence

@@ -104,6 +104,24 @@ landed after v0.6.0 (PRs #21–#28).
   (`#assertion-ack`, `#receipts`) — the whole proof chain is public.
 - POSTURE: invariants **B6** (exit-exempt, enforced in code — no read op
   consults billing state) and the **D-series** (§15, D1–D6) + checklist.
+- **`GET /.well-known/oauth-protected-resource`** (RFC 9728) — OAuth
+  resource-server discovery, the pointer half only: names the resource and
+  bsky as its AS. CISS still accepts no OAuth tokens (credentials remain
+  `id:` sessions + service-auth JWTs); the DPoP-verification half stays
+  parked (`docs/notes/pds-capability-gap.md`, E101).
+
+### Fixed
+- **Verify-compat for pre-`account_mode` receipts.** The account-mode tag
+  had landed with parse-compat only (`#[serde(default)]`); canonical
+  serialization includes every present field, so every receipt signed
+  before the tag re-canonicalized to different bytes and read as
+  *tampered* to any honest verifier. Fixed inside the unreleased window:
+  the default (`Active`) is omitted from serialized form
+  (`skip_serializing_if`), so pre-tag receipts keep their signed bytes and
+  drawdown receipts still carry the mode inside the hash. Permanent guard:
+  `receipts::a_receipt_persisted_before_the_account_mode_tag_still_verifies`.
+  Standing rule (also in the design notes): a field added to any *signed*
+  record body ships with `skip_serializing_if` on its default.
 
 ### Changed
 - **Policy records re-homed** onto the substrate as the `policy` kind

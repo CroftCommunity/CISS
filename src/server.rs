@@ -948,8 +948,12 @@ fn default_service_did() -> String {
 /// `GET /.well-known/did.json` — CISS's did:web document, so external atproto
 /// clients can resolve the configured service DID and address it as a service-auth
 /// `aud`. Public, cheap, side-effect-free (sits beside `/healthz`); reflects the
-/// configured `service_did`. `SEAM:` publishing CISS's provider key here (so
-/// receipts are externally verifiable via the DID) is a tracked follow-on.
+/// configured `service_did`. Both provider keys are published (`#assertion-ack`,
+/// `#receipts`) so the proof chain is externally verifiable via the DID.
+/// `SEAM:` the *operational* half of self-description (auth modes, limits,
+/// pricing, contact) is a separate document this doc's `service` entry will
+/// point at — decided shape, `ROADMAP_TODO` E103; `did.json` stays pure
+/// identity+keys.
 async fn well_known_did_handler(State(state): State<AppState>) -> Response {
     let did = state.service_did.as_ref();
     let service_endpoint = did
