@@ -98,6 +98,21 @@ fn row_to_usage(row: &rusqlite::Row) -> rusqlite::Result<UsageRow> {
     })
 }
 
+/// One row of the persisted `compute_usage` surface (E83 stage 1): a caller's
+/// dispatched-request count + total dispatch time for one operation class.
+/// Derived data — a flush of the in-memory ledger, read by `ciss usage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeUsageRow {
+    /// The caller (a DID, an `id:` identity, or the anonymous row).
+    pub caller: String,
+    /// The operation-class label.
+    pub class: String,
+    /// Requests dispatched.
+    pub requests: u64,
+    /// Total dispatch duration, microseconds.
+    pub micros: u64,
+}
+
 /// A per-DID record store backed by SQLite.
 pub struct Store {
     conn: Connection,
@@ -225,6 +240,13 @@ impl Store {
                  json            TEXT NOT NULL,
                  ack             TEXT NOT NULL,
                  PRIMARY KEY (did, kind, subkey, seq)
+             );
+             CREATE TABLE IF NOT EXISTS compute_usage (
+                 caller   TEXT NOT NULL,
+                 class    TEXT NOT NULL,
+                 requests INTEGER NOT NULL DEFAULT 0,
+                 micros   INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (caller, class)
              );
              CREATE INDEX IF NOT EXISTS receipt_did   ON receipt(did);
              CREATE INDEX IF NOT EXISTS statement_did ON statement(did);
@@ -1123,6 +1145,62 @@ impl Store {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+
+    /// Replace the persisted compute-usage snapshot (E83 stage 1) with the
+    /// given rows, atomically. The table is a **derived surface** — a flush of
+    /// the server's in-memory [`crate::compute::ComputeLedger`], not ledger
+    /// material — so replace-all is the honest write shape: the ledger is the
+    /// authority while the server runs, this table is what the on-box
+    /// reporting path (`ciss usage`, a separate read-only open) can see.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] if the transaction fails.
+    pub fn replace_compute_usage(
+        &mut self,
+        rows: &[crate::compute::ComputeRow],
+    ) -> Result<(), PersistError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM compute_usage", [])?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO compute_usage (caller, class, requests, micros)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    row.caller,
+                    row.class,
+                    i64::try_from(row.cell.requests).unwrap_or(i64::MAX),
+                    i64::try_from(row.cell.micros).unwrap_or(i64::MAX),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the persisted compute-usage snapshot (E83 stage 1), ordered by
+    /// caller then class — the `ciss usage` read path.
+    ///
+    /// # Errors
+    /// Returns [`PersistError`] if the query fails.
+    pub fn load_compute_usage(&self) -> Result<Vec<ComputeUsageRow>, PersistError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT caller, class, requests, micros FROM compute_usage
+             ORDER BY caller, class",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ComputeUsageRow {
+                caller: row.get(0)?,
+                class: row.get(1)?,
+                requests: row.get::<_, i64>(2)?.max(0).unsigned_abs(),
+                micros: row.get::<_, i64>(3)?.max(0).unsigned_abs(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Run a `SELECT json ...` query for a DID and deserialize each row.

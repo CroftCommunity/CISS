@@ -30,6 +30,7 @@ pub mod canonical;
 pub mod chain_kind;
 pub mod cidv1;
 pub mod clock;
+pub mod compute;
 pub mod crypto;
 pub mod dial;
 pub mod dials;

@@ -264,6 +264,10 @@ pub(crate) struct AppState {
     admin_only_du: bool,
     /// When chain compaction fires (ADR 0005 / A4). `OnAck` by default.
     compaction: CompactionPolicy,
+    /// Per-caller compute observability (E83 stage 1) — its own small mutex,
+    /// deliberately not the store mutex: bumping a counter must never contend
+    /// with the canonical write path. Flushed to SQLite at checkpoint.
+    compute: Arc<Mutex<crate::compute::ComputeLedger>>,
 }
 
 /// The cooperative metered-storage server.
@@ -352,6 +356,7 @@ impl App {
                 // Compaction defaults to on-ack (the starting case / tests);
                 // production sets Deferred to shred only at a billing marker.
                 compaction: CompactionPolicy::default(),
+                compute: Arc::new(Mutex::new(crate::compute::ComputeLedger::new())),
             },
         }
     }
@@ -483,8 +488,55 @@ impl App {
     ///
     /// Returns [`ServerError`] if the checkpoint fails.
     pub fn checkpoint(&self) -> Result<(), ServerError> {
+        self.flush_compute()?;
         lock_store(&self.state.store).checkpoint_truncate()?;
         Ok(())
+    }
+
+    /// Flush the in-memory compute ledger (E83 stage 1) to the `compute_usage`
+    /// table so the on-box reporting path (`ciss usage`, a separate read-only
+    /// open) sees it. Called by [`App::checkpoint`] and by the serve loop's
+    /// periodic flush task; safe to call at any time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the persistence write fails.
+    pub fn flush_compute(&self) -> Result<(), ServerError> {
+        let snapshot = self
+            .state
+            .compute
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot();
+        lock_store(&self.state.store).replace_compute_usage(&snapshot)?;
+        Ok(())
+    }
+
+    /// Spawn the periodic compute flush (E83 stage 1): every `every`, snapshot
+    /// the in-memory ledger into `compute_usage` so `ciss usage` on a live box
+    /// reads data at most one interval stale. A failed flush is logged and the
+    /// loop continues — telemetry must never take the server down. Runs for
+    /// the process lifetime (the task holds only `Arc`s, not the `App`).
+    #[must_use = "dropping the handle is fine; ignoring it entirely hides a dead flush loop"]
+    pub fn spawn_compute_flush(&self, every: Duration) -> tokio::task::JoinHandle<()> {
+        let compute = Arc::clone(&self.state.compute);
+        let store = Arc::clone(&self.state.store);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            // The first tick fires immediately; skip it — there is nothing to
+            // flush at startup and the empty write would race store init.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let snapshot = compute
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .snapshot();
+                if let Err(err) = lock_store(&store).replace_compute_usage(&snapshot) {
+                    tracing::warn!(%err, "compute flush failed; will retry next tick");
+                }
+            }
+        })
     }
 }
 
@@ -729,6 +781,28 @@ impl Op {
             | Op::CompactChain { .. }
             | Op::CountersignReceipt { .. }
             | Op::Du { .. } => false,
+        }
+    }
+
+    /// The operation-class label the compute ledger buckets this op under
+    /// (E83 stage 1). A fixed, closed set — one label per variant, so the
+    /// per-caller map's inner dimension is bounded by construction.
+    fn class(&self) -> &'static str {
+        match self {
+            Op::PutObject { .. } => "object-write",
+            Op::GetObject { .. } => "object-read",
+            Op::PutManifest { .. } => "manifest-write",
+            Op::GetManifest { .. } => "manifest-read",
+            Op::GetMeter { .. } => "meter-read",
+            Op::ListBlobs { .. } => "list-blobs",
+            Op::PutAssertion { .. } => "assertion-write",
+            Op::GetAssertion { .. } => "assertion-read",
+            Op::DeleteAssertion { .. } => "assertion-delete",
+            Op::ListAssertions { .. } => "assertion-list",
+            Op::GetChain { .. } => "chain-read",
+            Op::CompactChain { .. } => "chain-compact",
+            Op::CountersignReceipt { .. } => "countersign",
+            Op::Du { .. } => "du",
         }
     }
 }
@@ -1133,6 +1207,32 @@ pub(crate) fn dispatch(
     if op.is_heavy() {
         tracing::debug!("heavy op — would enter per-DID compute scope (E83 seam)");
     }
+    // E83 stage 1: attribute this dispatch to its caller. What is timed is
+    // dispatch itself — authz above ran already, and network drain happens in
+    // the handler afterward, so a slow reader inflates nothing here. Denied
+    // requests (the `?`s above) are not yet counted; an auth-fail class is a
+    // later stage-1 increment (design record §5).
+    let class = op.class();
+    let caller = principal
+        .did()
+        .map_or_else(|| crate::compute::ANONYMOUS_CALLER.to_owned(), str::to_owned);
+    let started = std::time::Instant::now();
+    let outcome = dispatch_op(state, principal, op);
+    let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    state
+        .compute
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .record(&caller, class, micros);
+    outcome
+}
+
+/// The op bodies behind the dispatch boundary (timed + attributed above).
+fn dispatch_op(
+    state: &AppState,
+    principal: &Principal,
+    op: Op,
+) -> Result<OpOutcome, ServerError> {
     match op {
         Op::PutObject { did, key, bytes } => op_put_object(state, &did, &key, &bytes),
         Op::GetObject { did, cid } => op_get_object(state, &did, &cid),

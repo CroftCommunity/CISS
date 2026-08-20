@@ -321,10 +321,15 @@ boundary, walk away mid-transfer, double-count an audit, feed malformed input.
 Marked `SEAM:` in code and tracked in `discovery/ROADMAP_TODO`:
 
 - **E83 — per-DID compute observability.** All requests route through
-  `server::dispatch`; `Op::is_heavy()` classifies each op. v0 ops are all cheap
-  (never cgroup-scoped), but the attach point exists so a later wrapper can scope
-  a *heavy* op (CAR export, MST rebuild, audit sampling) into a per-DID cgroup
-  without a handler rewrite.
+  `server::dispatch`; `Op::is_heavy()` classifies each op. **Stage 1 shipped
+  2026-08-19** (`docs/notes/rate-limiting-design.md` §5): every dispatch is
+  timed and attributed per caller × op class into a bounded in-memory ledger
+  (`src/compute.rs`), flushed to the derived `compute_usage` table
+  (periodically + at checkpoint) and surfaced by `ciss usage`. Remaining
+  stage-1 increments: component timers, mutex-hold, poll-time, an auth-fail
+  class. The cgroup-scoping half of the seam is unchanged: v0 ops are all
+  cheap (never cgroup-scoped), and the attach point still awaits a *heavy* op
+  (CAR export, MST rebuild, audit sampling).
 - **E84 — kernel-perf backend.** `FsBlobStore` uses `write` + atomic
   same-filesystem `rename` (temp→permanent). The `BlobStore` trait is the attach
   point for an `io_uring`/`copy_file_range`/reflink backend. **On the production

@@ -89,7 +89,13 @@ a product decision stages 1–2 do not foreclose.
 
 ## 5. Staging
 
-- **Stage 1 — observe (E83, buildable now).** Multi-dimensional counters at
+- **Stage 1 — observe (E83). FIRST INCREMENT SHIPPED 2026-08-19:**
+  dispatch-time counters per caller × op class (`src/compute.rs`, bounded
+  LRS map, anonymous row), flushed to the derived `compute_usage` table
+  (60s + checkpoint), surfaced in `ciss usage`; guards:
+  `compute::tests` + `tests/e83_compute.rs`. Remaining increments below
+  (component timers etc.) are still open. Original scope:
+  Multi-dimensional counters at
   the single dispatch boundary: per DID per op class — count, poll-time,
   component timers, mutex hold, bytes. In memory, bounded map with
   least-recently-seen eviction (derived/rebuildable data — not ledger

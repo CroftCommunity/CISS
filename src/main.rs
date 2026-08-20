@@ -130,6 +130,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is quiet and rotation/retention is journald's job.
     tokio::spawn(cache_stats_heartbeat(resolver_for_heartbeat));
 
+    // E83 stage 1: periodic compute-ledger flush, so `ciss usage` on a live
+    // box reads compute data at most one interval stale (checkpoint also
+    // flushes at graceful shutdown).
+    let _compute_flush = app.spawn_compute_flush(std::time::Duration::from_secs(
+        COMPUTE_FLUSH_INTERVAL_S,
+    ));
+
     let listener = listen(&config.listen).await?;
     tracing::info!(
         provider = %app.provider_id(),
@@ -153,6 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// How often the resolver-cache heartbeat samples cache condition (seconds).
 const CACHE_STATS_INTERVAL_S: u64 = 60;
+
+/// How often the compute ledger flushes to `compute_usage` (seconds) — the
+/// staleness bound on a live box's `ciss usage` compute section (E83 stage 1).
+const COMPUTE_FLUSH_INTERVAL_S: u64 = 60;
 
 /// Periodically log the DID-resolution cache condition at INFO for ongoing
 /// monitoring. Emits only when activity (hits + misses) changed since the last
@@ -240,8 +251,17 @@ fn run_usage(args: &[String]) -> Result<(), String> {
     };
     let partition = partition_bytes(&data_dir);
 
+    // E83 stage 1: the compute section (per caller × class). Under a --did
+    // filter, show that caller only — same self-scoping the byte rows follow.
+    let compute_rows: Vec<ciss::persist::ComputeUsageRow> = store
+        .load_compute_usage()
+        .map_err(|e| format!("load compute usage: {e}"))?
+        .into_iter()
+        .filter(|r| did.as_deref().is_none_or(|d| r.caller == d))
+        .collect();
+
     print!(
-        "{}",
+        "{}{}",
         format_usage_report(
             &data_dir,
             store_ceiling,
@@ -250,9 +270,46 @@ fn run_usage(args: &[String]) -> Result<(), String> {
             partition,
             &rows,
             did.as_deref(),
-        )
+        ),
+        format_compute_section(&compute_rows),
     );
     Ok(())
+}
+
+/// Render the compute-observability section of the usage report (E83 stage 1) —
+/// per caller × operation class, dispatched requests + total dispatch time.
+/// Empty input renders nothing (a store predating the table, or a server that
+/// has not flushed yet). Counters are since server start (in-memory ledger,
+/// flushed periodically + at checkpoint); the table is derived, not billing.
+fn format_compute_section(rows: &[ciss::persist::ComputeUsageRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "  compute (dispatched requests since server start; derived, not billing):\n",
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "    {:<20} {:<16} {} req · {}\n",
+            row.caller,
+            row.class,
+            row.requests,
+            human_micros(row.micros),
+        ));
+    }
+    out
+}
+
+/// Humanize a microsecond total for the usage report (display only).
+#[allow(clippy::cast_precision_loss)] // display only
+fn human_micros(micros: u64) -> String {
+    if micros >= 1_000_000 {
+        format!("{:.1}s", micros as f64 / 1_000_000.0)
+    } else if micros >= 1_000 {
+        format!("{:.1}ms", micros as f64 / 1_000.0)
+    } else {
+        format!("{micros}µs")
+    }
 }
 
 /// A percentage of `whole` (0.0 when `whole` is 0).
@@ -417,8 +474,38 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usage_report, parse_args};
+    use super::{format_compute_section, format_usage_report, parse_args};
     use std::path::PathBuf;
+
+    #[test]
+    fn usage_report_includes_a_compute_section_per_caller_and_class() {
+        let rows = vec![
+            ciss::persist::ComputeUsageRow {
+                caller: "anon".to_owned(),
+                class: "object-read".to_owned(),
+                requests: 9,
+                micros: 120,
+            },
+            ciss::persist::ComputeUsageRow {
+                caller: "id:abc".to_owned(),
+                class: "manifest-write".to_owned(),
+                requests: 3,
+                micros: 4_500,
+            },
+        ];
+        let out = format_compute_section(&rows);
+        assert!(out.contains("compute"), "section is labeled: {out}");
+        assert!(out.contains("id:abc"), "caller shown: {out}");
+        assert!(out.contains("manifest-write"), "class shown: {out}");
+        assert!(out.contains("3 req"), "request count shown: {out}");
+        assert!(out.contains("4.5ms"), "dispatch time humanized: {out}");
+        assert!(out.contains("anon"), "anonymous row shown: {out}");
+    }
+
+    #[test]
+    fn an_empty_compute_table_renders_no_section() {
+        assert_eq!(format_compute_section(&[]), "", "nothing to report");
+    }
 
     #[test]
     fn usage_report_shows_ceiling_percent_and_per_did() {

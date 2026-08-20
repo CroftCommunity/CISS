@@ -109,6 +109,16 @@ landed after v0.6.0 (PRs #21–#28).
   bsky as its AS. CISS still accepts no OAuth tokens (credentials remain
   `id:` sessions + service-auth JWTs); the DPoP-verification half stays
   parked (`docs/notes/pds-capability-gap.md`, E101).
+- **Compute observability, stage 1** (E83; design:
+  `docs/notes/rate-limiting-design.md`). Every dispatched request is timed
+  and attributed per caller × operation class into a bounded in-memory
+  ledger (`src/compute.rs`: LRS-evicted past 1024 callers, anonymous
+  traffic one shared row, monotonic time only), flushed to the derived
+  `compute_usage` table every 60s and at checkpoint, and surfaced as a
+  compute section in `ciss usage` (self-scoped under `--did`). Observation
+  only — no enforcement rides on it; stage 2 (shaping) is gated on this
+  stage's live data. What is timed is dispatch itself: network drain is
+  excluded, so a slow reader inflates nothing.
 
 ### Fixed
 - **Verify-compat for pre-`account_mode` receipts.** The account-mode tag
