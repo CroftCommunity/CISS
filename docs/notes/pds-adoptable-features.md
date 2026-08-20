@@ -116,11 +116,16 @@ client-side; and whether v1 ships direction one only (the unambiguous half).
 
 Filed with full reasoning as ROADMAP_TODO E102; on this list because it is
 the one candidate that is a **standing hardening gap today**, not a
-compat/completeness item. Order: per-DID compute counters at the dispatch
-boundary (seam E83 — the attach point already exists), then limits fed by
-them. The cooperative twist worth discussing: **declared, owner-visible
-limits** (the dials pattern) rather than hidden operator tunables — possibly
-even a dial the owner can set *below* the house limit for their own devices.
+compat/completeness item.
+
+> **Design walked and recorded 2026-08-19 → `rate-limiting-design.md`.**
+> The shape that survived the discussion: multi-dimensional measurement
+> (wall-time conflates CPU / disk / mutex / drain), **shaping before
+> refusal** ("slow is the new refused" — per-DID concurrency caps, egress
+> shaping tied to the meter, WFQ with deliberately unfair system lanes on
+> the accounting-class seam), 429 as backstop only, declared limits via
+> E103, and the get-out-from-behind-Caddy question parked as a recorded
+> open decision. Stage 1 (E83 counters) is unblocked.
 
 ### 5. Blob quarantine — a reversible set-aside tier
 
