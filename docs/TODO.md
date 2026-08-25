@@ -11,7 +11,7 @@ server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
 
 ---
 
-## 0. ADR 0005 IMPLEMENTED — kind semantics + the accounting chain ✅ (2026-08-12)
+## 0. ADR 0005 IMPLEMENTED (DONE) — kind semantics + the accounting chain (2026-08-12)
 
 Built and merged. ADR 0005
 (`docs/adr/0005-kind-semantics-and-accounting-chain.md`) is now code: **six**
@@ -59,7 +59,7 @@ The two instances version independently by design; this item is the public one.
 - This redeploy also picks up **every** post-v0.4.0 server change bundled into the
   release tarball (it's the whole repo), not just `du`.
 
-## 2. Rust toolchain — RESOLVED ✅: pinned to 1.97.1, gated by CI
+## 2. Rust toolchain — RESOLVED: pinned to 1.97.1, gated by CI
 
 The decision was taken the "commit to a pin" way: `rust-toolchain.toml` pins
 **1.97.1** (+ clippy component; CI-PATTERN rule 7 — CI resolves exactly this
