@@ -43,10 +43,10 @@ Do not conflate with **ciss-admit**: the private loopback CISS instance backing
 croft-admit already runs **v0.8.0** (activated 2026-08-25, croft-stack RUNBOOK).
 The two instances version independently by design; this item is the public one.
 
-- **Action:** bump the `ciss` `active_tenants` pin (`binary_version`,
-  `binary_url`, `binary_sha256`) to the **v0.9.0** release asset — the release
-  workflow (`.github/workflows/release.yml`) builds, gates, and checksums it on
-  the tag — then an owner-authorized converge. Deploy shape (DEPLOYMENT.md):
+- **Action:** the `ciss` `active_tenants` pin is **already staged at v0.9.0**
+  on croft-stack `main` (`4e19321`, sha256 verified against a locally-hashed
+  download of the release asset). What remains is only the owner-authorized
+  converge. Deploy shape (DEPLOYMENT.md):
   systemd `ciss.service` → `/opt/ciss/current/ciss --data-dir /var/lib/ciss
   --listen 127.0.0.1:8301`, Caddy `443 → 127.0.0.1:8301`.
 - **Optional (`du` lockdown):** to restrict remote `du` to admins, set
@@ -59,22 +59,18 @@ The two instances version independently by design; this item is the public one.
 - This redeploy also picks up **every** post-v0.4.0 server change bundled into the
   release tarball (it's the whole repo), not just `du`.
 
-## 2. Rust toolchain — pin, or resolve the 2 pedantic lints (1.94 vs 1.97)
+## 2. Rust toolchain — RESOLVED ✅: pinned to 1.97.1, gated by CI
 
-The `brew install` pulled Homebrew **Rust 1.97** as a build dep, which became the
-active `cargo`/`clippy` and surfaces 2 pre-existing pedantic warnings the repo's
-prior **1.94** did not. `ciss-cli` itself is clean on both.
-
-- `src/server.rs` — `map(<f>).unwrap_or(<a>)` on a `Result` (`clippy::map_unwrap_or`).
-  Safe, portable fix: `.map_or(<a>, <f>)`.
-- `crates/ciss-resolve/src/timeout.rs:55` — `Duration::from_secs(3600)`
-  (`clippy::duration_suboptimal_units`). Clippy suggests `Duration::from_hours(1)`
-  — **but `from_hours` is 1.97-only and would break a 1.94 build** (portability
-  regression). Use `#[allow]` + comment, or commit to 1.97.
-- **Decision needed:** add a `rust-toolchain.toml` pinning a version (then fix the
-  lints for it), or keep dual-toolchain support and `#[allow]` the `from_hours`
-  lint. The repo has no CI, so nothing gates this today — it's hygiene under the
-  now-active 1.97.
+The decision was taken the "commit to a pin" way: `rust-toolchain.toml` pins
+**1.97.1** (+ clippy component; CI-PATTERN rule 7 — CI resolves exactly this
+toolchain, so version-skew "green locally, red in CI" cannot happen), and the
+repo now HAS CI: `.github/workflows/ci.yml` gates every PR/push with the full
+workspace test + pedantic clippy (`-D warnings`) run, and `release.yml` re-runs
+the same gate on every tagged commit before packaging. The two pedantic lints
+this item tracked are gone — the suite is pedantic-clean under the pinned
+toolchain (verified green at the v0.9.0 cut). Local caveat stands: on machines
+where Homebrew's rustc precedes `~/.cargo/bin` on PATH the pin does not bind
+local builds — keep the Homebrew toolchain on the same minor.
 
 ## 3. `du` lockdown 403 message (minor clarity)
 

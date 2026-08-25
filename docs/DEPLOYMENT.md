@@ -94,20 +94,35 @@ artifact = "github:CroftCommunity/CISS/releases"; serve_api = false
 ## 3. Packaging & release
 
 CISS ships as a **pinned, checksummed GitHub release binary** (the same pattern
-croft-stack uses for the iroh relay):
+croft-stack uses for the iroh relay). Since v0.9.0 the packaging is a workflow,
+not a ritual: pushing a `vX.Y.Z` tag runs
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), which
 
-1. Build a release binary for the box (`cargo build --release`). The current
-   estate is Debian 13 (trixie, glibc 2.41, x86_64), so the release asset is a
-   stripped **glibc** build. *(A fully-static `x86_64-unknown-linux-musl` build is
-   the portability hardening follow-up; on a single trixie box the glibc build is
-   correct and simplest.)*
-2. Package + checksum: the tarball ships the binary **and the man page** so the
-   operator tooling is deployed with CISS —
-   `tar czf ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz ciss docs/man/ciss.1` — and record
-   its `sha256sum`.
-3. Publish: `gh release create vX.Y.Z -R CroftCommunity/CISS <tarball>`.
-4. Pin it in `croft-stack/ansible/group_vars/all.yml` under the `ciss`
-   `active_tenants` entry: `binary_version`, `binary_url`, `binary_sha256`.
+1. **Gates on the tagged commit**: refuses a tag that does not match the
+   workspace `Cargo.toml` version, then runs the full `cargo test --workspace`
+   + pedantic clippy gate on that exact commit (a tag is not a gate, so the
+   gate runs here too), under the `rust-toolchain.toml`-pinned toolchain.
+2. **Builds + packages**: a stripped **glibc** `cargo build --release` binary
+   for the estate (Debian 13 trixie, glibc 2.41, x86_64; built on
+   ubuntu-latest glibc 2.39, forward-compatible), tarballed **with the man
+   page** — `ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz` containing `ciss` +
+   `docs/man/ciss.1` — so the operator tooling deploys with the service.
+   *(A fully-static `x86_64-unknown-linux-musl` build remains the portability
+   hardening follow-up; on a single trixie box the glibc build is correct and
+   simplest.)*
+3. **Publishes** the tarball and its `.sha256` as the `vX.Y.Z` GitHub release.
+   A `workflow_dispatch` input takes an *existing* tag for re-builds (a tag cut
+   on a commit predating the workflow file never fires the push trigger).
+
+The one manual step left: **pin it** in `croft-stack/ansible/group_vars/all.yml`
+under the `ciss` `active_tenants` entry (`binary_version`, `binary_url`,
+`binary_sha256` — verify the checksum against a locally-hashed download, not
+just the published `.sha256`).
+
+Release flow, cutting a version: roll the `[Unreleased]`/pending entries in
+both changelogs (`CHANGELOG.md`, `crates/ciss-cli/CHANGELOG.md`) into the new
+version heading, bump root + `ciss-cli` `Cargo.toml` in lockstep, land green,
+tag, push the tag.
 
 The `ciss usage` operator report is the same binary (a subcommand, not a separate
 tool), so it is deployed with the service. The croft-stack `tenants` role installs
