@@ -1,0 +1,109 @@
+# Release — the pinned, checksummed glibc binary (docs/DEPLOYMENT.md §3).
+#
+# The §3 steps were manual; this makes them repeatable with the same discipline
+# croft-stack's release workflows landed (release-relay/release-admit): the full
+# gate runs on the SAME commit the artifact is built from, the tag must match the
+# workspace version, and the asset ships with its sha256 alongside.
+#
+# Tag-triggered (vX.Y.Z) with a workflow_dispatch escape hatch that takes an
+# EXISTING tag — needed because a tag cut on a commit that predates this file
+# never fires the push trigger (GitHub reads workflows from the tagged commit).
+#
+# The asset is the §3 layout: ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz containing the
+# stripped `ciss` binary and docs/man/ciss.1 (the operator tooling deploys with
+# the service). Built on ubuntu-latest (glibc 2.39), which the trixie estate
+# (glibc 2.41) runs forward-compatibly; the musl build remains the §3 follow-up.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to (re)build and release"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: resolve tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # The tag must say what the workspace says — a mismatch means the tag
+      # was cut against the wrong commit.
+      - name: verify tag matches workspace version
+        run: |
+          WS=$(grep -m1 '^version' Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          [ "$WS" = "${{ steps.tag.outputs.version }}" ] || {
+            echo "tag says ${{ steps.tag.outputs.version }}, workspace says $WS" >&2; exit 1; }
+
+      # Rule 7 (ci.yml): resolve the toolchain through rustup, which reads
+      # rust-toolchain.toml at the TAGGED commit — the artifact is built by the
+      # toolchain that commit pinned.
+      - name: install pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The same gate ci.yml runs, on the tagged commit — a tag is not a gate,
+      # so the gate runs here too.
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy (pedantic, deny warnings)
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      - name: build release binary
+        run: |
+          cargo build --release -p ciss
+          strip target/release/ciss
+
+      - name: package + checksum (DEPLOYMENT.md §3 layout)
+        id: package
+        run: |
+          STAGE="ciss-v${{ steps.tag.outputs.version }}-x86_64-linux-gnu"
+          mkdir -p /tmp/stage/docs/man
+          cp target/release/ciss /tmp/stage/
+          cp docs/man/ciss.1 /tmp/stage/docs/man/
+          tar -C /tmp/stage -czf "/tmp/$STAGE.tar.gz" ciss docs/man/ciss.1
+          ( cd /tmp && sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256" )
+          cat "/tmp/$STAGE.tar.gz.sha256"
+          echo "tarball=/tmp/$STAGE.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum_file=/tmp/$STAGE.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "checksum=$(cut -d' ' -f1 "/tmp/$STAGE.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "ciss glibc x86_64 binary + man page (DEPLOYMENT.md §3 layout).
+          sha256: \`${{ steps.package.outputs.checksum }}\`
+
+          Consumed by croft-stack's tenants role via an active_tenants pin
+          (binary_version, binary_url, binary_sha256). Full workspace gate ran on
+          this commit in this workflow before packaging." \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.checksum_file }}" || \
+          gh release upload "$TAG" --clobber \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.checksum_file }}"
