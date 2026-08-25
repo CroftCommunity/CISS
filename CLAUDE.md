@@ -1,5 +1,12 @@
 # CISS — agent orientation
 
+## Identity (workspace architecture)
+
+**Scope:** The metered-storage server: owner-manifested chains, kind semantics (ADR 0005), budgets/receipts (ADR 0004), the `Principal` auth seam (`crates/ciss-auth`), `SimClock`.
+**Not this repo:** admission policy (croft-stack); MLS delivery (the meer rides CISS as a custodian-queue mode — DECISIONS.md `CISS/meer-queue`).
+**Provides:** CISS crates + server contract. **Consumes:** atproto service-auth JWTs.
+Card + altitudes: `CroftC/.claude/ARCHITECTURE.md`.
+
 CISS (Croft Item Storage Server) is a cooperative metered-storage server in Rust:
 an S3-compatible object interface + an atproto PDS blob API over one metered
 byte-path. Its core value proposition is a set of **cryptographic integrity
