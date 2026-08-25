@@ -1,5 +1,9 @@
 # CISS — outstanding TODO
 
+> Repo operations / deferred items only. The product/design backlog of record is
+> `discovery/alpha/ROADMAP_TODO.md`; the tracking scheme is `CroftC/.claude/TRACKING.md`.
+> Cross-reference E-numbers where an item here implements a backlog row.
+
 Open items after the `ciss-ctl` client effort (delivered through **v0.5.6**,
 2026-08-06). Full history: `docs/plans/2026-08-06-ciss-ctl-client-cli.md`. The
 client is shipped via Homebrew (`brew install croftcommunity/tap/ciss-ctl`); the
