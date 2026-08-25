@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-06
+- **Tags:** ops, api, quota, admin
 - **Context:** the `ciss-ctl` client wanted a `du` — "how big are the objects I
   stored?" — and, separately, an operator view of usage across DIDs. Sizes are
   already maintained in the ledger (`receipt.bytes`, `did_total.stored_bytes`), so

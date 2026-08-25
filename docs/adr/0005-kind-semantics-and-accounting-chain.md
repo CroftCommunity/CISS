@@ -11,6 +11,7 @@
   `docs/plans/2026-08-11-kind-semantics-implementation.md`. The classification
   and checkpoint design below are the reasoning record; where it reads in the
   future tense ("removed when the chain lands"), that has now happened.
+- **Tags:** storage, accounting, chains, schema
 - Context: the assertion substrate (D1) + the first external-consumer kinds
   (`kv.flag`/`kv.counter`, PR #35) + the deletion-semantics question the
   croft-relay-admit integration surfaced

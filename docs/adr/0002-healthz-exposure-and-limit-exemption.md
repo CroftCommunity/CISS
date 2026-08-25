@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-03
+- **Tags:** ops, monitoring, rate-limit
 - **Context:** raised during Phase 2 (availability hardening), when the request
   timeout + global concurrency limit were added to the data plane but `/healthz`
   was left exempt.

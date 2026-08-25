@@ -3,6 +3,7 @@
 - **Status:** Proposed — **amended 2026-08-04** (see "Amendment" below; §3's
   token-source model was corrected after the Phase-0 probe).
 - **Date:** 2026-08-03
+- **Tags:** auth, access-control, service-jwt, identity
 - **Deciders:** CISS maintainers (Croft)
 - **Supersedes:** the Phase-8 mock-bearer `SEAM:` (`docs/ARCHITECTURE.md` §7 → "Auth")
 

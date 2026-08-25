@@ -2,6 +2,7 @@
 
 - **Status:** **Accepted as amended** (2026-08-09 — built as dials D1–D5; the decisions held: refuse-with-quote shipped at 402, rent enforcement deferred to the statement-scheduler SEAM per the transfer-is-the-threshold ruling, B6 carved out in code, the sliver policy moot in v0 pending runtime rent, the drawdown dial added in review)
 - **Date:** 2026-08-07
+- **Tags:** billing, budgets, receipts, admission
 - **Amendment:** review discussion identified that the dial is the **third
   instance of an existing pattern** — the owner-signed monotonic record
   (manifest/I5, policy record/Z6; DeviceHead is a client-side fourth) — and
