@@ -10,7 +10,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/); one entry per tagged
 release, written at release time as part of the release flow (the entry is the
 GitHub release notes).
 
-## [Unreleased]
+## [0.9.0] — 2026-08-24
+
+Server-only follow-ons to the kind-semantics release: the RFC 9728 discovery
+pointer, stage-1 compute observability, and the receipt verify-compat fix.
+No client changes (`ciss-ctl` bumps in lockstep with no behavior change).
+
+### Added
+- **`GET /.well-known/oauth-protected-resource`** (RFC 9728) — OAuth
+  resource-server discovery, the pointer half only: names the resource and
+  bsky as its AS. CISS still accepts no OAuth tokens (credentials remain
+  `id:` sessions + service-auth JWTs); the DPoP-verification half stays
+  parked (`docs/notes/pds-capability-gap.md`, E101).
+- **Compute observability, stage 1** (E83; design:
+  `docs/notes/rate-limiting-design.md`). Every dispatched request is timed
+  and attributed per caller × operation class into a bounded in-memory
+  ledger (`src/compute.rs`: LRS-evicted past 1024 callers, anonymous
+  traffic one shared row, monotonic time only), flushed to the derived
+  `compute_usage` table every 60s and at checkpoint, and surfaced as a
+  compute section in `ciss usage` (self-scoped under `--did`). Observation
+  only — no enforcement rides on it; stage 2 (shaping) is gated on this
+  stage's live data. What is timed is dispatch itself: network drain is
+  excluded, so a slow reader inflates nothing.
+
+### Fixed
+- **Verify-compat for pre-`account_mode` receipts.** The account-mode tag
+  had landed with parse-compat only (`#[serde(default)]`); canonical
+  serialization includes every present field, so every receipt signed
+  before the tag re-canonicalized to different bytes and read as
+  *tampered* to any honest verifier. The tag shipped in v0.8.0, so a
+  v0.8.0 verifier read every older receipt as tampered; fixed here:
+  the default (`Active`) is omitted from serialized form
+  (`skip_serializing_if`), so pre-tag receipts keep their signed bytes and
+  drawdown receipts still carry the mode inside the hash. Permanent guard:
+  `receipts::a_receipt_persisted_before_the_account_mode_tag_still_verifies`.
+  Standing rule (also in the design notes): a field added to any *signed*
+  record body ships with `skip_serializing_if` on its default.
+
+## [0.8.0] — 2026-08-12
 
 The **kind-semantics release** (ADR 0005): every stored kind now declares its
 point in a six-axis space (`src/kind_spec.rs`), and the accounting substrate
@@ -104,34 +141,6 @@ landed after v0.6.0 (PRs #21–#28).
   (`#assertion-ack`, `#receipts`) — the whole proof chain is public.
 - POSTURE: invariants **B6** (exit-exempt, enforced in code — no read op
   consults billing state) and the **D-series** (§15, D1–D6) + checklist.
-- **`GET /.well-known/oauth-protected-resource`** (RFC 9728) — OAuth
-  resource-server discovery, the pointer half only: names the resource and
-  bsky as its AS. CISS still accepts no OAuth tokens (credentials remain
-  `id:` sessions + service-auth JWTs); the DPoP-verification half stays
-  parked (`docs/notes/pds-capability-gap.md`, E101).
-- **Compute observability, stage 1** (E83; design:
-  `docs/notes/rate-limiting-design.md`). Every dispatched request is timed
-  and attributed per caller × operation class into a bounded in-memory
-  ledger (`src/compute.rs`: LRS-evicted past 1024 callers, anonymous
-  traffic one shared row, monotonic time only), flushed to the derived
-  `compute_usage` table every 60s and at checkpoint, and surfaced as a
-  compute section in `ciss usage` (self-scoped under `--did`). Observation
-  only — no enforcement rides on it; stage 2 (shaping) is gated on this
-  stage's live data. What is timed is dispatch itself: network drain is
-  excluded, so a slow reader inflates nothing.
-
-### Fixed
-- **Verify-compat for pre-`account_mode` receipts.** The account-mode tag
-  had landed with parse-compat only (`#[serde(default)]`); canonical
-  serialization includes every present field, so every receipt signed
-  before the tag re-canonicalized to different bytes and read as
-  *tampered* to any honest verifier. Fixed inside the unreleased window:
-  the default (`Active`) is omitted from serialized form
-  (`skip_serializing_if`), so pre-tag receipts keep their signed bytes and
-  drawdown receipts still carry the mode inside the hash. Permanent guard:
-  `receipts::a_receipt_persisted_before_the_account_mode_tag_still_verifies`.
-  Standing rule (also in the design notes): a field added to any *signed*
-  record body ships with `skip_serializing_if` on its default.
 
 ### Changed
 - **Policy records re-homed** onto the substrate as the `policy` kind

@@ -42,8 +42,10 @@ CISS satisfies `croft-stack/CONTRACT.md` so it drops in with no kit changes:
   timeout + concurrency limits (it does no work and must not be starved), and its
   *public* exposure is controlled at the Caddy edge, not the app — see
   [`adr/0002-healthz-exposure-and-limit-exemption.md`](adr/0002-healthz-exposure-and-limit-exemption.md).
-  **TODO (croft-stack):** restrict `/healthz` on the `ciss.croft.ing` vhost to a
-  loopback + monitoring-host allowlist; currently it answers the public internet.
+  **Done (croft-stack):** the `ciss.croft.ing` vhost gates `/healthz` at the
+  Caddy edge to a loopback allowlist (`croft-stack/services/ciss.toml`
+  `healthz_allowlist`); the public internet gets 403 (verified live 2026-08-24).
+  The allowlist matches `path /healthz` exactly and never gates `/.well-known/*`.
 - `GET /.well-known/did.json` → CISS's `did:web` document. **Must stay public** —
   external atproto clients resolve `did:web:ciss.croft.ing` here to address CISS as
   a service-auth `aud`. Any future `/healthz` edge allowlist must **not** also gate

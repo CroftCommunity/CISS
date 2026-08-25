@@ -30,17 +30,25 @@ stays erasable + listable (a roster wants erasure; usage wants permanence).
 Execution record: `docs/plans/2026-08-11-kind-semantics-implementation.md`.
 
 
-## 1. Redeploy the VPS to v0.5.6 — blocks `du` and any post-v0.4.0 server change  ⟵ biggest
+## 1. Redeploy the VPS — public `ciss.croft.ing` runs v0.4.0; v0.9.0 is released  ⟵ biggest
 
-The deployed `https://ciss.croft.ing` runs a **pre-v0.5.5** server: it enforces
-auth (unauth `PUT` → 401, gated reads + `did:` service-auth all verified live on
-2026-08-06), but it is **older than the client releases**. Concretely, `GET
-/{did}/du` (added v0.5.5) returns **501** there, so `ciss-ctl du` fails against the
-VPS until a redeploy.
+The deployed public `https://ciss.croft.ing` runs **v0.4.0** (the ansible pin in
+`croft-stack/ansible/group_vars/all.yml`, `ciss` entry): it enforces auth (unauth
+`PUT` → 401, gated reads + `did:` service-auth all verified live 2026-08-06), but
+it predates every release since. Concretely, `GET /{did}/du` (added v0.5.5)
+returns **501** there — re-confirmed live 2026-08-24 — so `ciss-ctl du` fails
+against the VPS until a redeploy.
 
-- **Action:** build/deploy the **v0.5.6** release via croft-stack. Deploy shape
-  (DEPLOYMENT.md): systemd `ciss.service` → `/opt/ciss/current/ciss --data-dir
-  /var/lib/ciss --listen 127.0.0.1:8301`, Caddy `443 → 127.0.0.1:8301`.
+Do not conflate with **ciss-admit**: the private loopback CISS instance backing
+croft-admit already runs **v0.8.0** (activated 2026-08-25, croft-stack RUNBOOK).
+The two instances version independently by design; this item is the public one.
+
+- **Action:** bump the `ciss` `active_tenants` pin (`binary_version`,
+  `binary_url`, `binary_sha256`) to the **v0.9.0** release asset — the release
+  workflow (`.github/workflows/release.yml`) builds, gates, and checksums it on
+  the tag — then an owner-authorized converge. Deploy shape (DEPLOYMENT.md):
+  systemd `ciss.service` → `/opt/ciss/current/ciss --data-dir /var/lib/ciss
+  --listen 127.0.0.1:8301`, Caddy `443 → 127.0.0.1:8301`.
 - **Optional (`du` lockdown):** to restrict remote `du` to admins, set
   `CISS_ADMIN_ONLY_DU=1` in the unit **and** populate `CISS_ADMIN_PINS_FILE`
   (currently provisioned-but-empty — DEPLOYMENT.md §2 TODO). With the flag set but

@@ -5,7 +5,13 @@ it fronts: `ciss-sync`, `ciss-iroh`). The server has its own changelog at the
 repo root. Versions move in lockstep with the server; the Homebrew tap
 (`croftcommunity/tap/ciss-ctl`) tracks tagged releases.
 
-## [Unreleased]
+## [0.9.0] — 2026-08-24
+
+No client changes — the version moves in lockstep with the server release
+(RFC 9728 discovery pointer, E83 stage-1 compute observability, receipt
+verify-compat fix; see the server changelog).
+
+## [0.8.0] — 2026-08-12
 
 ### Added
 - `Meter` (from `GET /{did}/meter`) now carries `drawdown_download_bytes` —
