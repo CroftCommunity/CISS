@@ -57,3 +57,11 @@ without first reading the posture doc and locating the relevant invariant.
 Workspace-level git identity and "don't commit/push unless asked" conventions are
 in the CroftC workspace orientation (`discovery/AGENTS.md`), auto-loaded above
 this file.
+
+## Concurrent sessions (workspace norm)
+
+Multiple agent sessions share the `CroftC/` workspace. Do multi-turn work in a dedicated
+worktree — `git -C CISS worktree add ../worktrees/CISS/<slug> -b claude/<slug>` — never in
+this checkout (peer sessions stage with `git add -A`; loose files get swept into unrelated
+commits). Contested surfaces here — claim in `CroftC/.coordination/claims/` before
+touching: **landing on `main`** (the store/chain semantics other repos pin to — see the dependency pins in croft-stack). Full protocol and the reasons behind it: `CroftC/.claude/COORDINATION.md`.
