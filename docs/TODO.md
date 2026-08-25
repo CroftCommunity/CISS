@@ -30,34 +30,26 @@ stays erasable + listable (a roster wants erasure; usage wants permanence).
 Execution record: `docs/plans/2026-08-11-kind-semantics-implementation.md`.
 
 
-## 1. Redeploy the VPS — public `ciss.croft.ing` runs v0.4.0; v0.9.0 is released  ⟵ biggest
+## 1. Redeploy the VPS — RESOLVED ✅ (2026-08-25): public `ciss.croft.ing` runs v0.9.0
 
-The deployed public `https://ciss.croft.ing` runs **v0.4.0** (the ansible pin in
-`croft-stack/ansible/group_vars/all.yml`, `ciss` entry): it enforces auth (unauth
-`PUT` → 401, gated reads + `did:` service-auth all verified live 2026-08-06), but
-it predates every release since. Concretely, `GET /{did}/du` (added v0.5.5)
-returns **501** there — re-confirmed live 2026-08-24 — so `ciss-ctl du` fails
-against the VPS until a redeploy.
+The owner-authorized converge landed 2026-08-25 (croft-stack
+`sessions/2026-08-25-ciss-v090-converge.md` is the full record): v0.4.0 →
+**v0.9.0** in one converge (`ok=96 changed=5 failed=0`; second run
+`changed=0`), provider identity carried across the upgrade by the encrypted
+`provider-seed.cred` (same provider id after restart). Verified live from
+outside: the RFC 9728 endpoint 404→200, unauth `du` 501→403 (the real authz
+refusal, `reason="not owner"` in the journal), and the CLIENT-TESTING
+put/ls/du/get walk green — `du` returning ledger sizes against the VPS for
+the first time since the endpoint shipped in v0.5.5.
 
-Do not conflate with **ciss-admit**: the private loopback CISS instance backing
-croft-admit already runs **v0.8.0** (activated 2026-08-25, croft-stack RUNBOOK).
-The two instances version independently by design; this item is the public one.
-
-- **Action:** the `ciss` `active_tenants` pin is **already staged at v0.9.0**
-  on croft-stack `main` (`4e19321`, sha256 verified against a locally-hashed
-  download of the release asset). What remains is only the owner-authorized
-  converge. Deploy shape (DEPLOYMENT.md):
-  systemd `ciss.service` → `/opt/ciss/current/ciss --data-dir /var/lib/ciss
-  --listen 127.0.0.1:8301`, Caddy `443 → 127.0.0.1:8301`.
-- **Optional (`du` lockdown):** to restrict remote `du` to admins, set
-  `CISS_ADMIN_ONLY_DU=1` in the unit **and** populate `CISS_ADMIN_PINS_FILE`
-  (currently provisioned-but-empty — DEPLOYMENT.md §2 TODO). With the flag set but
-  no pins, **all** `du` is denied (nobody is an admin). Leave the flag unset for
-  self-service `du` (any authenticated caller, own namespace only).
-- **After redeploy:** `du` works against the VPS for `id:` and `did:` (self-only);
-  re-run the `du` steps in `docs/CLIENT-TESTING.md`.
-- This redeploy also picks up **every** post-v0.4.0 server change bundled into the
-  release tarball (it's the whole repo), not just `du`.
+Still open, carried by their own items/docs:
+- **`du` lockdown (optional):** `CISS_ADMIN_ONLY_DU` stays unset (self-service
+  `du`, own namespace only). Flipping it requires populating
+  `CISS_ADMIN_PINS_FILE` first — still provisioned-but-empty (DEPLOYMENT.md §2
+  TODO; with the flag set and no pins, **all** `du` is denied).
+- The deployed **client** walk ran on ciss-ctl 0.7.0 from the tap; a tap bump
+  to 0.9.0 is routine Homebrew housekeeping when wanted (no wire changes for
+  the walked surface).
 
 ## 2. Rust toolchain — RESOLVED: pinned to 1.97.1, gated by CI
 
