@@ -95,3 +95,16 @@ meter endpoint would accept a `did:` service-auth JWT (like `du`/`listBlobs`/
   (PAR/DPoP/PKCE) is a tracked follow-on.
 - **`CISS_ADMIN_PINS_FILE` on the VPS** — provisioned-but-empty (DEPLOYMENT.md §2);
   needed before `did:` break-glass resolution (and the `du` admin lockdown) is real.
+
+## 6. Publish a source tarball asset again (homebrew formula depends on it)
+
+Releases stopped shipping a source asset after v0.7.0 — v0.8.0+ publish only
+`ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz` (the prebuilt binary). The homebrew formula
+(`homebrew-tap/Formula/ciss-ctl.rb`) builds `ciss-ctl` from source, so it could not
+follow: it sat pinned at v0.7.0 until 2026-08-26, when it was pointed at GitHub's
+auto-generated tag tarball as a stopgap. That deviates from the workspace preference
+for uploaded assets (deterministic hashes we control).
+
+Durable fix: have `release.yml` also package and upload a source tarball
+(`ciss-vX.Y.Z-src.tar.gz` + `.sha256`), then point the formula back at it and bump
+together. Coupling recorded in `CroftC/.claude/VERSIONING.md` § Cross-repo pins.
