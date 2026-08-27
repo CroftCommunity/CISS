@@ -1,8 +1,11 @@
 # CISS — outstanding TODO
 
-> Repo operations / deferred items only. The product/design backlog of record is
-> `discovery/alpha/ROADMAP_TODO.md`; the tracking scheme is `CroftC/.claude/TRACKING.md`.
-> Cross-reference E-numbers where an item here implements a backlog row.
+> Known work only — items whose shape is already decided, and which may therefore be
+> proposed as work. Anything still an open question (decide / verify / investigate /
+> reconcile) belongs in the backlog of record, `discovery/alpha/ROADMAP_TODO.md`,
+> however small or operational it is. Tracking scheme: `CroftC/.claude/TRACKING.md`;
+> the two piles and why: its § "Two piles". Cross-reference E-numbers where an item
+> here implements a backlog row.
 
 Open items after the `ciss-ctl` client effort (delivered through **v0.5.6**,
 2026-08-06). Full history: `docs/plans/2026-08-06-ciss-ctl-client-cli.md`. The
