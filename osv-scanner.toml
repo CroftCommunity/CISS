@@ -1,0 +1,57 @@
+# osv-scanner exceptions for CISS.
+#
+# Rule and why: CroftC/.claude/SUPPLY-CHAIN.md rule 9 — every exception dated, reasoned,
+# expiring. Each reason names the rung of rule 5 that settled it.
+#
+# Settled 2026-08-29 (Phase 0 of the supply-chain rollout). One finding was FIXED rather
+# than excepted: h2 0.4.15 -> 0.4.19 retires RUSTSEC-2026-0258, which was genuinely in
+# the production path via axum and reqwest. An exception is for what cannot be fixed;
+# reaching for one first is how a fixable advisory becomes permanent.
+#
+# METHODOLOGY NOTE, because it produced a false negative here and rule 5 did not warn
+# about it. `cargo tree -i <crate> --edges normal` run at the WORKSPACE ROOT reports
+# "nothing to print" for all three unmaintained crates below — the only path from the
+# root package `ciss` crosses a dev edge. That reading is wrong: `ciss-cli` is itself a
+# workspace member that PRODUCES A BINARY, and `cargo tree -p ciss-cli --edges normal`
+# puts all three squarely in its production tree. In a multi-binary workspace,
+# reachability must be asked once per shipped artifact, not once per repo.
+
+# ── unmaintained-crate notices: PRODUCTION for the ciss-cli binary, but not vulnerabilities
+# All three are RUSTSEC "unmaintained" advisories — no CVE, no exploit, no patched version
+# to move to. They are transitive under the iroh stack and retire when iroh moves off them,
+# which is not an action available from here.
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0089"
+ignoreUntil = 2026-11-29
+reason = """atomic-polyfill 1.0.3 is UNMAINTAINED (no vulnerability, no fixed version).
+Rung 2 does NOT clear it: production for the ciss-cli binary via
+heapless <- postcard <- iroh-blobs <- ciss-iroh. Kept as an exception because there is
+nothing to fix — it retires when iroh-blobs moves off heapless 0.7. Re-check at expiry
+by re-running the scan after an iroh bump."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2026-11-29
+reason = """paste 1.0.15 is UNMAINTAINED (no vulnerability, no fixed version). Production
+for ciss-cli via netlink-packet-core <- netdev <- netwatch <- iroh. It is additionally a
+proc-macro, so it runs at build time and ships no code in the binary — but it is recorded
+on the unmaintained grounds, which are the honest ones. Retires when netdev moves off it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+ignoreUntil = 2026-11-29
+reason = """proc-macro-error 0.4.12 is UNMAINTAINED (no vulnerability, no fixed version).
+Production for ciss-cli via genawaiter-proc-macro <- genawaiter <- bao-tree <- iroh-blobs.
+Build-time proc macro; ships no code. Retires when bao-tree moves off genawaiter."""
+
+# ── a real vulnerability, unreachable at rung 1
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2026-11-29
+reason = """rsa 0.9.10, the Marvin timing attack (CVSS 5.9) — a REAL vulnerability with
+NO upstream fix, which is exactly the shape rule 9 exists for. Rung 1 clears it:
+`cargo tree -i rsa --target all` prints "nothing to print" — it is in Cargo.lock as an
+unenabled optional dependency and is in no resolved tree on any target, so it compiles
+into nothing. Verified per-artifact too: absent from ciss-cli's normal tree.
+INVALIDATION: enabling any feature that activates an RSA-backed path makes this real
+immediately. Re-check on any feature change, not only at the expiry date."""
