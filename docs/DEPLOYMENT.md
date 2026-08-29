@@ -120,7 +120,7 @@ under the `ciss` `active_tenants` entry (`binary_version`, `binary_url`,
 just the published `.sha256`).
 
 Release flow, cutting a version: roll the `[Unreleased]`/pending entries in
-both changelogs (`CHANGELOG.md`, `crates/ciss-cli/CHANGELOG.md`) into the new
+the one changelog (`CHANGELOG.md`, entries prefixed `**server:**` / `**cli:**`) into the new
 version heading, bump root + `ciss-cli` `Cargo.toml` in lockstep, land green,
 tag, push the tag.
 
