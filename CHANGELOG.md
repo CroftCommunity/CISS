@@ -42,7 +42,8 @@ docs.
   been pointed at GitHub's auto-generated tag tarball as a stopgap).
 
 ### Security
-- **server+cli:** `h2` 0.4.15 → 0.4.19 retires **RUSTSEC-2026-0258** (in the
+- **server:** (the same workspace dependency serves the cli) `h2` 0.4.15 →
+  0.4.19 retires **RUSTSEC-2026-0258** (in the
   production path via axum/reqwest). Four advisories remain recorded as dated
   exceptions with per-artifact reachability, none with an upstream fix
   (`security.yml` gates the set).
