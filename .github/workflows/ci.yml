@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # Rule 7: resolve the toolchain explicitly through rustup, which reads
       # rust-toolchain.toml — never whatever rustc happens to shadow PATH.
@@ -40,7 +40,7 @@ jobs:
           rustc --version
           cargo clippy --version
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
 
       - name: cargo test --workspace
         run: cargo test --workspace
