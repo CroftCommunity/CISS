@@ -110,9 +110,13 @@ not a ritual: pushing a `vX.Y.Z` tag runs
    *(A fully-static `x86_64-unknown-linux-musl` build remains the portability
    hardening follow-up; on a single trixie box the glibc build is correct and
    simplest.)*
-3. **Publishes** the tarball and its `.sha256` as the `vX.Y.Z` GitHub release.
-   A `workflow_dispatch` input takes an *existing* tag for re-builds (a tag cut
-   on a commit predating the workflow file never fires the push trigger).
+3. **Publishes** the tarball and its `.sha256` as the `vX.Y.Z` GitHub release,
+   plus a **source tarball** (`ciss-vX.Y.Z-src.tar.gz` + `.sha256`, a
+   `git archive` of the tagged commit) — the Homebrew formula's build input
+   (TODO §6; `CroftC/.claude/VERSIONING.md` § Cross-repo pins names the tap
+   coupling). A `workflow_dispatch` input takes an *existing* tag for re-builds
+   (a tag cut on a commit predating the workflow file never fires the push
+   trigger).
 
 The one manual step left: **pin it** in `croft-stack/ansible/group_vars/all.yml`
 under the `ciss` `active_tenants` entry (`binary_version`, `binary_url`,

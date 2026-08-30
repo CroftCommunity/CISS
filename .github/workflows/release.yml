@@ -89,6 +89,24 @@ jobs:
           echo "checksum_file=/tmp/$STAGE.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "checksum=$(cut -d' ' -f1 "/tmp/$STAGE.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
 
+      # The SOURCE asset (TODO §6): the homebrew formula builds ciss-ctl from
+      # source, so every release also ships a source tarball we hash ourselves —
+      # the workspace rule prefers uploaded assets over GitHub's auto-generated
+      # tag tarballs (deterministic hashes we control; VERSIONING.md § Cross-repo
+      # pins names the tap coupling). git archive of the tagged commit, one
+      # ciss-vX.Y.Z/ prefix directory, same layout brew's url/sha256 expect.
+      - name: package + checksum the source tarball
+        id: source
+        run: |
+          SRC="ciss-v${{ steps.tag.outputs.version }}-src"
+          git archive --format=tar.gz \
+            --prefix="ciss-v${{ steps.tag.outputs.version }}/" \
+            -o "/tmp/$SRC.tar.gz" HEAD
+          ( cd /tmp && sha256sum "$SRC.tar.gz" > "$SRC.tar.gz.sha256" )
+          cat "/tmp/$SRC.tar.gz.sha256"
+          echo "tarball=/tmp/$SRC.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum_file=/tmp/$SRC.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -101,9 +119,14 @@ jobs:
 
           Consumed by croft-stack's tenants role via an active_tenants pin
           (binary_version, binary_url, binary_sha256). Full workspace gate ran on
-          this commit in this workflow before packaging." \
+          this commit in this workflow before packaging. The -src tarball is the
+          formula's build input (homebrew-tap ciss-ctl.rb)." \
             "${{ steps.package.outputs.tarball }}" \
-            "${{ steps.package.outputs.checksum_file }}" || \
+            "${{ steps.package.outputs.checksum_file }}" \
+            "${{ steps.source.outputs.tarball }}" \
+            "${{ steps.source.outputs.checksum_file }}" || \
           gh release upload "$TAG" --clobber \
             "${{ steps.package.outputs.tarball }}" \
-            "${{ steps.package.outputs.checksum_file }}"
+            "${{ steps.package.outputs.checksum_file }}" \
+            "${{ steps.source.outputs.tarball }}" \
+            "${{ steps.source.outputs.checksum_file }}"
