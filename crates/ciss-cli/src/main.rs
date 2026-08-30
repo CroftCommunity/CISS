@@ -517,6 +517,8 @@ const UPLOAD_LXM: &str = "com.atproto.repo.uploadBlob";
 const LISTBLOBS_LXM: &str = "com.atproto.sync.listBlobs";
 /// The lexicon method usage inspection (`du`) binds a `did:` token to (ADR 0003).
 const DU_LXM: &str = "ing.croft.ciss.du";
+/// The lexicon method a `did:` meter read binds a token to (TODO §4).
+const METER_LXM: &str = "ing.croft.ciss.meter";
 /// The lexicon methods a Model-C `did:` owner's policy set/read tokens bind to.
 const SET_POLICY_LXM: &str = "ing.croft.ciss.putAssertion";
 const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
@@ -700,12 +702,14 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .await
             }
         },
-        Commands::Meter => {
-            require_id_plane(cli.global.identity, "meter")?;
-            let session = client::session_for(&identity::load_keypair(&config)?);
-            let http = server_client(&cli.global);
-            commands::object::meter(&http, &session, cli.global.json).await
-        }
+        Commands::Meter => match cli.global.identity {
+            IdentityKind::Id => {
+                let session = client::session_for(&identity::load_keypair(&config)?);
+                let http = server_client(&cli.global);
+                commands::object::meter(&http, &session, cli.global.json).await
+            }
+            IdentityKind::Did => did_meter(&cli.global, &config).await,
+        },
         Commands::Ls => match cli.global.identity {
             IdentityKind::Id => {
                 let keypair = identity::load_keypair(&config)?;
@@ -873,19 +877,18 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Reject a `did:`-plane invocation of a command the **server** only exposes to an
-/// `id:` session, with a clear message (rather than the confusing "no identity —
-/// run key gen" a missing local key gives). Currently only `meter`: the server's
-/// meter endpoint authenticates an `id:` session, so `did:` metering would need a
-/// server change.
-fn require_id_plane(identity: IdentityKind, command: &str) -> anyhow::Result<()> {
-    if identity == IdentityKind::Did {
-        anyhow::bail!(
-            "`{command}` is not available for a did: identity — the server authenticates \
-             this endpoint with an id: session. Run it under an id: profile (omit \
-             `--identity did`)."
-        );
-    }
+/// `--identity did meter`: relay a `meter`-scoped service-auth JWT and read the
+/// running meter for the account's own DID (owner-only; TODO §4 lifted the old
+/// `id:`-plane-only limitation server-side).
+async fn did_meter(global: &GlobalArgs, config: &config::Config) -> anyhow::Result<()> {
+    let cred = atproto::load_credential(config)?;
+    let pds = reqwest::Client::new();
+    let server = server_client(global);
+    let aud = resolve_aud(global, &server).await?;
+    let (account_did, tokens) =
+        atproto::service_auth_tokens(&pds, &cred, &aud, &[METER_LXM]).await?;
+    let meter = server.get_meter_bearer(&tokens[0], &account_did).await?;
+    commands::object::print_meter(&meter, global.json);
     Ok(())
 }
 

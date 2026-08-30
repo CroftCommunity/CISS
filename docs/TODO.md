@@ -67,22 +67,22 @@ toolchain (verified green at the v0.9.0 cut). Local caveat stands: on machines
 where Homebrew's rustc precedes `~/.cargo/bin` on PATH the pin does not bind
 local builds — keep the Homebrew toolchain on the same minor.
 
-## 3. `du` lockdown 403 message (minor clarity)
+## 3. `du` lockdown 403 message — RESOLVED (2026-08-29)
 
-When `CISS_ADMIN_ONLY_DU=1` and a **non-admin owner** runs `du`, the server returns
-`403` with the generic body "forbidden: not the owner of this namespace" — which
-is misleading (they *are* the owner, just not an admin). The **server log is
-accurate** (`"du locked to admins"`). Consider a distinct `ServerError` /message
-for the lockdown case (e.g. "du is restricted to admins on this server"). `op_du`
-in `src/server.rs`.
+The lockdown refusal is its own error now: `ServerError::DuLockedToAdmins` →
+`403 "forbidden: du is restricted to admins on this server"`, so a locked-out
+owner is no longer told they are "not the owner". Guard:
+`wiring_du::the_lockdown_refusal_names_the_lockdown_not_ownership` (RED against
+the old shared `Forbidden`).
 
-## 4. `did:` metering (server change to lift a current limitation)
+## 4. `did:` metering — RESOLVED (2026-08-29)
 
-`meter` is **`id:`-session only**: `get_meter_handler` uses `authenticate` (not
-`authenticate_atproto`), so a `did:` account can't read its meter remotely
-(`ciss-ctl --identity did meter` refuses with a clear message). To support it, the
-meter endpoint would accept a `did:` service-auth JWT (like `du`/`listBlobs`/
-`uploadBlob` do). Tracked, not built. (`ls` and `du` already work under `did:`.)
+`GET /{did}/meter` authenticates both planes (`authenticate_atproto`,
+`lxm=ing.croft.ciss.meter`), and the CLI grew `--identity did meter`
+(`Client::get_meter_bearer`; the client-side `require_id_plane` refusal is
+deleted with the limitation it described). Owner-only unchanged. Guards:
+`tests/wiring_meter.rs` (both planes, lxm mismatch, cross-DID) and
+`crates/ciss-cli/tests/cli_meter.rs`.
 
 ## 5. Minor / deferred (already noted in the plan's SEAMs)
 
@@ -96,10 +96,22 @@ meter endpoint would accept a `did:` service-auth JWT (like `du`/`listBlobs`/
   meter shows transferred bytes, not rent.
 - **Full atproto OAuth** for the `did:` path — v1 uses an app password; OAuth
   (PAR/DPoP/PKCE) is a tracked follow-on.
-- **`CISS_ADMIN_PINS_FILE` on the VPS** — provisioned-but-empty (DEPLOYMENT.md §2);
-  needed before `did:` break-glass resolution (and the `du` admin lockdown) is real.
+- **`CISS_ADMIN_PINS_FILE` on the VPS** — provisioned-but-empty (DEPLOYMENT.md §2),
+  and **accepted as-is** (owner, 2026-08-29) because the mechanism is fully tested:
+  parse (`did_resolver::tests`, incl. malformed-file loud failure), pin isolation
+  (`ciss-resolve/src/pinned.rs` tests — a pinned admin never touches the network
+  arm, even under force-refresh), the outage break-glass flow
+  (`flow_atproto_identity::when_the_resolver_is_down_a_pinned_admin_still_authenticates`),
+  and the lockdown gate wiring (`tests/wiring_du.rs`). Populating it on the box
+  remains a pure ops step whenever `did:` break-glass (or the `du` lockdown) is
+  wanted for real.
 
-## 6. Publish a source tarball asset again (homebrew formula depends on it)
+## 6. Publish a source tarball asset again — RESOLVED (2026-08-29)
+
+`release.yml` now packages + uploads `ciss-vX.Y.Z-src.tar.gz` and its `.sha256`
+(a `git archive` of the tagged commit, one `ciss-vX.Y.Z/` prefix directory)
+alongside the binary asset. The formula points back at the uploaded asset from
+the first release carrying it; the paragraphs below are the history.
 
 Releases stopped shipping a source asset after v0.7.0 — v0.8.0+ publish only
 `ciss-vX.Y.Z-x86_64-linux-gnu.tar.gz` (the prebuilt binary). The homebrew formula

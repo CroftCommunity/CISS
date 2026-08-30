@@ -131,7 +131,12 @@ pub async fn get(
 ///
 /// Fails if the meter read is refused or unreachable.
 pub async fn meter(client: &Client, session: &Session, json_out: bool) -> Result<()> {
-    let m = client.get_meter(session).await?;
+    print_meter(&client.get_meter(session).await?, json_out);
+    Ok(())
+}
+
+/// Render a fetched meter (shared by the `id:` session and `did:` bearer paths).
+pub fn print_meter(m: &crate::client::Meter, json_out: bool) {
     if json_out {
         println!(
             "{}",
@@ -150,7 +155,6 @@ pub async fn meter(client: &Client, session: &Session, json_out: bool) -> Result
         println!("running total bytes: {}", m.running_total_bytes);
         println!("postage (cents):     {}", m.postage_cents);
     }
-    Ok(())
 }
 
 /// `ciss-ctl ls`: list the cids stored under the active identity (hex, matching

@@ -159,3 +159,49 @@ async fn admin_only_lockdown_restricts_du_to_admins_still_self_only() {
         "with the lockdown off, any authenticated caller may du its own namespace",
     );
 }
+
+/// The two `du` 403s are distinguishable by their bodies: a locked-out owner is
+/// told about the lockdown, not (falsely) that they are not the owner. The server
+/// log was always accurate; the wire message must be too (TODO §3).
+#[tokio::test]
+async fn the_lockdown_refusal_names_the_lockdown_not_ownership() {
+    let resolver: Arc<dyn DidResolver> = Arc::new(StaticResolver::default());
+    let app = App::new("provider-master", Blobs::Memory, Db::Memory)
+        .expect("app")
+        .with_did_resolver(resolver, SERVICE_DID)
+        .with_admin_only_du(HashSet::new(), true);
+    let server = TestServer::spawn(app).await;
+    let client = reqwest::Client::new();
+
+    let owner = derive_keypair("du-owner3", "owner");
+    let owner_did = derive_id(&owner.verifying_key());
+
+    // A non-admin OWNER under the lockdown: the refusal names the lockdown.
+    let (pk, sess) = common::session_headers(&owner, &owner_did);
+    let locked = client
+        .get(server.url(&format!("/{owner_did}/du")))
+        .header("x-croft-pubkey", pk)
+        .header("x-croft-session", sess)
+        .send()
+        .await
+        .expect("locked du");
+    assert_eq!(locked.status().as_u16(), 403);
+    let locked_body = locked.text().await.expect("body");
+    assert!(
+        locked_body.contains("restricted to admins"),
+        "the lockdown refusal must name the lockdown, got: {locked_body:?}",
+    );
+    assert!(
+        !locked_body.contains("not the owner"),
+        "a locked-out owner must not be told they are not the owner, got: {locked_body:?}",
+    );
+
+    // Contrast: a genuine ownership refusal still says so (anonymous caller).
+    let anon = client.get(server.url(&format!("/{owner_did}/du"))).send().await.expect("anon");
+    assert_eq!(anon.status().as_u16(), 403);
+    let anon_body = anon.text().await.expect("body");
+    assert!(
+        anon_body.contains("not the owner"),
+        "the ownership refusal keeps its message, got: {anon_body:?}",
+    );
+}

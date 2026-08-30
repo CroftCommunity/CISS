@@ -318,8 +318,8 @@ service-auth JWT):
 cctl --identity did ls        # the cids stored under your did:plc
 ```
 
-(`meter`, by contrast, is `id:`-only — the server's meter endpoint authenticates
-an `id:` session, so `did:` metering would need a server change.)
+(`meter` works here too: `cctl --identity did meter` relays a meter-scoped
+service-auth JWT — the endpoint accepts both auth planes since TODO §4.)
 
 Under a `did:` identity, `--via s3` is refused (there is no local signing key). A
 `did:` owner can also set an object policy (Model C — CISS provider-attests it
@@ -349,8 +349,9 @@ cctl man | head          # the roff man page
 Errors map the server's status: `401` (no/invalid credential), `403` (bad
 signature / wrong signer / bad Model-C credential), `404` (not found **or** not
 visible), `409` (policy `seq` not newer), and a clear "server unreachable" on a
-connect failure. `id:`-only commands (`meter`, `ls`) refuse a `--identity did`
-invocation with a clear message rather than a confusing failure.
+connect failure. Every read command (`meter`, `ls`, `du`, `get`) works under
+both identity planes; the one `did:` refusal left is `--via s3` (no local
+signing key), which says so clearly.
 
 ---
 

@@ -237,6 +237,20 @@ impl Client {
         resp.json::<Meter>().await.context("parse meter response")
     }
 
+    /// `GET /{did}/meter` under a `did:` bearer token — a PDS-minted
+    /// service-auth JWT (`lxm=ing.croft.ciss.meter`). The meter is owner-only;
+    /// the server serves it only for the token's own account DID (TODO §4).
+    ///
+    /// # Errors
+    ///
+    /// Fails on a connect error or a non-2xx status.
+    pub async fn get_meter_bearer(&self, token: &str, did: &str) -> Result<Meter> {
+        let url = format!("{}/{}/meter", self.base, did);
+        let resp = self.send(self.http.get(&url).bearer_auth(token), "meter").await?;
+        let resp = self.ensure_success(resp, "meter").await?;
+        resp.json::<Meter>().await.context("parse meter response")
+    }
+
     /// `POST /xrpc/com.atproto.repo.uploadBlob` under a signed session (the
     /// `x-croft-*` session is accepted as the atproto-plane credential). Returns
     /// the CIDv1 bridged back to the sha256 hex the S3 plane uses.

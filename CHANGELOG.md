@@ -16,6 +16,29 @@ release to disagree (`[0.6.1] — never released` below is the residue).
 
 ## [Unreleased]
 
+### Added
+- **server:** `GET /{did}/meter` accepts a `did:` **service-auth JWT**
+  (`lxm=ing.croft.ciss.meter`) alongside the `id:` session plane — the same two
+  planes as `du`, closing the "a `did:` account can't read its own meter
+  remotely" limitation (TODO §4). Owner-only as ever; an lxm-mismatched token
+  is an unauthenticated caller (401), a cross-DID read stays 403. Guards:
+  `tests/wiring_meter.rs`.
+- **cli:** `--identity did meter` — relays a meter-scoped service-auth JWT and
+  prints the account's own meter; the client-side "not available for a did:
+  identity" refusal is gone with the server limitation it described
+  (`Client::get_meter_bearer`; guard: `crates/ciss-cli/tests/cli_meter.rs`).
+- **cli:** releases now also ship a **source tarball**
+  (`ciss-vX.Y.Z-src.tar.gz` + `.sha256`) — the Homebrew formula's build input,
+  restoring an uploaded asset with a hash we control (TODO §6; the formula had
+  been pointed at GitHub's auto-generated tag tarball as a stopgap).
+
+### Fixed
+- **server:** the `du` admin-lockdown refusal now says what it means:
+  `403 "forbidden: du is restricted to admins on this server"` instead of the
+  misleading "not the owner of this namespace" a locked-out **owner** used to
+  get (TODO §3 — the log line was always accurate; the wire body now matches).
+  Guard: `wiring_du::the_lockdown_refusal_names_the_lockdown_not_ownership`.
+
 ## [0.9.0] — 2026-08-24
 
 Server-only follow-ons to the kind-semantics release: the RFC 9728 discovery

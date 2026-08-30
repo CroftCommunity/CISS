@@ -86,6 +86,9 @@ pub(crate) const GET_POLICY_LXM: &str = "ing.croft.ciss.getPolicy";
 /// The lexicon method a `did:` caller's usage-inspection (`du`) service-auth JWT
 /// must bind to (ADR 0003).
 pub(crate) const DU_LXM: &str = "ing.croft.ciss.du";
+/// The lexicon method a `did:` meter-read service-auth JWT binds to (TODO §4:
+/// the meter accepts both auth planes, like `du`).
+pub(crate) const METER_LXM: &str = "ing.croft.ciss.meter";
 
 /// The lexicon method a `did:` caller's **assertion erasure** JWT binds to
 /// (ADR 0005 / A2). Owner-only, like the write it undoes.
@@ -1673,7 +1676,7 @@ fn op_du(state: &AppState, principal: &Principal, did: &str) -> Result<OpOutcome
     // at all — still only for its own namespace (checked above).
     if state.admin_only_du && !caller.is_some_and(|c| state.admin_dids.contains(c)) {
         tracing::info!(resource = %did, reason = "du locked to admins", "du denied");
-        return Err(ServerError::Forbidden);
+        return Err(ServerError::DuLockedToAdmins);
     }
 
     let store = lock_store(&state.store);
@@ -2459,7 +2462,9 @@ async fn get_meter_handler(
 ) -> Result<OpOutcome, ServerError> {
     let did = Did::parse(&did)?;
     // The billing meter is private: owner-only (require_owner at dispatch).
-    let principal = authenticate(&headers);
+    // Accepts an `id:` session or a `did:` service-auth JWT bound to `meter`
+    // (TODO §4 — the same two planes as `du`).
+    let principal = authenticate_atproto(&state, &headers, METER_LXM).await;
     dispatch_blocking(&state, principal, Op::GetMeter { did: did.into_string() }).await
 }
 
@@ -2620,6 +2625,12 @@ pub enum ServerError {
     /// The caller is authenticated but is not the owner of the target namespace.
     #[error("forbidden: not the owner of this namespace")]
     Forbidden,
+    /// `du` is locked to admin pins (`CISS_ADMIN_ONLY_DU`) and the caller is not
+    /// one. Distinct from [`ServerError::Forbidden`]: the caller may well be the
+    /// owner, and telling an owner "not the owner" misdiagnoses the refusal
+    /// (TODO §3 — the log was always accurate; the wire message is now too).
+    #[error("forbidden: du is restricted to admins on this server")]
+    DuLockedToAdmins,
     /// A blob CID could not be parsed as a CIDv1 raw + sha-256 address.
     #[error("bad blob CID: {0}")]
     BadCid(#[from] crate::cidv1::CidError),
@@ -2757,6 +2768,7 @@ impl IntoResponse for ServerError {
             | ServerError::BadIdentifier(_) => StatusCode::BAD_REQUEST,
             ServerError::DidKeyMismatch
             | ServerError::Forbidden
+            | ServerError::DuLockedToAdmins
             | ServerError::AssertionUnauthorized => StatusCode::FORBIDDEN,
             ServerError::AssertionStale { .. }
             | ServerError::DrawdownActive
