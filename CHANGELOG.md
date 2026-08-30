@@ -16,6 +16,15 @@ release to disagree (`[0.6.1] — never released` below is the residue).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-29
+
+The TODO-close release: both auth planes on the meter, an honest du-lockdown
+refusal, and the source-tarball release asset the Homebrew formula builds from.
+Also carries everything landed since v0.9.0 outside this batch: the h2
+dependency fix with the workspace supply-chain gates (`security.yml`), the
+changelog fold (the cli file merged into this one), and the CI/land process
+docs.
+
 ### Added
 - **server:** `GET /{did}/meter` accepts a `did:` **service-auth JWT**
   (`lxm=ing.croft.ciss.meter`) alongside the `id:` session plane — the same two
@@ -31,6 +40,12 @@ release to disagree (`[0.6.1] — never released` below is the residue).
   (`ciss-vX.Y.Z-src.tar.gz` + `.sha256`) — the Homebrew formula's build input,
   restoring an uploaded asset with a hash we control (TODO §6; the formula had
   been pointed at GitHub's auto-generated tag tarball as a stopgap).
+
+### Security
+- **server+cli:** `h2` 0.4.15 → 0.4.19 retires **RUSTSEC-2026-0258** (in the
+  production path via axum/reqwest). Four advisories remain recorded as dated
+  exceptions with per-artifact reachability, none with an upstream fix
+  (`security.yml` gates the set).
 
 ### Fixed
 - **server:** the `du` admin-lockdown refusal now says what it means:
