@@ -11,35 +11,22 @@ Work local to this repo. Dated plans live in `docs/plans/`; decisions in `docs/a
 
 ## Open
 
-- [ ] **Bump `h2` — RUSTSEC-2026-0258, fix available.** Found by the workspace
-  supply-chain sweep, 2026-08-29 (`CroftC/.claude/SUPPLY-CHAIN.md`). `h2` 0.4.15 is in
-  the **normal** dependency path — confirmed, not assumed — via both `axum` and
-  `reqwest`:
+(nothing — every item below closed; new known work starts a fresh bullet here)
 
-  ```
-  h2 v0.4.15
-  ├── hyper v1.11.0 └── axum v0.8.9 └── ciss v0.9.0
-  └── reqwest v0.13.4
-  ```
+## Closed
 
-  Fixed in 0.4.16. Likely a `cargo update -p h2` rather than a manifest change, since
-  it is transitive. Re-run `osv-scanner scan source -L Cargo.lock` after.
-
-  Note the deployment coupling before bumping: `ciss-admit` on the box is pinned to
-  **v0.8.0** (the admit crate's kind-semantics pin), while the public tenant versions
-  independently at v0.9.0. A fix that only lands on the v0.9.x line does not reach the
-  deployed admit service — check which line needs it, and whether the pin moves.
-
-- [ ] **Record the `rsa` advisory as a dated exception — it has no upstream fix.**
-  `rsa` 0.9.10 carries RUSTSEC-2023-0071 (the Marvin timing attack) with **no fixed
-  version available**, which is exactly the shape `SUPPLY-CHAIN.md` rule 9 exists for:
-  an undated ignore is indistinguishable from a decision nobody made. It needs an
-  entry in `osv-scanner.toml` with the reason and an expiry, not a silenced check.
-
-  **Reachability is unproven** — `rsa` did not resolve in the default-target normal
-  tree. Run `cargo tree -i rsa --edges normal --target all` first; the exception's
-  wording depends on the answer, and "not in the default tree" is not "not shipped".
-
-- [ ] **Wire the SCA gate (audit check 31).** CISS is one of the three enforcing
-  surfaces slated to get the blocking gate first, ahead of the static sites — rollout
-  step 4 in `CroftC/.claude/SUPPLY-CHAIN.md` § Current state.
+- [x] **Bump `h2` — RUSTSEC-2026-0258.** Shipped in v0.10.0 (2026-08-29): `h2` 0.4.15 → 0.4.19
+  via `cargo update`, in the production path through `axum` and `reqwest`. The deployed
+  `ciss-admit` (pinned to the v0.8.0 rev by `croft-stack`'s admit crate) did NOT carry it
+  until that pin moved — tracked in `croft-stack`, not here (the pin's bump PR is where the
+  admit gate proves compatibility). Closed on the record 2026-09-14; the TODO had outlived
+  the changelog entry.
+- [x] **Record the `rsa` advisory as a dated exception.** Done 2026-08-29 in
+  `osv-scanner.toml` (RUSTSEC-2023-0071, `ignoreUntil` 2026-11-29): rung 1 clears it — an
+  unenabled optional dependency in no resolved tree on any target, verified per shipped
+  artifact — with the invalidation condition written down (any feature that activates an
+  RSA-backed path). Closed on the record 2026-09-14.
+- [x] **Wire the SCA gate (audit check 31).** Done 2026-08-29: `.github/workflows/security.yml`
+  calls croft-pwa's `security-reusable.yml` on every PR, push to main, weekly, and by hand
+  (secrets AND dependencies; blocking). Audit check 31 no longer flags this repo. Closed on
+  the record 2026-09-14.
