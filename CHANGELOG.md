@@ -16,6 +16,12 @@ release to disagree (`[0.6.1] — never released` below is the residue).
 
 ## [Unreleased]
 
+### Security
+- **server + cli:** `rustls` 0.23.43 → 0.23.45 retires **RUSTSEC-2026-0285** (TLS 1.3
+  handshake messages accepted across encryption-level boundaries; published 2026-09-14).
+  Rung 2 is production for both shipped binaries (`cargo tree -p ciss -i rustls --edges
+  normal`, same for `ciss-cli`), so the fix is the upgrade, not an exception. Lockfile-only.
+
 ## [0.10.0] — 2026-08-29
 
 The TODO-close release: both auth planes on the meter, an honest du-lockdown
