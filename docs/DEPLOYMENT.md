@@ -175,6 +175,24 @@ full `systemctl restart ciss`.** Retry is safe for PUT/POST — Caddy only retri
 when the dial fails, before any bytes reach the upstream. True zero-downtime
 (kernel holds the socket) is the E87 socket-activation stretch.
 
+**Re-measured 2026-09-15 (E87 spike, croft-stack `sessions/2026-09-14-vps-ops.md`)**, over
+persistent connections through Caddy from off-box (4 keep-alive connections, ≈35 req/s,
+`GET /` — answered 501 by CISS itself, so 501 means "CISS answered"):
+
+| Run | Requests | Non-CISS answers | Slowest |
+|---|---|---|---|
+| no restart (baseline) | 846 | 0 | 349 ms |
+| `systemctl restart ciss` (SIGTERM drain + retry) | 1174 | 0 | 325 ms |
+| `SIGKILL` + `Restart=always` (the stop-start floor) | 1097 | 0 | 2.3 s (4 requests) |
+
+The graceful restart is invisible at this load; even a hard kill costs four requests a
+2 s stall (`RestartSec` + the retry window), none a failure. Socket activation
+(`LISTEN_FDS` is already honoured) and `SO_REUSEPORT` blue-green stay **deferred** until a
+trigger fires: a measured non-2xx across a restart, or an in-flight request longer than
+the drain window (a large PUT, a firehose subscriber). Measure restarts over persistent
+connections — a new-connection-per-request probe from one source shows SYN-backoff stalls
+with no restart at all, which is the edge's per-source connection budget, not the tenant.
+
 ## 6. Data profile & backup
 
 | Path | Class | Backup mechanism | Status |
