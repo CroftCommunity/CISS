@@ -33,7 +33,12 @@ stays erasable + listable (a roster wants erasure; usage wants permanence).
 Execution record: `docs/plans/2026-08-11-kind-semantics-implementation.md`.
 
 
-## 1. Redeploy the VPS — RESOLVED ✅ (2026-08-25): public `ciss.croft.ing` runs v0.9.0
+## 1. Redeploy the VPS — RESOLVED ✅ (2026-08-25); public `ciss.croft.ing` runs v0.10.0 since 2026-08-30
+
+**Current state:** v0.10.0, converged 2026-08-30 (owner-authorized, v0.9.0 → v0.10.0,
+`ok=98 changed=4 failed=0`) — croft-stack `sessions/2026-08-30-ciss-v0100-converge.md`,
+pin commit croft-stack `9cf238f`; `CroftC/.claude/DEPLOYED.md` reads the same pin. The
+record below is the 2026-08-25 v0.9.0 converge that resolved this item.
 
 The owner-authorized converge landed 2026-08-25 (croft-stack
 `sessions/2026-08-25-ciss-v090-converge.md` is the full record): v0.4.0 →
