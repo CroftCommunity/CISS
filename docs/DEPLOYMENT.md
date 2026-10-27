@@ -72,7 +72,8 @@ path) and point `CISS_ADMIN_PINS_FILE` at it. A malformed file fails startup
 loudly. Resolution reaches `plc.directory` outbound over HTTPS (rustls) — the only
 egress CISS makes.
 
-> **TODO (croft-stack): `CISS_ADMIN_PINS_FILE` is not yet populated.** As deployed,
+> **Accepted as-is (owner, 2026-08-29): `CISS_ADMIN_PINS_FILE` is provisioned but empty;
+> populate it when `did:` break-glass is wanted.** As deployed,
 > the pin set is **empty** — every `did:` resolves via the network, so there is no
 > break-glass for the admin identities and a `plc.directory` outage means `did:`
 > auth fails closed for everyone (the `id:` session path is unaffected). Provision

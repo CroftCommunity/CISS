@@ -11,7 +11,15 @@ Work local to this repo. Dated plans live in `docs/plans/`; decisions in `docs/a
 
 ## Open
 
-(nothing — every item below closed; new known work starts a fresh bullet here)
+- [ ] **`security / deps` is red: 10 blocking (rustls, rustls-webpki, webpki-roots, tokio, hickory-resolver, quinn-proto, crypto-bigint, ctutils, block-buffer — the same Rust cluster as croft-stack's).** Triaged in the workspace-wide
+  advisory pass, croft-stack first: the handoff prompt is croft-stack `TODO.md` § Open,
+  "Advisory triage, workspace-wide" (filed 2026-10-27).
+
+(Everything else below is closed; new known work starts a fresh bullet here. The deferred
+`ciss-ctl` items in [`docs/TODO.md`](docs/TODO.md) §5 — per-class exit codes, the
+manifest/rent client surface, full atproto OAuth, auto-countersign batching — are open
+questions, not known work, so they are filed as one roadmap row, discovery
+`alpha/ROADMAP_TODO.md` **E162**, rather than bullets here.)
 
 ## Closed
 
