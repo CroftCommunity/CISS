@@ -10,7 +10,7 @@
 The record of items opened after the `ciss-ctl` client effort (delivered through
 **v0.5.6**, 2026-08-06), every one now resolved or deferred. Open known work lives in
 [`../TODO.md`](../TODO.md); the deferred items in §5 are open questions, not known work, and
-are owed rows in `discovery/alpha/ROADMAP_TODO.md` (`CroftC/.claude/TRACKING.md` § "Two
+are filed as discovery `alpha/ROADMAP_TODO.md` **E162** (`CroftC/.claude/TRACKING.md` § "Two
 piles"). Full history: `docs/plans/2026-08-06-ciss-ctl-client-cli.md`. The
 client is shipped via Homebrew (`brew install croftcommunity/tap/ciss-ctl`); the
 server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
