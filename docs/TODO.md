@@ -1,4 +1,4 @@
-# CISS — outstanding TODO
+# CISS — resolved-items history (open work: `../TODO.md`)
 
 > Known work only — items whose shape is already decided, and which may therefore be
 > proposed as work. Anything still an open question (decide / verify / investigate /
@@ -7,8 +7,11 @@
 > the two piles and why: its § "Two piles". Cross-reference E-numbers where an item
 > here implements a backlog row.
 
-Open items after the `ciss-ctl` client effort (delivered through **v0.5.6**,
-2026-08-06). Full history: `docs/plans/2026-08-06-ciss-ctl-client-cli.md`. The
+The record of items opened after the `ciss-ctl` client effort (delivered through
+**v0.5.6**, 2026-08-06), every one now resolved or deferred. Open known work lives in
+[`../TODO.md`](../TODO.md); the deferred items in §5 are open questions, not known work, and
+are owed rows in `discovery/alpha/ROADMAP_TODO.md` (`CroftC/.claude/TRACKING.md` § "Two
+piles"). Full history: `docs/plans/2026-08-06-ciss-ctl-client-cli.md`. The
 client is shipped via Homebrew (`brew install croftcommunity/tap/ciss-ctl`); the
 server + client are one workspace (root `ciss` crate + `crates/ciss-cli`).
 
@@ -53,8 +56,8 @@ the first time since the endpoint shipped in v0.5.5.
 Still open, carried by their own items/docs:
 - **`du` lockdown (optional):** `CISS_ADMIN_ONLY_DU` stays unset (self-service
   `du`, own namespace only). Flipping it requires populating
-  `CISS_ADMIN_PINS_FILE` first — still provisioned-but-empty (DEPLOYMENT.md §2
-  TODO; with the flag set and no pins, **all** `du` is denied).
+  `CISS_ADMIN_PINS_FILE` first — still provisioned-but-empty (DEPLOYMENT.md §2,
+  accepted as-is; with the flag set and no pins, **all** `du` is denied).
 - The deployed **client** walk ran on ciss-ctl 0.7.0 from the tap; a tap bump
   to 0.9.0 is routine Homebrew housekeeping when wanted (no wire changes for
   the walked surface).
@@ -89,7 +92,7 @@ deleted with the limitation it described). Owner-only unchanged. Guards:
 `tests/wiring_meter.rs` (both planes, lxm mismatch, cross-DID) and
 `crates/ciss-cli/tests/cli_meter.rs`.
 
-## 5. Minor / deferred (already noted in the plan's SEAMs)
+## 5. Minor / deferred (already noted in the plan's SEAMs) — to-be-planned, not known work
 
 - **Actionable exit codes:** every `ciss-ctl` error exits `1`; the messages are
   actionable but there are no distinct per-class exit codes (deferred, plan §4).

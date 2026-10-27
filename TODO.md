@@ -11,7 +11,11 @@ Work local to this repo. Dated plans live in `docs/plans/`; decisions in `docs/a
 
 ## Open
 
-(nothing — every item below closed; new known work starts a fresh bullet here)
+(nothing — every item below closed; new known work starts a fresh bullet here. The deferred
+`ciss-ctl` items in [`docs/TODO.md`](docs/TODO.md) §5 — per-class exit codes, the
+manifest/rent client surface, full atproto OAuth, auto-countersign batching — are open
+questions, not known work, so they are owed `discovery/alpha/ROADMAP_TODO.md` rows rather
+than bullets here.)
 
 ## Closed
 

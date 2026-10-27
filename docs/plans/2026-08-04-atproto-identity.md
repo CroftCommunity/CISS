@@ -1,7 +1,10 @@
 # Plan — atproto-identity increment (service-auth JWT + DID resolution)
 
 - **Date:** 2026-08-04
-- **Status:** Proposed (TDD-first). **Phase 0 done** — model decided: **Model R**
+- **Status:** SHIPPED in v0.3.0 — the `did:` service-auth plane and the production DID
+  resolver (`src/did_resolver.rs`) were wired 2026-08-04 (`5127dbd` Phase 4, `f96259d`
+  Phase 5; guards `tests/flow_atproto_identity.rs`); the meter joined the `did:` plane
+  in v0.10.0 (`e4ae938`). Model decided in Phase 0: **Model R**
   (verify a bsky-delegated service-auth JWT via DID resolution; not DPoP, not a
   broker-issued token). See `docs/notes/atproto-integration-model.md`.
 - **Owns:** ADR 0001 §5 (DID resolution) + §3 as **amended 2026-08-04**
